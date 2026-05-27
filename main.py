@@ -27,6 +27,7 @@ PORT = int(ENV("PORT", "8000"))
 
 pool = None
 _db_ready = False
+_db_error: str | None = None
 
 
 async def get_db():
@@ -337,7 +338,11 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "ПОЛЯНА API v2.1", "db_ready": _db_ready}
+    return {
+        "status": "ok", "service": "ПОЛЯНА API v2.1",
+        "db_ready": _db_ready,
+        "db_error": _db_error,
+    }
 
 
 # ── Progress helpers ──────────────────────────────────────────────────────────
@@ -803,11 +808,14 @@ async def run_bot():
 
 async def _bg_init():
     """Run DB migrations and start bot in background so FastAPI starts immediately."""
+    global _db_error
     try:
         await init_db()
     except asyncio.TimeoutError:
-        log.error("DB connection timed out — server running without DB")
+        _db_error = "DB connection timed out after 30s"
+        log.error(_db_error)
     except Exception as e:
+        _db_error = f"{type(e).__name__}: {e}"
         log.error("init_db error: %s", e)
     # Start bot regardless (it will retry polling if needed)
     asyncio.create_task(run_bot())
