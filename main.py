@@ -169,8 +169,8 @@ def validate_init_data(init_data: str) -> dict | None:
 
 async def get_current_user(
     x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
-    db=Depends(get_db),
 ) -> int:
+    """Extract user_id ONLY from HMAC-signed Telegram initData — never from query params."""
     if not x_telegram_init_data:
         raise HTTPException(401, "Missing initData")
     user = validate_init_data(x_telegram_init_data)
