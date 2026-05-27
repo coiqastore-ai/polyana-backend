@@ -7,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.filters.command import CommandObject
 from aiogram.types import (
     BotCommand, BotCommandScopeAllPrivateChats,
     KeyboardButton, MenuButtonWebApp, Message,
@@ -92,10 +91,11 @@ async def init_db():
             );
         """)
 
-        # Migrate old schema if needed (title->name, date->event_date)
+        # ── Migrate old schema ────────────────────────────────────────────────
         await c.execute("""
             DO $$
             BEGIN
+                -- events: title → name
                 IF EXISTS (
                     SELECT 1 FROM information_schema.columns
                     WHERE table_name='events' AND column_name='title'
@@ -106,6 +106,7 @@ async def init_db():
                     ALTER TABLE events RENAME COLUMN title TO name;
                 END IF;
 
+                -- events: date → event_date
                 IF EXISTS (
                     SELECT 1 FROM information_schema.columns
                     WHERE table_name='events' AND column_name='date'
@@ -116,15 +117,67 @@ async def init_db():
                     ALTER TABLE events RENAME COLUMN date TO event_date;
                 END IF;
 
+                -- events: add new columns
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='share_token')
-                    THEN ALTER TABLE events ADD COLUMN share_token TEXT UNIQUE; END IF;
+                    THEN ALTER TABLE events ADD COLUMN share_token TEXT; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='location')
                     THEN ALTER TABLE events ADD COLUMN location TEXT; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='description')
                     THEN ALTER TABLE events ADD COLUMN description TEXT; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='template')
                     THEN ALTER TABLE events ADD COLUMN template TEXT; END IF;
+
+                -- collaborators: add columns missing from old schema
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='first_name')
+                    THEN ALTER TABLE collaborators ADD COLUMN first_name TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='username')
+                    THEN ALTER TABLE collaborators ADD COLUMN username TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='role')
+                    THEN ALTER TABLE collaborators ADD COLUMN role TEXT DEFAULT 'collaborator'; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='joined_at')
+                    THEN ALTER TABLE collaborators ADD COLUMN joined_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+
+                -- shopping_items: ingredient_name → name
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='shopping_items' AND column_name='ingredient_name'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='shopping_items' AND column_name='name'
+                ) THEN
+                    ALTER TABLE shopping_items RENAME COLUMN ingredient_name TO name;
+                END IF;
             END $$;
+        """)
+
+        # Add UNIQUE constraint to collaborators safely (deduplicate first)
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'collaborators_event_user_uniq'
+                ) THEN
+                    -- remove duplicates keeping lowest id
+                    DELETE FROM collaborators a USING collaborators b
+                    WHERE a.id > b.id
+                      AND a.event_id = b.event_id
+                      AND a.telegram_user_id = b.telegram_user_id;
+
+                    ALTER TABLE collaborators
+                        ADD CONSTRAINT collaborators_event_user_uniq
+                        UNIQUE (event_id, telegram_user_id);
+                END IF;
+            END $$;
+        """)
+
+        # Indexes for query performance
+        await c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_user    ON events(telegram_user_id);
+            CREATE INDEX IF NOT EXISTS idx_collab_event   ON collaborators(event_id);
+            CREATE INDEX IF NOT EXISTS idx_collab_user    ON collaborators(telegram_user_id);
+            CREATE INDEX IF NOT EXISTS idx_menu_event     ON event_menu_items(event_id);
+            CREATE INDEX IF NOT EXISTS idx_shopping_event ON shopping_items(event_id);
         """)
 
         # Backfill share_token for existing events
@@ -492,11 +545,13 @@ def main_kb():
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject):
+async def cmd_start(message: Message):
     if not message.from_user:
         return
     user = message.from_user
-    arg = command.args
+    # Parse deep-link arg manually — more reliable than CommandObject injection
+    text = message.text or ""
+    arg = text.split(maxsplit=1)[1] if " " in text else None
 
     if arg and arg.startswith("event_"):
         try:
