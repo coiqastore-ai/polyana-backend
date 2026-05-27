@@ -179,6 +179,37 @@ async def init_db():
                 ) THEN
                     ALTER TABLE shopping_items RENAME COLUMN ingredient_name TO name;
                 END IF;
+
+                -- recipes: fix old schema (title→name, add missing columns)
+                -- The very first version had: recipes(id, title TEXT, telegram_user_id BIGINT)
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='recipes' AND column_name='title'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='recipes' AND column_name='name'
+                ) THEN
+                    ALTER TABLE recipes RENAME COLUMN title TO name;
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='name')
+                    THEN ALTER TABLE recipes ADD COLUMN name TEXT NOT NULL DEFAULT ''; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='event_id')
+                    THEN ALTER TABLE recipes ADD COLUMN event_id INT REFERENCES events(id) ON DELETE CASCADE; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='emoji')
+                    THEN ALTER TABLE recipes ADD COLUMN emoji TEXT DEFAULT '🍽'; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='servings')
+                    THEN ALTER TABLE recipes ADD COLUMN servings INT DEFAULT 4; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='cook_time_min')
+                    THEN ALTER TABLE recipes ADD COLUMN cook_time_min INT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='source_url')
+                    THEN ALTER TABLE recipes ADD COLUMN source_url TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='added_by_user_id')
+                    THEN ALTER TABLE recipes ADD COLUMN added_by_user_id BIGINT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='added_by_name')
+                    THEN ALTER TABLE recipes ADD COLUMN added_by_name TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='created_at')
+                    THEN ALTER TABLE recipes ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW(); END IF;
             END $$;
         """)
 
