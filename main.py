@@ -26,16 +26,22 @@ INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 
 pool = None
+_db_ready = False
 
 
 async def get_db():
+    if pool is None:
+        raise HTTPException(503, "Сервис запускается, попробуйте через секунду")
     async with pool.acquire() as c:
         yield c
 
 
 async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    global pool, _db_ready
+    pool = await asyncio.wait_for(
+        asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=60),
+        timeout=30,
+    )
     async with pool.acquire() as c:
         await c.execute("""
             CREATE TABLE IF NOT EXISTS events (
@@ -232,6 +238,7 @@ async def init_db():
                 secrets.token_urlsafe(16), row["id"]
             )
 
+    _db_ready = True
     log.info("DB ready")
 
 
@@ -330,7 +337,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "ПОЛЯНА API v2.1"}
+    return {"status": "ok", "service": "ПОЛЯНА API v2.1", "db_ready": _db_ready}
 
 
 # ── Progress helpers ──────────────────────────────────────────────────────────
@@ -727,6 +734,10 @@ async def cmd_start(message: Message):
             await message.answer("Неверная ссылка.", reply_markup=ReplyKeyboardRemove())
             return
 
+        if pool is None:
+            await message.answer("Сервис запускается, попробуйте через минуту.", reply_markup=ReplyKeyboardRemove())
+            return
+
         async with pool.acquire() as db:
             event = await db.fetchrow("SELECT * FROM events WHERE id=$1", event_id)
 
@@ -790,11 +801,22 @@ async def run_bot():
         log.error("Bot error: %s", e)
 
 
+async def _bg_init():
+    """Run DB migrations and start bot in background so FastAPI starts immediately."""
+    try:
+        await init_db()
+    except asyncio.TimeoutError:
+        log.error("DB connection timed out — server running without DB")
+    except Exception as e:
+        log.error("init_db error: %s", e)
+    # Start bot regardless (it will retry polling if needed)
+    asyncio.create_task(run_bot())
+
+
 @app.on_event("startup")
 async def startup():
-    await init_db()
-    asyncio.create_task(run_bot())
-    log.info("Started on port %d", PORT)
+    log.info("FastAPI starting on port %d", PORT)
+    asyncio.create_task(_bg_init())  # non-blocking: health endpoint responds immediately
 
 
 if __name__ == "__main__":
