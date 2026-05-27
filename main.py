@@ -44,6 +44,8 @@ async def init_db():
         timeout=30,
     )
     async with pool.acquire() as c:
+
+        # ── Create tables (target schema for fresh deploys) ───────────────────
         await c.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id               SERIAL PRIMARY KEY,
@@ -58,28 +60,36 @@ async def init_db():
                 created_at       TIMESTAMPTZ DEFAULT NOW()
             );
 
-            CREATE TABLE IF NOT EXISTS event_menu_items (
+            CREATE TABLE IF NOT EXISTS collaborators (
                 id               SERIAL PRIMARY KEY,
                 event_id         INT REFERENCES events(id) ON DELETE CASCADE,
-                name             TEXT NOT NULL,
-                emoji            TEXT DEFAULT '🍽',
-                servings         INT DEFAULT 4,
-                added_by_user_id BIGINT,
-                added_by_name    TEXT,
-                added_at         TIMESTAMPTZ DEFAULT NOW()
+                telegram_user_id BIGINT NOT NULL,
+                first_name       TEXT,
+                username         TEXT,
+                role             TEXT DEFAULT 'collaborator',
+                joined_at        TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(event_id, telegram_user_id)
             );
 
+            -- Personal recipe library (user-owned, not event-bound)
             CREATE TABLE IF NOT EXISTS recipes (
-                id               SERIAL PRIMARY KEY,
-                event_id         INT REFERENCES events(id) ON DELETE CASCADE,
-                name             TEXT NOT NULL,
-                emoji            TEXT DEFAULT '🍽',
-                servings         INT DEFAULT 4,
-                cook_time_min    INT,
-                source_url       TEXT,
-                added_by_user_id BIGINT,
-                added_by_name    TEXT,
-                created_at       TIMESTAMPTZ DEFAULT NOW()
+                id                SERIAL PRIMARY KEY,
+                user_id           BIGINT NOT NULL DEFAULT 0,
+                name              TEXT NOT NULL,
+                name_original     TEXT,
+                emoji             TEXT DEFAULT '🍽',
+                source_url        TEXT,
+                source_type       TEXT DEFAULT 'manual',
+                original_language TEXT,
+                servings          INT DEFAULT 4,
+                cook_time_minutes INT,
+                category          TEXT,
+                tags              TEXT[] DEFAULT '{}',
+                times_cooked      INT DEFAULT 0,
+                rating            INT,
+                notes             TEXT,
+                created_at        TIMESTAMPTZ DEFAULT NOW(),
+                updated_at        TIMESTAMPTZ DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS ingredients (
@@ -99,15 +109,15 @@ async def init_db():
                 text        TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS collaborators (
-                id               SERIAL PRIMARY KEY,
-                event_id         INT REFERENCES events(id) ON DELETE CASCADE,
-                telegram_user_id BIGINT NOT NULL,
-                first_name       TEXT,
-                username         TEXT,
-                role             TEXT DEFAULT 'collaborator',
-                joined_at        TIMESTAMPTZ DEFAULT NOW(),
-                UNIQUE(event_id, telegram_user_id)
+            -- M2M: which recipes appear in which events
+            CREATE TABLE IF NOT EXISTS event_recipes (
+                id                  SERIAL PRIMARY KEY,
+                event_id            INT REFERENCES events(id) ON DELETE CASCADE,
+                recipe_id           INT REFERENCES recipes(id) ON DELETE CASCADE,
+                servings_multiplier FLOAT DEFAULT 1.0,
+                added_by_id         BIGINT NOT NULL DEFAULT 0,
+                added_at            TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(event_id, recipe_id)
             );
 
             CREATE TABLE IF NOT EXISTS shopping_items (
@@ -128,30 +138,21 @@ async def init_db():
             );
         """)
 
-        # ── Migrate old schema ────────────────────────────────────────────────
+        # ── Migration A: Column renames & additions ───────────────────────────
         await c.execute("""
             DO $$
             BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='events' AND column_name='title'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='events' AND column_name='name'
-                ) THEN
-                    ALTER TABLE events RENAME COLUMN title TO name;
-                END IF;
+                -- events: title→name
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='title')
+                   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='name')
+                THEN ALTER TABLE events RENAME COLUMN title TO name; END IF;
 
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='events' AND column_name='date'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='events' AND column_name='event_date'
-                ) THEN
-                    ALTER TABLE events RENAME COLUMN date TO event_date;
-                END IF;
+                -- events: date→event_date
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='date')
+                   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='event_date')
+                THEN ALTER TABLE events RENAME COLUMN date TO event_date; END IF;
 
+                -- events: add missing columns
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='share_token')
                     THEN ALTER TABLE events ADD COLUMN share_token TEXT; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='location')
@@ -161,6 +162,7 @@ async def init_db():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='events' AND column_name='template')
                     THEN ALTER TABLE events ADD COLUMN template TEXT; END IF;
 
+                -- collaborators
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='first_name')
                     THEN ALTER TABLE collaborators ADD COLUMN first_name TEXT; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='username')
@@ -170,50 +172,130 @@ async def init_db():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='collaborators' AND column_name='joined_at')
                     THEN ALTER TABLE collaborators ADD COLUMN joined_at TIMESTAMPTZ DEFAULT NOW(); END IF;
 
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='shopping_items' AND column_name='ingredient_name'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='shopping_items' AND column_name='name'
-                ) THEN
-                    ALTER TABLE shopping_items RENAME COLUMN ingredient_name TO name;
-                END IF;
+                -- shopping_items: ingredient_name→name
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='shopping_items' AND column_name='ingredient_name')
+                   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='shopping_items' AND column_name='name')
+                THEN ALTER TABLE shopping_items RENAME COLUMN ingredient_name TO name; END IF;
 
-                -- recipes: fix old schema (title→name, add missing columns)
-                -- The very first version had: recipes(id, title TEXT, telegram_user_id BIGINT)
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='recipes' AND column_name='title'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='recipes' AND column_name='name'
-                ) THEN
-                    ALTER TABLE recipes RENAME COLUMN title TO name;
-                END IF;
-
+                -- recipes: title→name (very old schema)
+                IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='title')
+                   AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='name')
+                THEN ALTER TABLE recipes RENAME COLUMN title TO name; END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='name')
                     THEN ALTER TABLE recipes ADD COLUMN name TEXT NOT NULL DEFAULT ''; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='event_id')
-                    THEN ALTER TABLE recipes ADD COLUMN event_id INT REFERENCES events(id) ON DELETE CASCADE; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='emoji')
-                    THEN ALTER TABLE recipes ADD COLUMN emoji TEXT DEFAULT '🍽'; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='servings')
-                    THEN ALTER TABLE recipes ADD COLUMN servings INT DEFAULT 4; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='cook_time_min')
-                    THEN ALTER TABLE recipes ADD COLUMN cook_time_min INT; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='source_url')
-                    THEN ALTER TABLE recipes ADD COLUMN source_url TEXT; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='added_by_user_id')
-                    THEN ALTER TABLE recipes ADD COLUMN added_by_user_id BIGINT; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='added_by_name')
-                    THEN ALTER TABLE recipes ADD COLUMN added_by_name TEXT; END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='created_at')
-                    THEN ALTER TABLE recipes ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW(); END IF;
             END $$;
         """)
 
-        # UNIQUE constraint on collaborators (safe)
+        # ── Migration B: Recipes → user_id-based personal library ────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                -- Add user_id if missing (old schema used event_id instead)
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='user_id')
+                THEN ALTER TABLE recipes ADD COLUMN user_id BIGINT; END IF;
+
+                -- Backfill user_id from added_by_user_id
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='recipes' AND column_name='added_by_user_id') THEN
+                    UPDATE recipes SET user_id = added_by_user_id
+                    WHERE user_id IS NULL AND added_by_user_id IS NOT NULL;
+                END IF;
+
+                -- Backfill user_id from event owner for recipes linked to events
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='recipes' AND column_name='event_id') THEN
+                    UPDATE recipes r SET user_id = e.telegram_user_id
+                    FROM events e
+                    WHERE r.event_id = e.id AND r.user_id IS NULL;
+                END IF;
+
+                -- Default any remaining nulls to 0
+                UPDATE recipes SET user_id = 0 WHERE user_id IS NULL;
+
+                -- Rename cook_time_min → cook_time_minutes
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='recipes' AND column_name='cook_time_min')
+                   AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='recipes' AND column_name='cook_time_minutes')
+                THEN ALTER TABLE recipes RENAME COLUMN cook_time_min TO cook_time_minutes; END IF;
+
+                -- Add new columns (no-op if already present)
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='cook_time_minutes')
+                    THEN ALTER TABLE recipes ADD COLUMN cook_time_minutes INT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='name_original')
+                    THEN ALTER TABLE recipes ADD COLUMN name_original TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='source_type')
+                    THEN ALTER TABLE recipes ADD COLUMN source_type TEXT DEFAULT 'manual'; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='original_language')
+                    THEN ALTER TABLE recipes ADD COLUMN original_language TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='category')
+                    THEN ALTER TABLE recipes ADD COLUMN category TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='tags')
+                    THEN ALTER TABLE recipes ADD COLUMN tags TEXT[] DEFAULT '{}'; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='times_cooked')
+                    THEN ALTER TABLE recipes ADD COLUMN times_cooked INT DEFAULT 0; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='rating')
+                    THEN ALTER TABLE recipes ADD COLUMN rating INT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='notes')
+                    THEN ALTER TABLE recipes ADD COLUMN notes TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='recipes' AND column_name='updated_at')
+                    THEN ALTER TABLE recipes ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+            END $$;
+        """)
+
+        # ── Migration C: Seed event_recipes from old recipes.event_id ────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                -- Migrate existing event_id links on recipes → event_recipes
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name='recipes' AND column_name='event_id') THEN
+                    INSERT INTO event_recipes
+                        (event_id, recipe_id, servings_multiplier, added_by_id, added_at)
+                    SELECT r.event_id, r.id, 1.0,
+                           COALESCE(r.user_id, 0),
+                           COALESCE(r.created_at, NOW())
+                    FROM recipes r
+                    WHERE r.event_id IS NOT NULL
+                    ON CONFLICT (event_id, recipe_id) DO NOTHING;
+                END IF;
+
+                -- Also migrate from event_menu_items if that legacy table still exists
+                IF EXISTS (SELECT 1 FROM information_schema.tables
+                           WHERE table_name='event_menu_items') THEN
+                    -- Insert unique items into recipe library
+                    INSERT INTO recipes
+                        (user_id, name, emoji, servings, source_type, created_at)
+                    SELECT COALESCE(m.added_by_user_id, e.telegram_user_id, 0),
+                           m.name, m.emoji, m.servings, 'manual', m.added_at
+                    FROM event_menu_items m
+                    JOIN events e ON e.id = m.event_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM recipes r2
+                        WHERE r2.user_id = COALESCE(m.added_by_user_id, e.telegram_user_id, 0)
+                          AND r2.name = m.name
+                          AND r2.created_at = m.added_at
+                    );
+
+                    -- Link them to events
+                    INSERT INTO event_recipes
+                        (event_id, recipe_id, servings_multiplier, added_by_id, added_at)
+                    SELECT m.event_id, r.id, 1.0,
+                           COALESCE(m.added_by_user_id, e.telegram_user_id, 0),
+                           m.added_at
+                    FROM event_menu_items m
+                    JOIN events e ON e.id = m.event_id
+                    JOIN recipes r
+                        ON r.name = m.name
+                       AND r.user_id = COALESCE(m.added_by_user_id, e.telegram_user_id, 0)
+                       AND r.created_at = m.added_at
+                    ON CONFLICT (event_id, recipe_id) DO NOTHING;
+                END IF;
+            END $$;
+        """)
+
+        # ── Migration D: Constraints ──────────────────────────────────────────
         await c.execute("""
             DO $$
             BEGIN
@@ -231,38 +313,20 @@ async def init_db():
             END $$;
         """)
 
-        # Migrate event_menu_items → recipes (copy existing data, skip duplicates)
+        # ── Indexes ───────────────────────────────────────────────────────────
         await c.execute("""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.tables WHERE table_name='event_menu_items'
-                ) THEN
-                    INSERT INTO recipes (event_id, name, emoji, servings, added_by_user_id, added_by_name, created_at)
-                    SELECT m.event_id, m.name, m.emoji, m.servings,
-                           m.added_by_user_id, m.added_by_name, m.added_at
-                    FROM event_menu_items m
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM recipes r
-                        WHERE r.event_id = m.event_id
-                          AND r.name = m.name
-                          AND COALESCE(r.added_by_user_id, 0) = COALESCE(m.added_by_user_id, 0)
-                    );
-                END IF;
-            END $$;
+            CREATE INDEX IF NOT EXISTS idx_events_user        ON events(telegram_user_id);
+            CREATE INDEX IF NOT EXISTS idx_collab_event       ON collaborators(event_id);
+            CREATE INDEX IF NOT EXISTS idx_collab_user        ON collaborators(telegram_user_id);
+            CREATE INDEX IF NOT EXISTS idx_recipes_user       ON recipes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_recipes_user_name  ON recipes(user_id, name);
+            CREATE INDEX IF NOT EXISTS idx_event_recipes_evt  ON event_recipes(event_id);
+            CREATE INDEX IF NOT EXISTS idx_event_recipes_rec  ON event_recipes(recipe_id);
+            CREATE INDEX IF NOT EXISTS idx_ingredients_rec    ON ingredients(recipe_id);
+            CREATE INDEX IF NOT EXISTS idx_shopping_event     ON shopping_items(event_id);
         """)
 
-        # Indexes
-        await c.execute("""
-            CREATE INDEX IF NOT EXISTS idx_events_user     ON events(telegram_user_id);
-            CREATE INDEX IF NOT EXISTS idx_collab_event    ON collaborators(event_id);
-            CREATE INDEX IF NOT EXISTS idx_collab_user     ON collaborators(telegram_user_id);
-            CREATE INDEX IF NOT EXISTS idx_recipes_event   ON recipes(event_id);
-            CREATE INDEX IF NOT EXISTS idx_ingredients_rec ON ingredients(recipe_id);
-            CREATE INDEX IF NOT EXISTS idx_shopping_event  ON shopping_items(event_id);
-        """)
-
-        # Backfill share_token
+        # ── Backfill share_token ──────────────────────────────────────────────
         rows = await c.fetch("SELECT id FROM events WHERE share_token IS NULL")
         for row in rows:
             await c.execute(
@@ -271,7 +335,7 @@ async def init_db():
             )
 
     _db_ready = True
-    log.info("DB ready")
+    log.info("DB ready ✓  (recipes-as-library schema v3)")
 
 
 # ── Ingredient auto-categorisation ───────────────────────────────────────────
@@ -349,7 +413,7 @@ async def get_current_user(
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="ПОЛЯНА API", version="2.1")
+app = FastAPI(title="ПОЛЯНА API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -370,7 +434,7 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     return {
-        "status": "ok", "service": "ПОЛЯНА API v2.1",
+        "status": "ok", "service": "ПОЛЯНА API v3.0",
         "db_ready": _db_ready,
         "db_error": _db_error,
     }
@@ -403,7 +467,7 @@ async def list_events(user_id: int = Depends(get_current_user), db=Depends(get_d
     rows = await db.fetch(
         """
         SELECT e.id, e.name, e.event_date, e.location, e.template, e.share_token, e.telegram_user_id,
-               (SELECT COUNT(*) FROM recipes r WHERE r.event_id = e.id)         AS recipes_count,
+               (SELECT COUNT(*) FROM event_recipes er WHERE er.event_id = e.id) AS recipes_count,
                (SELECT COUNT(*) FROM shopping_items s WHERE s.event_id = e.id)  AS shopping_total,
                (SELECT COUNT(*) FROM shopping_items s WHERE s.event_id = e.id AND s.bought) AS shopping_bought,
                (SELECT COUNT(*) FROM collaborators c WHERE c.event_id = e.id)   AS collab_count
@@ -473,6 +537,23 @@ async def create_event(body: dict, user_id: int = Depends(get_current_user), db=
     return {"id": row["id"], "name": row["name"], "share_token": row["share_token"], "owner_id": user_id}
 
 
+# ── GET /api/events/shared/{event_id} (no-auth) ───────────────────────────────
+# Must be registered BEFORE /api/events/{event_id} to avoid route shadowing
+
+@app.get("/api/events/shared/{event_id}")
+async def get_shared_event(event_id: int, db=Depends(get_db)):
+    row = await db.fetchrow(
+        "SELECT id, name, event_date, location, guests_count FROM events WHERE id=$1", event_id
+    )
+    if not row:
+        raise HTTPException(404, "Not found")
+    return {
+        "id": row["id"], "name": row["name"],
+        "event_date": row["event_date"].isoformat() if row["event_date"] else None,
+        "location": row["location"], "guests_count": row["guests_count"], "read_only": True,
+    }
+
+
 # ── GET /api/events/{id} ──────────────────────────────────────────────────────
 
 @app.get("/api/events/{event_id}")
@@ -489,19 +570,30 @@ async def get_event(event_id: int, user_id: int = Depends(get_current_user), db=
     collabs = await db.fetch(
         "SELECT * FROM collaborators WHERE event_id=$1 ORDER BY joined_at ASC", event_id
     )
+
+    # Recipes via event_recipes M2M join
     recipes = await db.fetch(
         """
-        SELECT r.*,
+        SELECT r.id, r.name, r.emoji, r.servings, r.cook_time_minutes,
+               r.user_id AS recipe_owner_id,
+               er.servings_multiplier, er.added_by_id, er.added_at AS linked_at,
                (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredients_count
-        FROM recipes r WHERE r.event_id=$1 ORDER BY r.created_at ASC
+        FROM event_recipes er
+        JOIN recipes r ON r.id = er.recipe_id
+        WHERE er.event_id = $1
+        ORDER BY er.added_at ASC
         """,
         event_id,
     )
+
     shop_row = await db.fetchrow(
         "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE bought) AS bought FROM shopping_items WHERE event_id=$1",
         event_id,
     )
     rc, st, sb = len(recipes), (shop_row["total"] or 0), (shop_row["bought"] or 0)
+
+    # Collaborator name lookup
+    collab_names = {c["telegram_user_id"]: c["first_name"] or "Гость" for c in collabs}
 
     return {
         "id": row["id"],
@@ -521,18 +613,25 @@ async def get_event(event_id: int, user_id: int = Depends(get_current_user), db=
                 "first_name": c["first_name"] or "Гость",
                 "username": c["username"],
                 "role": c["role"],
-                "recipes_count": sum(1 for r in recipes if r["added_by_user_id"] == c["telegram_user_id"]),
+                "recipes_count": sum(1 for r in recipes if r["added_by_id"] == c["telegram_user_id"]),
             }
             for c in collabs
         ],
         "recipes": [
             {
-                "id": r["id"], "name": r["name"], "emoji": r["emoji"] or "🍽",
+                "id": r["id"],
+                "name": r["name"],
+                "emoji": r["emoji"] or "🍽",
                 "servings": r["servings"],
-                "cook_time_min": r["cook_time_min"],
+                "cook_time_min": r["cook_time_minutes"],        # compat alias
+                "cook_time_minutes": r["cook_time_minutes"],
+                "servings_multiplier": float(r["servings_multiplier"] or 1.0),
                 "ingredients_count": r["ingredients_count"] or 0,
-                "added_by": {"user_id": r["added_by_user_id"], "first_name": r["added_by_name"] or "Гость"},
-                "added_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "added_by": {
+                    "user_id": r["added_by_id"],
+                    "first_name": collab_names.get(r["added_by_id"], "Гость"),
+                },
+                "added_at": r["linked_at"].isoformat() if r["linked_at"] else None,
             }
             for r in recipes
         ],
@@ -568,9 +667,11 @@ async def delete_event(event_id: int, user_id: int = Depends(get_current_user), 
 
 
 # ── POST /api/events/{id}/recipes ─────────────────────────────────────────────
+# Mode 1: {"recipe_id": 123, "servings_multiplier": 2.0}  → link existing library recipe
+# Mode 2: {"name": "...", "emoji": "🥩", ...}             → create in library + link
 
 @app.post("/api/events/{event_id}/recipes", status_code=201)
-async def add_recipe(event_id: int, body: dict, user_id: int = Depends(get_current_user), db=Depends(get_db)):
+async def add_recipe_to_event(event_id: int, body: dict, user_id: int = Depends(get_current_user), db=Depends(get_db)):
     ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
     if not ev:
         raise HTTPException(404, "Event not found")
@@ -580,25 +681,237 @@ async def add_recipe(event_id: int, body: dict, user_id: int = Depends(get_curre
     if ev["telegram_user_id"] != user_id and not is_collab:
         raise HTTPException(403, "Access denied")
 
+    recipe_id = body.get("recipe_id")
+
+    if recipe_id:
+        # ── Mode 1: link existing recipe from user's library ──────────────────
+        rec = await db.fetchrow(
+            "SELECT id, name, emoji, servings FROM recipes WHERE id=$1 AND user_id=$2",
+            int(recipe_id), user_id
+        )
+        if not rec:
+            raise HTTPException(404, "Recipe not found in your library")
+
+        mult = float(body.get("servings_multiplier") or 1.0)
+        await db.execute(
+            """
+            INSERT INTO event_recipes (event_id, recipe_id, servings_multiplier, added_by_id)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (event_id, recipe_id) DO UPDATE
+                SET servings_multiplier = EXCLUDED.servings_multiplier
+            """,
+            event_id, rec["id"], mult, user_id,
+        )
+        return {
+            "id": rec["id"], "name": rec["name"],
+            "emoji": rec["emoji"] or "🍽",
+            "servings": rec["servings"],
+            "servings_multiplier": mult,
+        }
+
+    else:
+        # ── Mode 2: create new recipe in library, then link to event ──────────
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "name required")
+
+        rec = await db.fetchrow(
+            """
+            INSERT INTO recipes
+                (user_id, name, emoji, servings, cook_time_minutes, source_url, source_type)
+            VALUES ($1,$2,$3,$4,$5,$6,'manual')
+            RETURNING *
+            """,
+            user_id, name,
+            body.get("emoji", "🍽"),
+            body.get("servings", 4),
+            body.get("cook_time_min") or body.get("cook_time_minutes"),
+            body.get("source_url"),
+        )
+
+        # Persist ingredients
+        for i, ing in enumerate(body.get("ingredients", [])):
+            ing_name = (ing.get("name") or "").strip()
+            if not ing_name:
+                continue
+            raw_qty = ing.get("qty")
+            qty_val = None
+            if raw_qty not in (None, "", 0):
+                try:
+                    qty_val = float(raw_qty)
+                except (TypeError, ValueError):
+                    qty_val = None
+            await db.execute(
+                "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
+                rec["id"], ing_name, qty_val,
+                (ing.get("unit") or "").strip(),
+                categorize_ingredient(ing_name),
+                i,
+            )
+
+        # Persist steps
+        for i, step in enumerate(body.get("steps", [])):
+            step_text = (step.get("text") or "").strip()
+            if not step_text:
+                continue
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                rec["id"], i + 1, step_text,
+            )
+
+        # Link to event via event_recipes
+        await db.execute(
+            """
+            INSERT INTO event_recipes (event_id, recipe_id, servings_multiplier, added_by_id)
+            VALUES ($1,$2,1.0,$3)
+            ON CONFLICT (event_id, recipe_id) DO NOTHING
+            """,
+            event_id, rec["id"], user_id,
+        )
+
+        return {
+            "id": rec["id"], "name": rec["name"],
+            "emoji": rec["emoji"] or "🍽",
+            "servings": rec["servings"],
+            "servings_multiplier": 1.0,
+            "added_at": rec["created_at"].isoformat() if rec["created_at"] else None,
+        }
+
+
+# ── PATCH /api/events/{id}/recipes/{id} (update multiplier) ──────────────────
+
+@app.patch("/api/events/{event_id}/recipes/{recipe_id}")
+async def update_event_recipe(
+    event_id: int, recipe_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    mult = float(body.get("servings_multiplier") or 1.0)
+    await db.execute(
+        "UPDATE event_recipes SET servings_multiplier=$1 WHERE event_id=$2 AND recipe_id=$3",
+        mult, event_id, recipe_id,
+    )
+    return {"servings_multiplier": mult}
+
+
+# ── DELETE /api/events/{id}/recipes/{id} (unlink only — library intact) ───────
+
+@app.delete("/api/events/{event_id}/recipes/{recipe_id}", status_code=204)
+async def unlink_recipe_from_event(
+    event_id: int, recipe_id: int,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    er = await db.fetchrow(
+        "SELECT added_by_id FROM event_recipes WHERE event_id=$1 AND recipe_id=$2",
+        event_id, recipe_id,
+    )
+    if not er:
+        raise HTTPException(404, "Recipe not linked to this event")
+    rec_owner = await db.fetchval("SELECT user_id FROM recipes WHERE id=$1", recipe_id)
+    if ev["telegram_user_id"] != user_id and er["added_by_id"] != user_id and rec_owner != user_id:
+        raise HTTPException(403, "Access denied")
+    await db.execute(
+        "DELETE FROM event_recipes WHERE event_id=$1 AND recipe_id=$2", event_id, recipe_id
+    )
+
+
+# ── GET /api/recipes  (personal library) ─────────────────────────────────────
+
+@app.get("/api/recipes")
+async def list_recipes(
+    q: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    where_parts = ["r.user_id = $1"]
+    params: list = [user_id]
+
+    if q:
+        params.append(f"%{q.lower()}%")
+        where_parts.append(f"LOWER(r.name) LIKE ${len(params)}")
+    if category:
+        params.append(category)
+        where_parts.append(f"r.category = ${len(params)}")
+
+    where_sql = " AND ".join(where_parts)
+    rows = await db.fetch(
+        f"""
+        SELECT r.id, r.name, r.name_original, r.emoji, r.servings, r.cook_time_minutes,
+               r.category, r.tags, r.times_cooked, r.rating, r.source_url, r.source_type,
+               r.notes, r.created_at,
+               (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredients_count
+        FROM recipes r
+        WHERE {where_sql}
+        ORDER BY r.created_at DESC
+        """,
+        *params,
+    )
+    return {
+        "recipes": [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "name_original": r["name_original"],
+                "emoji": r["emoji"] or "🍽",
+                "servings": r["servings"],
+                "cook_time_minutes": r["cook_time_minutes"],
+                "cook_time_min": r["cook_time_minutes"],   # compat
+                "category": r["category"],
+                "tags": list(r["tags"] or []),
+                "times_cooked": r["times_cooked"] or 0,
+                "rating": r["rating"],
+                "source_url": r["source_url"],
+                "source_type": r["source_type"] or "manual",
+                "notes": r["notes"],
+                "ingredients_count": r["ingredients_count"] or 0,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
+# ── POST /api/recipes  (add to personal library directly) ────────────────────
+
+@app.post("/api/recipes", status_code=201)
+async def create_recipe(body: dict, user_id: int = Depends(get_current_user), db=Depends(get_db)):
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "name required")
 
     rec = await db.fetchrow(
         """
-        INSERT INTO recipes (event_id, name, emoji, servings, cook_time_min, source_url, added_by_user_id, added_by_name)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+        INSERT INTO recipes
+            (user_id, name, name_original, emoji, source_url, source_type,
+             original_language, servings, cook_time_minutes, category, notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        RETURNING *
         """,
-        event_id, name,
+        user_id, name,
+        body.get("name_original"),
         body.get("emoji", "🍽"),
-        body.get("servings", 4),
-        body.get("cook_time_min"),
         body.get("source_url"),
-        user_id,
-        body.get("added_by_name", ""),
+        body.get("source_type", "manual"),
+        body.get("original_language"),
+        body.get("servings", 4),
+        body.get("cook_time_min") or body.get("cook_time_minutes"),
+        body.get("category"),
+        body.get("notes"),
     )
 
-    # Persist ingredients
     for i, ing in enumerate(body.get("ingredients", [])):
         ing_name = (ing.get("name") or "").strip()
         if not ing_name:
@@ -611,17 +924,13 @@ async def add_recipe(event_id: int, body: dict, user_id: int = Depends(get_curre
             except (TypeError, ValueError):
                 qty_val = None
         await db.execute(
-            """
-            INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order)
-            VALUES ($1,$2,$3,$4,$5,$6)
-            """,
+            "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
             rec["id"], ing_name, qty_val,
             (ing.get("unit") or "").strip(),
             categorize_ingredient(ing_name),
             i,
         )
 
-    # Persist steps
     for i, step in enumerate(body.get("steps", [])):
         step_text = (step.get("text") or "").strip()
         if not step_text:
@@ -632,9 +941,10 @@ async def add_recipe(event_id: int, body: dict, user_id: int = Depends(get_curre
         )
 
     return {
-        "id": rec["id"], "name": rec["name"], "emoji": rec["emoji"],
-        "servings": rec["servings"],
-        "added_at": rec["created_at"].isoformat() if rec["created_at"] else None,
+        "id": rec["id"], "name": rec["name"], "emoji": rec["emoji"] or "🍽",
+        "user_id": rec["user_id"], "servings": rec["servings"],
+        "cook_time_minutes": rec["cook_time_minutes"],
+        "created_at": rec["created_at"].isoformat() if rec["created_at"] else None,
     }
 
 
@@ -645,14 +955,20 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
     rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
     if not rec:
         raise HTTPException(404, "Recipe not found")
-    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", rec["event_id"])
-    if not ev:
-        raise HTTPException(404, "Event not found")
-    is_collab = await db.fetchval(
-        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", rec["event_id"], user_id
-    )
-    if ev["telegram_user_id"] != user_id and not is_collab:
-        raise HTTPException(403, "Access denied")
+
+    # Access: recipe owner OR collaborator in any event that contains this recipe
+    if rec["user_id"] != user_id:
+        has_access = await db.fetchval(
+            """
+            SELECT 1 FROM event_recipes er
+            JOIN collaborators c ON c.event_id = er.event_id
+            WHERE er.recipe_id = $1 AND c.telegram_user_id = $2
+            LIMIT 1
+            """,
+            recipe_id, user_id,
+        )
+        if not has_access:
+            raise HTTPException(403, "Access denied")
 
     ingredients = await db.fetch(
         "SELECT * FROM ingredients WHERE recipe_id=$1 ORDER BY sort_order, id", recipe_id
@@ -661,15 +977,25 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
         "SELECT * FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id
     )
 
+    rec_dict = dict(rec)
+    cook_time = rec_dict.get("cook_time_minutes") or rec_dict.get("cook_time_min")
+
     return {
         "id": rec["id"],
-        "event_id": rec["event_id"],
+        "user_id": rec["user_id"],
         "name": rec["name"],
+        "name_original": rec_dict.get("name_original"),
         "emoji": rec["emoji"] or "🍽",
         "servings": rec["servings"],
-        "cook_time_min": rec["cook_time_min"],
-        "source_url": rec["source_url"],
-        "added_by": {"user_id": rec["added_by_user_id"], "first_name": rec["added_by_name"] or "Гость"},
+        "cook_time_minutes": cook_time,
+        "cook_time_min": cook_time,   # compat
+        "source_url": rec_dict.get("source_url"),
+        "source_type": rec_dict.get("source_type") or "manual",
+        "category": rec_dict.get("category"),
+        "tags": list(rec_dict.get("tags") or []),
+        "times_cooked": rec_dict.get("times_cooked") or 0,
+        "rating": rec_dict.get("rating"),
+        "notes": rec_dict.get("notes"),
         "created_at": rec["created_at"].isoformat() if rec["created_at"] else None,
         "ingredients": [
             {
@@ -686,16 +1012,18 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
     }
 
 
-# ── DELETE /api/events/{id}/recipes/{id} ──────────────────────────────────────
+# ── DELETE /api/recipes/{id}  (remove from library entirely) ─────────────────
 
-@app.delete("/api/events/{event_id}/recipes/{recipe_id}", status_code=204)
-async def delete_recipe(event_id: int, recipe_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)):
-    rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1 AND event_id=$2", recipe_id, event_id)
+@app.delete("/api/recipes/{recipe_id}", status_code=204)
+async def delete_recipe_from_library(
+    recipe_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    rec = await db.fetchrow("SELECT user_id FROM recipes WHERE id=$1", recipe_id)
     if not rec:
-        raise HTTPException(404, "Not found")
-    owner = await db.fetchval("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
-    if rec["added_by_user_id"] != user_id and owner != user_id:
+        raise HTTPException(404, "Recipe not found")
+    if rec["user_id"] != user_id:
         raise HTTPException(403, "Access denied")
+    # CASCADE removes ingredients, recipe_steps, event_recipes links
     await db.execute("DELETE FROM recipes WHERE id=$1", recipe_id)
 
 
@@ -731,22 +1059,6 @@ async def join_event(event_id: int, body: dict, user_id: int = Depends(get_curre
         event_id, user_id, body.get("first_name", ""), body.get("username", ""),
     )
     return {"status": "joined", "role": "collaborator"}
-
-
-# ── Shared (no-auth) ──────────────────────────────────────────────────────────
-
-@app.get("/api/events/shared/{event_id}")
-async def get_shared_event(event_id: int, db=Depends(get_db)):
-    row = await db.fetchrow(
-        "SELECT id, name, event_date, location, guests_count FROM events WHERE id=$1", event_id
-    )
-    if not row:
-        raise HTTPException(404, "Not found")
-    return {
-        "id": row["id"], "name": row["name"],
-        "event_date": row["event_date"].isoformat() if row["event_date"] else None,
-        "location": row["location"], "guests_count": row["guests_count"], "read_only": True,
-    }
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -816,7 +1128,8 @@ async def cmd_start(message: Message):
         await message.answer(
             f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
             f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-            f"Создавайте события, составляйте меню и зовите гостей.\n"
+            f"📚 Кидайте рецепты прямо сюда — ссылку, фото или текст.\n"
+            f"Бот сохранит в вашу личную библиотеку.\n\n"
             f"Нажмите кнопку <b>ПОЛЯНА</b> внизу экрана 👇",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -848,14 +1161,14 @@ async def _bg_init():
     except Exception as e:
         _db_error = f"{type(e).__name__}: {e}"
         log.error("init_db error: %s", e)
-    # Start bot regardless (it will retry polling if needed)
+    # Start bot regardless
     asyncio.create_task(run_bot())
 
 
 @app.on_event("startup")
 async def startup():
     log.info("FastAPI starting on port %d", PORT)
-    asyncio.create_task(_bg_init())  # non-blocking: health endpoint responds immediately
+    asyncio.create_task(_bg_init())  # non-blocking: /health responds immediately
 
 
 if __name__ == "__main__":
