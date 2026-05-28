@@ -335,12 +335,24 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_events_user        ON events(telegram_user_id);
             CREATE INDEX IF NOT EXISTS idx_collab_event       ON collaborators(event_id);
             CREATE INDEX IF NOT EXISTS idx_collab_user        ON collaborators(telegram_user_id);
-            CREATE INDEX IF NOT EXISTS idx_recipes_user       ON recipes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_recipes_user_id    ON recipes(user_id);
             CREATE INDEX IF NOT EXISTS idx_recipes_user_name  ON recipes(user_id, name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_user_source_url
+                ON recipes(user_id, source_url) WHERE source_url IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_event_recipes_evt  ON event_recipes(event_id);
             CREATE INDEX IF NOT EXISTS idx_event_recipes_rec  ON event_recipes(recipe_id);
             CREATE INDEX IF NOT EXISTS idx_ingredients_rec    ON ingredients(recipe_id);
             CREATE INDEX IF NOT EXISTS idx_shopping_event     ON shopping_items(event_id);
+        """)
+
+        # Rename old index if it exists under the old name
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_recipes_user')
+                   AND NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_recipes_user_id')
+                THEN ALTER INDEX idx_recipes_user RENAME TO idx_recipes_user_id; END IF;
+            END $$;
         """)
 
         # ── Backfill share_token ──────────────────────────────────────────────
@@ -454,6 +466,68 @@ async def health():
         "status": "ok", "service": "ПОЛЯНА API v3.0",
         "db_ready": _db_ready,
         "db_error": _db_error,
+    }
+
+
+@app.get("/api/admin/migration-check")
+async def migration_check(db=Depends(get_db)):
+    """Structural migration verification — returns only counts/metadata, no user data."""
+    # БЛОК 1: orphan check
+    recipes_without_user = await db.fetchval(
+        "SELECT COUNT(*) FROM recipes WHERE user_id IS NULL"
+    )
+    recipes_with_zero = await db.fetchval(
+        "SELECT COUNT(*) FROM recipes WHERE user_id = 0"
+    )
+
+    # БЛОК 1: priority check sample (first 10 rows)
+    priority_rows = await db.fetch("""
+        SELECT r.id,
+               r.user_id,
+               r.added_by_user_id,
+               CASE
+                 WHEN r.added_by_user_id IS NOT NULL
+                      THEN r.user_id = r.added_by_user_id
+                 ELSE NULL
+               END AS priority_correct
+        FROM recipes r
+        LIMIT 10
+    """)
+
+    # БЛОК 1: duplicates in event_recipes
+    dup_count = await db.fetchval("""
+        SELECT COUNT(*) FROM (
+            SELECT event_id, recipe_id FROM event_recipes
+            GROUP BY event_id, recipe_id HAVING COUNT(*) > 1
+        ) x
+    """)
+
+    # БЛОК 4: indexes on recipes
+    indexes = await db.fetch(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'recipes' ORDER BY indexname"
+    )
+
+    # БЛОК 4: constraints on recipes
+    constraints = await db.fetch("""
+        SELECT conname, contype, pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conrelid = 'recipes'::regclass
+        ORDER BY conname
+    """)
+
+    # event_recipes columns (verify added_by_id exists)
+    er_columns = await db.fetch(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='event_recipes' ORDER BY ordinal_position"
+    )
+
+    return {
+        "блок1_recipes_without_user": recipes_without_user,
+        "блок1_recipes_user_id_zero": recipes_with_zero,
+        "блок1_priority_sample": [dict(r) for r in priority_rows],
+        "блок1_event_recipes_duplicates": dup_count,
+        "блок4_indexes_on_recipes": [{"name": r["indexname"], "def": r["indexdef"]} for r in indexes],
+        "блок4_constraints_on_recipes": [{"name": r["conname"], "type": r["contype"], "def": r["def"]} for r in constraints],
+        "event_recipes_columns": [r["column_name"] for r in er_columns],
     }
 
 
