@@ -1808,8 +1808,8 @@ async def handle_text_message(message: Message):
             await _reply_parse_error(status, e, "рецепт")
         return
 
-    # Plain text — only try if it's long enough to be a recipe
-    if len(text) < 100:
+    # Plain text — only try if it's long enough to be a recipe (skip greetings/commands)
+    if len(text) < 30:
         return   # too short, silently ignore
 
     status = await message.reply("⏳ Разбираю рецепт...")
