@@ -467,7 +467,7 @@ async def _llm_parse_text(text: str, source_type: str = "text") -> dict | None:
     """Parse recipe from text using Gemini 2.5 Flash via OpenRouter."""
     client = _get_or_client()
     resp = await client.chat.completions.create(
-        model="google/gemini-2.5-flash-preview-05-20",
+        model="google/gemini-2.5-flash",
         messages=[
             {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
             {"role": "user", "content": f"Контент:\n\n{text[:8000]}"},
