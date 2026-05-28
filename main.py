@@ -1236,6 +1236,7 @@ async def add_recipe_to_event(event_id: int, body: dict, user_id: int = Depends(
             """,
             event_id, rec["id"], mult, user_id,
         )
+        await _resync_shopping_if_exists(event_id, db)
         return {
             "id": rec["id"], "name": rec["name"],
             "emoji": rec["emoji"] or "🍽",
@@ -1303,6 +1304,7 @@ async def add_recipe_to_event(event_id: int, body: dict, user_id: int = Depends(
             event_id, rec["id"], user_id,
         )
 
+        await _resync_shopping_if_exists(event_id, db)
         return {
             "id": rec["id"], "name": rec["name"],
             "emoji": rec["emoji"] or "🍽",
@@ -1358,6 +1360,7 @@ async def unlink_recipe_from_event(
     await db.execute(
         "DELETE FROM event_recipes WHERE event_id=$1 AND recipe_id=$2", event_id, recipe_id
     )
+    await _resync_shopping_if_exists(event_id, db)
 
 
 # ── GET /api/recipes  (personal library) ─────────────────────────────────────
@@ -1551,6 +1554,14 @@ async def update_recipe(
                 "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
                 recipe_id, i + 1, step_text,
             )
+
+    # If ingredients changed, resync shopping for every event using this recipe
+    if "ingredients" in body:
+        evt_rows = await db.fetch(
+            "SELECT event_id FROM event_recipes WHERE recipe_id=$1", recipe_id
+        )
+        for er in evt_rows:
+            await _resync_shopping_if_exists(er["event_id"], db)
 
     return {"id": recipe_id, "ok": True}
 
@@ -1761,25 +1772,47 @@ async def _generate_shopping_list(event_id: int, db) -> int:
                 "category": row["category"] or "прочее",
             }
 
+    # Preserve "bought" state across regeneration (key by lower name + unit)
+    prev = await db.fetch(
+        "SELECT name, unit, bought FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE",
+        event_id,
+    )
+    bought_state = {
+        (p["name"].lower().strip(), (p["unit"] or "").strip().lower()): p["bought"]
+        for p in prev
+    }
+
     # Remove previously generated items (keep manual ones)
     await db.execute(
         "DELETE FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE", event_id
     )
 
     # Insert aggregated items
-    for item in agg.values():
+    for key, item in agg.items():
         qty_val = item["qty"] if item["qty"] > 0 else None
         qty_str = _fmt_qty(qty_val)
         display_qty = f"{qty_str} {item['unit']}".strip() if qty_str else (item["unit"] or None)
+        was_bought = bought_state.get(key, False)
         await db.execute(
             """
             INSERT INTO shopping_items (event_id, name, quantity, qty, unit, category, is_generated, bought)
-            VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE)
+            VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
             """,
-            event_id, item["name"], display_qty, qty_val, item["unit"], item["category"],
+            event_id, item["name"], display_qty, qty_val, item["unit"], item["category"], was_bought,
         )
 
     return len(agg)
+
+
+async def _resync_shopping_if_exists(event_id: int, db) -> None:
+    """Regenerate the shopping list, but only if one was already generated for
+    this event — so adding/removing a recipe keeps an existing list in sync
+    without building one for events the user never opened shopping for."""
+    has_generated = await db.fetchval(
+        "SELECT 1 FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE LIMIT 1", event_id
+    )
+    if has_generated:
+        await _generate_shopping_list(event_id, db)
 
 
 # ── GET /api/events/{id}/shopping ─────────────────────────────────────────────
