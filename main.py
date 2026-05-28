@@ -353,15 +353,9 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_shopping_event     ON shopping_items(event_id);
         """)
 
-        # Rename old index if it exists under the old name
-        await c.execute("""
-            DO $$
-            BEGIN
-                IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_recipes_user')
-                   AND NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_recipes_user_id')
-                THEN ALTER INDEX idx_recipes_user RENAME TO idx_recipes_user_id; END IF;
-            END $$;
-        """)
+        # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
+        await c.execute("DROP INDEX IF EXISTS idx_recipes_user")
+        await c.execute("DROP INDEX IF EXISTS idx_recipes_event")
 
         # ── Backfill share_token ──────────────────────────────────────────────
         rows = await c.fetch("SELECT id FROM events WHERE share_token IS NULL")
