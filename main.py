@@ -1482,6 +1482,79 @@ async def create_recipe(body: dict, user_id: int = Depends(get_current_user), db
     }
 
 
+# ── PATCH /api/recipes/{id}  (edit recipe + ingredients/steps) ───────────────
+
+@app.patch("/api/recipes/{recipe_id}")
+async def update_recipe(
+    recipe_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    rec = await db.fetchrow("SELECT user_id FROM recipes WHERE id=$1", recipe_id)
+    if not rec:
+        raise HTTPException(404, "Recipe not found")
+    if rec["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    # Update scalar fields that are present in the body
+    scalar_map = {
+        "name": "name",
+        "emoji": "emoji",
+        "servings": "servings",
+        "category": "category",
+        "notes": "notes",
+    }
+    sets, params = [], []
+    for body_key, col in scalar_map.items():
+        if body_key in body and body[body_key] is not None:
+            params.append(body[body_key])
+            sets.append(f"{col} = ${len(params)}")
+    # cook time accepts either alias
+    if "cook_time_min" in body or "cook_time_minutes" in body:
+        params.append(body.get("cook_time_min") or body.get("cook_time_minutes"))
+        sets.append(f"cook_time_minutes = ${len(params)}")
+    if sets:
+        params.append(recipe_id)
+        await db.execute(
+            f"UPDATE recipes SET {', '.join(sets)} WHERE id = ${len(params)}", *params
+        )
+
+    # Replace ingredients if the key is present (even if empty list = clear all)
+    if "ingredients" in body:
+        await db.execute("DELETE FROM ingredients WHERE recipe_id=$1", recipe_id)
+        for i, ing in enumerate(body.get("ingredients") or []):
+            ing_name = (ing.get("name") or "").strip()
+            if not ing_name:
+                continue
+            raw_qty = ing.get("qty")
+            qty_val = None
+            if raw_qty not in (None, "", 0):
+                try:
+                    qty_val = float(raw_qty)
+                except (TypeError, ValueError):
+                    qty_val = None
+            await db.execute(
+                "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
+                recipe_id, ing_name, qty_val,
+                (ing.get("unit") or "").strip(),
+                categorize_ingredient(ing_name),
+                i,
+            )
+
+    # Replace steps if present
+    if "steps" in body:
+        await db.execute("DELETE FROM recipe_steps WHERE recipe_id=$1", recipe_id)
+        for i, step in enumerate(body.get("steps") or []):
+            step_text = (step.get("text") or "").strip()
+            if not step_text:
+                continue
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                recipe_id, i + 1, step_text,
+            )
+
+    return {"id": recipe_id, "ok": True}
+
+
 # ── GET /api/recipes/{id} ─────────────────────────────────────────────────────
 
 @app.get("/api/recipes/{recipe_id}")
