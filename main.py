@@ -25,7 +25,6 @@ FRONTEND_URL = ENV("FRONTEND_URL", "")
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
-GROQ_API_KEY = ENV("GROQ_API_KEY", "")
 
 pool = None
 _db_ready = False
@@ -429,7 +428,6 @@ qty: только число (1.5, 200, 3)
 Переведи название на русский если оригинал не русский."""
 
 _or_client = None
-_groq_client = None
 
 
 def _get_or_client():
@@ -443,19 +441,6 @@ def _get_or_client():
             base_url="https://openrouter.ai/api/v1",
         )
     return _or_client
-
-
-def _get_groq_client():
-    global _groq_client
-    if _groq_client is None:
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY не задан в env")
-        from openai import AsyncOpenAI
-        _groq_client = AsyncOpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
-    return _groq_client
 
 
 async def _llm_parse_text(text: str, source_type: str = "text") -> dict | None:
@@ -506,10 +491,10 @@ async def _llm_parse_image(image_bytes: bytes) -> dict | None:
 
 
 async def _transcribe_voice(audio_bytes: bytes) -> str:
-    """Transcribe voice via Groq Whisper large-v3."""
-    client = _get_groq_client()
+    """Transcribe voice via OpenRouter (openai/whisper-large-v3)."""
+    client = _get_or_client()
     resp = await client.audio.transcriptions.create(
-        model="whisper-large-v3",
+        model="openai/whisper-large-v3",
         file=("voice.ogg", io.BytesIO(audio_bytes), "audio/ogg"),
         language="ru",
     )
