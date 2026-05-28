@@ -45,7 +45,7 @@ async def get_db():
 async def init_db():
     global pool, _db_ready
     pool = await asyncio.wait_for(
-        asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=60),
+        asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, command_timeout=30),
         timeout=30,
     )
     async with pool.acquire() as c:
