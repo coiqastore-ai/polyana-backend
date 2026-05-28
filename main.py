@@ -1230,8 +1230,21 @@ async def update_event(event_id: int, body: dict, user_id: int = Depends(get_cur
 @app.delete("/api/events/{event_id}", status_code=204)
 async def delete_event(event_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)):
     owner = await db.fetchval("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if owner is None:
+        raise HTTPException(404, "Event not found")
     if owner != user_id:
         raise HTTPException(403, "Access denied")
+    # Explicitly remove children first — don't rely on FK ON DELETE CASCADE,
+    # since legacy tables in production may have been created without it.
+    # (Recipes are library-owned and shared, so they are NOT deleted here.)
+    await db.execute("DELETE FROM shopping_items WHERE event_id=$1", event_id)
+    await db.execute("DELETE FROM event_recipes  WHERE event_id=$1", event_id)
+    await db.execute("DELETE FROM collaborators   WHERE event_id=$1", event_id)
+    # Legacy table from an older schema — clean up only if it still exists.
+    try:
+        await db.execute("DELETE FROM event_menu_items WHERE event_id=$1", event_id)
+    except asyncpg.UndefinedTableError:
+        pass
     await db.execute("DELETE FROM events WHERE id=$1", event_id)
 
 
