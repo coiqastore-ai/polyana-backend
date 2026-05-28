@@ -540,11 +540,45 @@ async def _transcribe_voice(audio_bytes: bytes) -> str:
     return resp.text
 
 
-def _try_recipe_scraper(url: str) -> dict | None:
-    """Try recipe-scrapers for 300+ known sites. Returns None for unsupported sites."""
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
+
+
+async def _fetch_page_html(url: str) -> str:
+    """Fetch raw HTML with browser-like headers. Raises httpx.HTTPStatusError on failure."""
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        resp = await client.get(url, headers=_BROWSER_HEADERS)
+        resp.raise_for_status()
+    return resp.text
+
+
+def _html_to_text(html: str) -> str:
+    """Strip tags and return readable text (max 8 000 chars) for LLM."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)[:8000]
+
+
+def _try_recipe_scraper(url: str, html: str) -> dict | None:
+    """Try recipe-scrapers with pre-fetched HTML. Returns None if site not supported."""
     try:
-        from recipe_scrapers import scrape_me
-        scraper = scrape_me(url)
+        from recipe_scrapers import scrape_html
+        scraper = scrape_html(html, org_url=url)
         try:
             raw_yield = str(scraper.yields() or "4")
             servings = int(re.search(r'\d+', raw_yield).group()) if re.search(r'\d+', raw_yield) else 4
@@ -562,8 +596,11 @@ def _try_recipe_scraper(url: str) -> dict | None:
             raw = scraper.instructions()
             if raw:
                 steps = [{"text": raw.strip()}]
+        title = scraper.title() or ""
+        if not title or not ingredients:
+            return None   # scraper found nothing useful, fall through to LLM
         return {
-            "name": scraper.title() or "Рецепт",
+            "name": title or "Рецепт",
             "servings": servings,
             "cook_time_minutes": scraper.total_time() or None,
             "ingredients": ingredients,
@@ -572,19 +609,6 @@ def _try_recipe_scraper(url: str) -> dict | None:
         }
     except Exception:
         return None
-
-
-async def _fetch_page_text(url: str) -> str:
-    """Fetch URL and extract readable text for LLM."""
-    from bs4 import BeautifulSoup
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; RecipeBot/1.0)"})
-        resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    return text[:8000]
 
 
 async def parse_and_save_recipe(
@@ -599,11 +623,23 @@ async def parse_and_save_recipe(
     parsed: dict | None = None
 
     if url:
-        # 1. Try recipe-scrapers (fast, no LLM)
-        parsed = _try_recipe_scraper(url)
+        # 1. Fetch HTML once with browser headers
+        try:
+            html = await _fetch_page_html(url)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (403, 429, 503):
+                raise ValueError(
+                    f"Сайт закрыл доступ для бота (HTTP {code}).\n"
+                    "Скопируйте текст рецепта со страницы и пришлите его мне напрямую."
+                ) from exc
+            raise ValueError(f"Не удалось загрузить страницу (HTTP {code}).") from exc
+
+        # 2. Try recipe-scrapers (structured, no LLM cost)
+        parsed = _try_recipe_scraper(url, html)
         if parsed is None:
-            # 2. Fetch HTML + LLM fallback
-            page_text = await _fetch_page_text(url)
+            # 3. LLM fallback: feed plain text
+            page_text = _html_to_text(html)
             parsed = await _llm_parse_text(page_text, source_type="url")
         if parsed:
             parsed["source_url"] = url
@@ -615,7 +651,18 @@ async def parse_and_save_recipe(
     elif audio_bytes:
         transcript = await _transcribe_voice(audio_bytes)
         log.info("Voice transcript: %s", transcript[:200])
-        parsed = await _llm_parse_text(transcript, source_type="voice")
+        if not transcript or len(transcript.strip()) < 10:
+            raise ValueError("Не удалось распознать речь. Попробуйте говорить чётче или пришлите текст.")
+        parsed = await _llm_parse_text(
+            f"[Голосовое сообщение, расшифровка Whisper]\n\n{transcript}",
+            source_type="voice",
+        )
+        if not parsed:
+            raise ValueError(
+                f"Не смог извлечь рецепт из голосового.\n\n"
+                f"Распознанный текст:\n«{transcript[:300]}»\n\n"
+                "Если это рецепт — пришлите текстом."
+            )
 
     elif text:
         parsed = await _llm_parse_text(text, source_type="manual")
@@ -1717,11 +1764,14 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
 
 async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
     msg = str(err)
-    if "not_a_recipe" in msg or "Не удалось распознать" in msg:
+    if isinstance(err, ValueError):
+        # User-facing ValueError: show the message directly, it's already human-readable
+        await status_msg.edit_text(f"🤷 {msg}")
+    elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
         await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
     else:
-        log.error("parse error: %s", err)
-        await status_msg.edit_text(f"❌ Ошибка при разборе.\n<code>{msg[:200]}</code>")
+        log.error("parse error (%s): %s", hint, err)
+        await status_msg.edit_text(f"❌ Ошибка при разборе.\n<code>{msg[:300]}</code>")
 
 
 # ── /add command ──────────────────────────────────────────────────────────────
