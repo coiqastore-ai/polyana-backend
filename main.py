@@ -271,6 +271,25 @@ async def init_db():
             END $$;
         """)
 
+        # ── Migration G: Extend shopping_items for aggregated list ──────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='qty')
+                    THEN ALTER TABLE shopping_items ADD COLUMN qty FLOAT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='unit')
+                    THEN ALTER TABLE shopping_items ADD COLUMN unit TEXT DEFAULT ''; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='category')
+                    THEN ALTER TABLE shopping_items ADD COLUMN category TEXT DEFAULT 'прочее'; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='is_generated')
+                    THEN ALTER TABLE shopping_items ADD COLUMN is_generated BOOLEAN DEFAULT FALSE; END IF;
+            END $$;
+        """)
+
         # ── Migration F: Ensure ingredients has all required columns ──────────
         await c.execute("""
             DO $$
@@ -1490,6 +1509,177 @@ async def join_event(event_id: int, body: dict, user_id: int = Depends(get_curre
         event_id, user_id, body.get("first_name", ""), body.get("username", ""),
     )
     return {"status": "joined", "role": "collaborator"}
+
+
+# ── Shopping list helpers ─────────────────────────────────────────────────────
+
+def _fmt_qty(qty: float | None) -> str:
+    """Format a float quantity to a clean string (1.5 → '1.5', 2.0 → '2')."""
+    if qty is None or qty == 0:
+        return ""
+    if qty == int(qty):
+        return str(int(qty))
+    return f"{qty:.2f}".rstrip("0").rstrip(".")
+
+
+CATEGORY_ORDER = [
+    "мясо", "рыба", "овощи", "фрукты", "молочное", "яйца",
+    "крупы", "мука", "масло", "соусы", "специи", "орехи",
+    "сахар", "консервы", "хлеб", "грибы", "напитки", "прочее",
+]
+
+
+async def _generate_shopping_list(event_id: int, db) -> int:
+    """Aggregate ingredients from all event recipes into shopping_items.
+    Deletes previously generated items, inserts fresh aggregated ones.
+    Returns number of items generated."""
+
+    rows = await db.fetch(
+        """
+        SELECT i.name, i.qty, i.unit, i.category, er.servings_multiplier
+        FROM event_recipes er
+        JOIN ingredients i ON i.recipe_id = er.recipe_id
+        WHERE er.event_id = $1
+        """,
+        event_id,
+    )
+
+    # Aggregate by (lower_name, unit) — sum qty × multiplier
+    agg: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row["name"].lower().strip(), (row["unit"] or "").strip().lower())
+        mult = float(row["servings_multiplier"] or 1.0)
+        qty = (float(row["qty"]) if row["qty"] else 0.0) * mult
+        if key in agg:
+            agg[key]["qty"] = (agg[key]["qty"] or 0.0) + qty
+        else:
+            agg[key] = {
+                "name": row["name"].strip(),
+                "qty": qty,
+                "unit": (row["unit"] or "").strip(),
+                "category": row["category"] or "прочее",
+            }
+
+    # Remove previously generated items (keep manual ones)
+    await db.execute(
+        "DELETE FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE", event_id
+    )
+
+    # Insert aggregated items
+    for item in agg.values():
+        qty_val = item["qty"] if item["qty"] > 0 else None
+        qty_str = _fmt_qty(qty_val)
+        display_qty = f"{qty_str} {item['unit']}".strip() if qty_str else (item["unit"] or None)
+        await db.execute(
+            """
+            INSERT INTO shopping_items (event_id, name, quantity, qty, unit, category, is_generated, bought)
+            VALUES ($1,$2,$3,$4,$5,$6,TRUE,FALSE)
+            """,
+            event_id, item["name"], display_qty, qty_val, item["unit"], item["category"],
+        )
+
+    return len(agg)
+
+
+# ── GET /api/events/{id}/shopping ─────────────────────────────────────────────
+
+@app.get("/api/events/{event_id}/shopping")
+async def get_shopping_list(
+    event_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    # Auto-generate if no generated items exist yet
+    has_generated = await db.fetchval(
+        "SELECT 1 FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE LIMIT 1", event_id
+    )
+    if not has_generated:
+        await _generate_shopping_list(event_id, db)
+
+    items = await db.fetch(
+        "SELECT * FROM shopping_items WHERE event_id=$1 ORDER BY category, name", event_id
+    )
+    total = len(items)
+    bought_count = sum(1 for i in items if i["bought"])
+
+    # Group by category
+    grouped: dict[str, list] = {}
+    for item in items:
+        cat = item["category"] or "прочее"
+        grouped.setdefault(cat, []).append({
+            "id": item["id"],
+            "name": item["name"],
+            "qty": item["qty"],
+            "unit": item["unit"] or "",
+            "quantity": item["quantity"] or "",
+            "category": cat,
+            "bought": bool(item["bought"]),
+            "is_generated": bool(item["is_generated"]),
+        })
+
+    # Sort categories by known order
+    def cat_sort(cat):
+        try:
+            return CATEGORY_ORDER.index(cat)
+        except ValueError:
+            return 99
+
+    categories = [
+        {"name": cat, "items": grouped[cat]}
+        for cat in sorted(grouped.keys(), key=cat_sort)
+    ]
+
+    return {"items": categories, "total": total, "bought": bought_count}
+
+
+# ── POST /api/events/{id}/shopping/sync ───────────────────────────────────────
+
+@app.post("/api/events/{event_id}/shopping/sync")
+async def sync_shopping_list(
+    event_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    count = await _generate_shopping_list(event_id, db)
+    return {"generated": count}
+
+
+# ── PATCH /api/events/{id}/shopping/{item_id} ────────────────────────────────
+
+@app.patch("/api/events/{event_id}/shopping/{item_id}")
+async def toggle_shopping_item(
+    event_id: int, item_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    bought = bool(body.get("bought", False))
+    await db.execute(
+        "UPDATE shopping_items SET bought=$1 WHERE id=$2 AND event_id=$3",
+        bought, item_id, event_id,
+    )
+    return {"id": item_id, "bought": bought}
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
