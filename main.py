@@ -5,6 +5,7 @@ from urllib.parse import parse_qsl
 import asyncpg
 from fastapi import FastAPI, HTTPException, Header, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -319,6 +320,11 @@ async def init_db():
                                WHERE table_name='shopping_items' AND column_name='added_by')
                     THEN ALTER TABLE shopping_items ADD COLUMN added_by BIGINT; END IF;
             END $$;
+        """)
+
+        # ── Migration I: recipes — store source photo file_id ─────────────────
+        await c.execute("""
+            ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source_photo_file_id TEXT;
         """)
 
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
@@ -698,6 +704,7 @@ async def parse_and_save_recipe(
     url: str | None = None,
     text: str | None = None,
     image_bytes: bytes | None = None,
+    image_file_id: str | None = None,
     audio_bytes: bytes | None = None,
 ) -> dict:
     """Full pipeline: detect type → LLM parse → save to DB. Returns saved recipe dict."""
@@ -728,6 +735,8 @@ async def parse_and_save_recipe(
 
     elif image_bytes:
         parsed = await _llm_parse_image(image_bytes)
+        if parsed and image_file_id:
+            parsed["source_photo_file_id"] = image_file_id
 
     elif audio_bytes:
         transcript = await _transcribe_voice(audio_bytes)
@@ -765,8 +774,8 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 """
                 INSERT INTO recipes
                     (user_id, name, name_original, emoji, source_url, source_type,
-                     original_language, servings, cook_time_minutes, category)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     original_language, servings, cook_time_minutes, category, source_photo_file_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 RETURNING *
                 """,
                 user_id,
@@ -779,6 +788,7 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 int(parsed["servings"]) if parsed.get("servings") else 4,
                 int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
                 parsed.get("category"),
+                parsed.get("source_photo_file_id"),
             )
         except asyncpg.UniqueViolationError:
             # Same URL already in this user's library — return existing
@@ -910,6 +920,31 @@ async def health():
         "db_ready": _db_ready,
         "db_error": _db_error,
     }
+
+
+# ── GET /api/files/photo/{file_id}  (proxy a Telegram photo) ─────────────────
+# Streams the image bytes through the backend so the bot token stays server-side.
+# Public (no auth) — <img> tags cannot send the init-data header. file_id is opaque.
+
+@app.get("/api/files/photo/{file_id}")
+async def get_recipe_photo(file_id: str):
+    if not file_id or len(file_id) > 256:
+        raise HTTPException(404, "Bad file id")
+    try:
+        tg_file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(tg_file.file_path, buf)
+    except Exception:
+        raise HTTPException(404, "Photo not available")
+    data = buf.getvalue()
+    if not data:
+        raise HTTPException(404, "Empty photo")
+    # Telegram photos are JPEG
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/admin/migration-check")
@@ -1609,6 +1644,7 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
         "cook_time_min": cook_time,   # compat
         "source_url": rec_dict.get("source_url"),
         "source_type": rec_dict.get("source_type") or "manual",
+        "source_photo_file_id": rec_dict.get("source_photo_file_id"),
         "category": rec_dict.get("category"),
         "tags": list(rec_dict.get("tags") or []),
         "times_cooked": rec_dict.get("times_cooked") or 0,
@@ -2078,7 +2114,9 @@ async def handle_photo_message(message: Message):
         file = await bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
-        recipe = await parse_and_save_recipe(message.from_user.id, image_bytes=buf.getvalue())
+        recipe = await parse_and_save_recipe(
+            message.from_user.id, image_bytes=buf.getvalue(), image_file_id=photo.file_id
+        )
         await _reply_recipe_saved(message, recipe, status)
     except Exception as e:
         await _reply_parse_error(status, e, "рецепт на фото")
