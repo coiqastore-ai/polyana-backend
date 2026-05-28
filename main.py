@@ -210,8 +210,16 @@ async def init_db():
                     WHERE r.event_id = e.id AND r.user_id IS NULL;
                 END IF;
 
-                -- Default any remaining nulls to 0
-                UPDATE recipes SET user_id = 0 WHERE user_id IS NULL;
+                -- Default any remaining nulls to -1 (orphan marker — not a real Telegram ID)
+                UPDATE recipes SET user_id = -1 WHERE user_id IS NULL;
+
+                -- Set NOT NULL now that every row has a value
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='recipes' AND column_name='user_id' AND is_nullable = 'YES'
+                ) THEN
+                    ALTER TABLE recipes ALTER COLUMN user_id SET NOT NULL;
+                END IF;
 
                 -- Rename cook_time_min → cook_time_minutes
                 IF EXISTS (SELECT 1 FROM information_schema.columns
