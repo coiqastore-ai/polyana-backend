@@ -244,6 +244,23 @@ async def init_db():
             END $$;
         """)
 
+        # ── Migration E: Ensure event_recipes has all required columns ──────────
+        # Handles the case where event_recipes was created with an older/partial schema
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='event_recipes' AND column_name='servings_multiplier')
+                    THEN ALTER TABLE event_recipes ADD COLUMN servings_multiplier FLOAT DEFAULT 1.0; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='event_recipes' AND column_name='added_by_id')
+                    THEN ALTER TABLE event_recipes ADD COLUMN added_by_id BIGINT NOT NULL DEFAULT 0; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='event_recipes' AND column_name='added_at')
+                    THEN ALTER TABLE event_recipes ADD COLUMN added_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+            END $$;
+        """)
+
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
         await c.execute("""
             DO $$
