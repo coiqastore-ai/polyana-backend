@@ -1601,6 +1601,51 @@ async def update_recipe(
     return {"id": recipe_id, "ok": True}
 
 
+# ── POST /api/recipes/{id}/normalize-ingredients ─────────────────────────────
+# Re-runs the LLM normalizer over the recipe's current ingredient names —
+# useful for recipes imported before normalization existed (raw "500г свинины"
+# strings with no qty/unit). Owner-only.
+
+@app.post("/api/recipes/{recipe_id}/normalize-ingredients")
+async def normalize_recipe_ingredients(
+    recipe_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    rec = await db.fetchrow("SELECT user_id FROM recipes WHERE id=$1", recipe_id)
+    if not rec:
+        raise HTTPException(404, "Recipe not found")
+    if rec["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    ings = await db.fetch(
+        "SELECT name FROM ingredients WHERE recipe_id=$1 ORDER BY sort_order, id", recipe_id
+    )
+    raw = [i["name"] for i in ings if (i["name"] or "").strip()]
+    if not raw:
+        return {"updated": 0}
+
+    normalized = await _llm_normalize_ingredients(raw)
+
+    await db.execute("DELETE FROM ingredients WHERE recipe_id=$1", recipe_id)
+    for idx, ing in enumerate(normalized):
+        ing_name = (ing.get("name") or "").strip()
+        if not ing_name:
+            continue
+        await db.execute(
+            "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
+            recipe_id, ing_name, ing.get("qty"),
+            (ing.get("unit") or "").strip(),
+            ing.get("category") or categorize_ingredient(ing_name),
+            idx,
+        )
+
+    # Keep shopping lists in sync for events using this recipe
+    evt_rows = await db.fetch("SELECT event_id FROM event_recipes WHERE recipe_id=$1", recipe_id)
+    for er in evt_rows:
+        await _resync_shopping_if_exists(er["event_id"], db)
+
+    return {"updated": len(normalized)}
+
+
 # ── GET /api/recipes/{id} ─────────────────────────────────────────────────────
 
 @app.get("/api/recipes/{recipe_id}")
@@ -2069,6 +2114,37 @@ async def cmd_add(message: Message):
     )
 
 
+# ── Text recipe buffering ─────────────────────────────────────────────────────
+# A long recipe pasted into Telegram is auto-split into multiple messages
+# (>4096 chars), or a user may send it in parts. We debounce: accumulate
+# consecutive text messages for a few seconds, then parse them as one recipe.
+
+_text_buffers: dict[int, dict] = {}
+_TEXT_DEBOUNCE_SEC = 3.5
+
+
+async def _flush_text_buffer(user_id: int):
+    try:
+        await asyncio.sleep(_TEXT_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        return   # a new part arrived; a fresh task will handle the flush
+    buf = _text_buffers.pop(user_id, None)
+    if not buf:
+        return
+    combined = "\n".join(buf["parts"]).strip()
+    status = buf["status_msg"]
+    try:
+        recipe = await parse_and_save_recipe(user_id, text=combined)
+        await _reply_recipe_saved(status, recipe, status_msg=status)
+    except ValueError:
+        try:
+            await status.delete()   # silently drop non-recipe text
+        except Exception:
+            pass
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепт")
+
+
 # ── Text / URL handler ────────────────────────────────────────────────────────
 
 @dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
@@ -2092,14 +2168,18 @@ async def handle_text_message(message: Message, state: FSMContext):
     if len(text) < 30:
         return   # too short, silently ignore
 
-    status = await message.reply("⏳ Разбираю рецепт...")
-    try:
-        recipe = await parse_and_save_recipe(message.from_user.id, text=text)
-        await _reply_recipe_saved(message, recipe, status)
-    except ValueError:
-        await status.delete()   # silently drop non-recipe text
-    except Exception as e:
-        await _reply_parse_error(status, e, "рецепт")
+    # Buffer it: a recipe split across several messages gets combined before parsing
+    uid = message.from_user.id
+    buf = _text_buffers.get(uid)
+    if buf:
+        buf["parts"].append(text)
+        if buf.get("task"):
+            buf["task"].cancel()
+    else:
+        status = await message.reply("⏳ Собираю рецепт…")
+        buf = {"parts": [text], "status_msg": status, "task": None}
+        _text_buffers[uid] = buf
+    buf["task"] = asyncio.create_task(_flush_text_buffer(uid))
 
 
 # ── Photo handler ─────────────────────────────────────────────────────────────
