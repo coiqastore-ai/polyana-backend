@@ -1,4 +1,5 @@
 import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re
+import httpx
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
@@ -267,6 +268,25 @@ async def init_db():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                                WHERE table_name='event_recipes' AND column_name='added_at')
                     THEN ALTER TABLE event_recipes ADD COLUMN added_at TIMESTAMPTZ DEFAULT NOW(); END IF;
+            END $$;
+        """)
+
+        # ── Migration F: Ensure ingredients has all required columns ──────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ingredients' AND column_name='qty')
+                    THEN ALTER TABLE ingredients ADD COLUMN qty FLOAT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ingredients' AND column_name='unit')
+                    THEN ALTER TABLE ingredients ADD COLUMN unit TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ingredients' AND column_name='category')
+                    THEN ALTER TABLE ingredients ADD COLUMN category TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ingredients' AND column_name='sort_order')
+                    THEN ALTER TABLE ingredients ADD COLUMN sort_order INT DEFAULT 0; END IF;
             END $$;
         """)
 
