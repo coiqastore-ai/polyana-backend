@@ -1,12 +1,12 @@
-import os, hashlib, hmac, json, asyncio, secrets, time, logging
+import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
 from fastapi import FastAPI, HTTPException, Header, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BotCommand, BotCommandScopeAllPrivateChats,
     MenuButtonWebApp, Message,
@@ -24,6 +24,8 @@ DATABASE_URL = ENV("DATABASE_URL", "")
 FRONTEND_URL = ENV("FRONTEND_URL", "")
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
+OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
+GROQ_API_KEY = ENV("GROQ_API_KEY", "")
 
 pool = None
 _db_ready = False
@@ -399,6 +401,293 @@ def categorize_ingredient(name: str) -> str:
             if kw in n:
                 return cat
     return "прочее"
+
+
+# ── LLM Recipe Parsing ────────────────────────────────────────────────────────
+
+_URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+
+RECIPE_SYSTEM_PROMPT = """Ты — кулинарный редактор. Из присланного контента извлеки рецепт и верни строго JSON.
+Если это НЕ рецепт — верни {"not_a_recipe": true}.
+
+JSON-схема (все поля опциональны кроме name):
+{
+  "name": "название на русском",
+  "name_original": "оригинал если не русский",
+  "emoji": "одна эмодзи",
+  "servings": 4,
+  "cook_time_minutes": 90,
+  "category": "ужин",
+  "original_language": "ru",
+  "ingredients": [{"name": "Свинина шейка", "qty": 1.5, "unit": "кг"}],
+  "steps": [{"text": "Нарезать мясо кусками по 4-5 см"}]
+}
+
+category: завтрак|обед|ужин|десерт|суп|салат|закуска|напиток|выпечка|другое
+unit: г/кг/мл/л/шт/ст.л/ч.л/щепотка/по вкусу
+qty: только число (1.5, 200, 3)
+Переведи название на русский если оригинал не русский."""
+
+_or_client = None
+_groq_client = None
+
+
+def _get_or_client():
+    global _or_client
+    if _or_client is None:
+        if not OPENROUTER_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY не задан в env")
+        from openai import AsyncOpenAI
+        _or_client = AsyncOpenAI(
+            api_key=OPENROUTER_KEY,
+            base_url="https://openrouter.ai/api/v1",
+        )
+    return _or_client
+
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        if not GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY не задан в env")
+        from openai import AsyncOpenAI
+        _groq_client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+    return _groq_client
+
+
+async def _llm_parse_text(text: str, source_type: str = "text") -> dict | None:
+    """Parse recipe from text using Gemini 2.5 Flash via OpenRouter."""
+    client = _get_or_client()
+    resp = await client.chat.completions.create(
+        model="google/gemini-2.5-flash-preview-05-20",
+        messages=[
+            {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Контент:\n\n{text[:8000]}"},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=2500,
+    )
+    raw = resp.choices[0].message.content
+    data = json.loads(raw)
+    if data.get("not_a_recipe"):
+        return None
+    data["source_type"] = source_type
+    return data
+
+
+async def _llm_parse_image(image_bytes: bytes) -> dict | None:
+    """Parse recipe from image using Qwen 2.5 VL via OpenRouter."""
+    import base64
+    client = _get_or_client()
+    b64 = base64.b64encode(image_bytes).decode()
+    resp = await client.chat.completions.create(
+        model="qwen/qwen2.5-vl-72b-instruct",
+        messages=[
+            {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": "Это изображение рецепта. Извлеки и верни JSON."},
+            ]},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=2500,
+    )
+    raw = resp.choices[0].message.content
+    data = json.loads(raw)
+    if data.get("not_a_recipe"):
+        return None
+    data["source_type"] = "photo"
+    return data
+
+
+async def _transcribe_voice(audio_bytes: bytes) -> str:
+    """Transcribe voice via Groq Whisper large-v3."""
+    client = _get_groq_client()
+    resp = await client.audio.transcriptions.create(
+        model="whisper-large-v3",
+        file=("voice.ogg", io.BytesIO(audio_bytes), "audio/ogg"),
+        language="ru",
+    )
+    return resp.text
+
+
+def _try_recipe_scraper(url: str) -> dict | None:
+    """Try recipe-scrapers for 300+ known sites. Returns None for unsupported sites."""
+    try:
+        from recipe_scrapers import scrape_me
+        scraper = scrape_me(url)
+        try:
+            raw_yield = str(scraper.yields() or "4")
+            servings = int(re.search(r'\d+', raw_yield).group()) if re.search(r'\d+', raw_yield) else 4
+        except Exception:
+            servings = 4
+        ingredients = []
+        for ing_str in (scraper.ingredients() or []):
+            ingredients.append({"name": ing_str.strip(), "qty": None, "unit": ""})
+        steps = []
+        try:
+            for s in (scraper.instructions_list() or []):
+                if s.strip():
+                    steps.append({"text": s.strip()})
+        except Exception:
+            raw = scraper.instructions()
+            if raw:
+                steps = [{"text": raw.strip()}]
+        return {
+            "name": scraper.title() or "Рецепт",
+            "servings": servings,
+            "cook_time_minutes": scraper.total_time() or None,
+            "ingredients": ingredients,
+            "steps": steps,
+            "source_type": "url",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_page_text(url: str) -> str:
+    """Fetch URL and extract readable text for LLM."""
+    from bs4 import BeautifulSoup
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; RecipeBot/1.0)"})
+        resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    return text[:8000]
+
+
+async def parse_and_save_recipe(
+    user_id: int,
+    *,
+    url: str | None = None,
+    text: str | None = None,
+    image_bytes: bytes | None = None,
+    audio_bytes: bytes | None = None,
+) -> dict:
+    """Full pipeline: detect type → LLM parse → save to DB. Returns saved recipe dict."""
+    parsed: dict | None = None
+
+    if url:
+        # 1. Try recipe-scrapers (fast, no LLM)
+        parsed = _try_recipe_scraper(url)
+        if parsed is None:
+            # 2. Fetch HTML + LLM fallback
+            page_text = await _fetch_page_text(url)
+            parsed = await _llm_parse_text(page_text, source_type="url")
+        if parsed:
+            parsed["source_url"] = url
+            parsed.setdefault("source_type", "url")
+
+    elif image_bytes:
+        parsed = await _llm_parse_image(image_bytes)
+
+    elif audio_bytes:
+        transcript = await _transcribe_voice(audio_bytes)
+        log.info("Voice transcript: %s", transcript[:200])
+        parsed = await _llm_parse_text(transcript, source_type="voice")
+
+    elif text:
+        parsed = await _llm_parse_text(text, source_type="manual")
+
+    if not parsed:
+        raise ValueError("Не удалось распознать рецепт в этом контенте")
+
+    return await _save_parsed_recipe(user_id, parsed)
+
+
+async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
+    """Persist a parsed recipe dict to DB. Returns minimal response dict."""
+    if pool is None:
+        raise RuntimeError("DB not ready")
+
+    async with pool.acquire() as db:
+        try:
+            rec = await db.fetchrow(
+                """
+                INSERT INTO recipes
+                    (user_id, name, name_original, emoji, source_url, source_type,
+                     original_language, servings, cook_time_minutes, category)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                RETURNING *
+                """,
+                user_id,
+                (parsed.get("name") or "Рецепт").strip(),
+                parsed.get("name_original"),
+                parsed.get("emoji") or "🍽",
+                parsed.get("source_url"),
+                parsed.get("source_type", "manual"),
+                parsed.get("original_language"),
+                int(parsed["servings"]) if parsed.get("servings") else 4,
+                int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
+                parsed.get("category"),
+            )
+        except asyncpg.UniqueViolationError:
+            # Same URL already in this user's library — return existing
+            existing = await db.fetchrow(
+                "SELECT * FROM recipes WHERE user_id=$1 AND source_url=$2",
+                user_id, parsed.get("source_url"),
+            )
+            ing_count = await db.fetchval(
+                "SELECT COUNT(*) FROM ingredients WHERE recipe_id=$1", existing["id"]
+            )
+            return {
+                "id": existing["id"], "name": existing["name"],
+                "emoji": existing["emoji"] or "🍽",
+                "servings": existing["servings"],
+                "cook_time_minutes": existing["cook_time_minutes"],
+                "category": existing["category"],
+                "ingredients_count": ing_count or 0,
+                "already_exists": True,
+            }
+
+        recipe_id = rec["id"]
+        ing_count = 0
+        for i, ing in enumerate(parsed.get("ingredients", [])):
+            ing_name = (ing.get("name") or "").strip()
+            if not ing_name:
+                continue
+            raw_qty = ing.get("qty")
+            qty_val = None
+            if raw_qty not in (None, "", 0):
+                try:
+                    qty_val = float(str(raw_qty).replace(",", "."))
+                except (TypeError, ValueError):
+                    pass
+            await db.execute(
+                "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
+                recipe_id, ing_name, qty_val,
+                (ing.get("unit") or "").strip(),
+                categorize_ingredient(ing_name),
+                i,
+            )
+            ing_count += 1
+
+        for i, step in enumerate(parsed.get("steps", [])):
+            step_text = (step.get("text") or "").strip()
+            if not step_text:
+                continue
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                recipe_id, i + 1, step_text,
+            )
+
+    return {
+        "id": recipe_id,
+        "name": rec["name"],
+        "emoji": rec["emoji"] or "🍽",
+        "servings": rec["servings"],
+        "cook_time_minutes": rec["cook_time_minutes"],
+        "category": rec["category"],
+        "ingredients_count": ing_count,
+        "already_exists": False,
+    }
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -1105,6 +1394,50 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
     }
 
 
+# ── POST /api/recipes/import-url  (Mini App → import by URL) ─────────────────
+
+@app.post("/api/recipes/import-url", status_code=201)
+async def import_recipe_url(
+    body: dict,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "url required")
+    if not url.startswith("http"):
+        raise HTTPException(400, "Invalid URL")
+    try:
+        recipe = await parse_and_save_recipe(user_id, url=url)
+        return recipe
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.error("import-url error: %s", e)
+        raise HTTPException(500, f"Parsing failed: {str(e)[:200]}")
+
+
+# ── POST /api/recipes/import-text  (Mini App → import free text) ──────────────
+
+@app.post("/api/recipes/import-text", status_code=201)
+async def import_recipe_text(
+    body: dict,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text required")
+    try:
+        recipe = await parse_and_save_recipe(user_id, text=text)
+        return recipe
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.error("import-text error: %s", e)
+        raise HTTPException(500, f"Parsing failed: {str(e)[:200]}")
+
+
 # ── DELETE /api/recipes/{id}  (remove from library entirely) ─────────────────
 
 @app.delete("/api/recipes/{recipe_id}", status_code=204)
@@ -1159,6 +1492,127 @@ async def join_event(event_id: int, body: dict, user_id: int = Depends(get_curre
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
+
+# ── Bot helpers ───────────────────────────────────────────────────────────────
+
+async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
+    """Send/edit recipe-saved confirmation with Open + AddToEvent buttons."""
+    ct = recipe.get("cook_time_minutes")
+    already = recipe.get("already_exists", False)
+    header = "📚 Рецепт уже в библиотеке!" if already else "✅ <b>Сохранено в библиотеку!</b>"
+    ct_str = f"⏱ {ct} мин · " if ct else ""
+    cat_str = f"[{recipe['category']}] " if recipe.get("category") else ""
+    body = (
+        f"{header}\n\n"
+        f"{recipe['emoji']} <b>{recipe['name']}</b>\n"
+        f"{cat_str}🍽 {recipe['servings']} порц. · {ct_str}"
+        f"🥕 {recipe['ingredients_count']} ингр."
+    )
+    recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
+    add_url = f"{FRONTEND_URL}?screen=add_to_event&recipe_id={recipe['id']}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
+        InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
+    ]])
+    if status_msg:
+        await status_msg.edit_text(body, reply_markup=kb)
+    else:
+        await message.answer(body, reply_markup=kb)
+
+
+async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
+    msg = str(err)
+    if "not_a_recipe" in msg or "Не удалось распознать" in msg:
+        await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
+    else:
+        log.error("parse error: %s", err)
+        await status_msg.edit_text(f"❌ Ошибка при разборе.\n<code>{msg[:200]}</code>")
+
+
+# ── /add command ──────────────────────────────────────────────────────────────
+
+@dp.message(Command("add"))
+async def cmd_add(message: Message):
+    await message.answer(
+        "📥 <b>Добавление рецепта</b>\n\n"
+        "Пришлите мне:\n"
+        "• 🔗 Ссылку на любой сайт с рецептом\n"
+        "• 📝 Текст рецепта\n"
+        "• 📸 Фото рецепта (из книги, экрана)\n"
+        "• 🎙 Голосовое сообщение\n\n"
+        "<i>Рецепт сохранится в вашу личную библиотеку.</i>"
+    )
+
+
+# ── Text / URL handler ────────────────────────────────────────────────────────
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_text_message(message: Message):
+    if not message.from_user or pool is None:
+        return
+    text = message.text or ""
+    url_match = _URL_RE.search(text)
+
+    if url_match:
+        url = url_match.group(0).rstrip(".,)")   # strip trailing punctuation
+        status = await message.reply("⏳ Читаю рецепт по ссылке...")
+        try:
+            recipe = await parse_and_save_recipe(message.from_user.id, url=url)
+            await _reply_recipe_saved(message, recipe, status)
+        except Exception as e:
+            await _reply_parse_error(status, e, "рецепт")
+        return
+
+    # Plain text — only try if it's long enough to be a recipe
+    if len(text) < 100:
+        return   # too short, silently ignore
+
+    status = await message.reply("⏳ Разбираю рецепт...")
+    try:
+        recipe = await parse_and_save_recipe(message.from_user.id, text=text)
+        await _reply_recipe_saved(message, recipe, status)
+    except ValueError:
+        await status.delete()   # silently drop non-recipe text
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепт")
+
+
+# ── Photo handler ─────────────────────────────────────────────────────────────
+
+@dp.message(F.photo)
+async def handle_photo_message(message: Message):
+    if not message.from_user or pool is None:
+        return
+    status = await message.reply("⏳ Читаю рецепт с фото...")
+    try:
+        photo = message.photo[-1]   # largest size
+        file = await bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        recipe = await parse_and_save_recipe(message.from_user.id, image_bytes=buf.getvalue())
+        await _reply_recipe_saved(message, recipe, status)
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепт на фото")
+
+
+# ── Voice handler ─────────────────────────────────────────────────────────────
+
+@dp.message(F.voice)
+async def handle_voice_message(message: Message):
+    if not message.from_user or pool is None:
+        return
+    status = await message.reply("⏳ Слушаю и распознаю...")
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        recipe = await parse_and_save_recipe(message.from_user.id, audio_bytes=buf.getvalue())
+        await _reply_recipe_saved(message, recipe, status)
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепт из голосового")
+
+
+# ── /start command ────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -1221,9 +1675,13 @@ async def cmd_start(message: Message):
         await message.answer(
             f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
             f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-            f"📚 Кидайте рецепты прямо сюда — ссылку, фото или текст.\n"
-            f"Бот сохранит в вашу личную библиотеку.\n\n"
-            f"Нажмите кнопку <b>ПОЛЯНА</b> внизу экрана 👇",
+            f"<b>Как добавить рецепт в библиотеку:</b>\n"
+            f"• 🔗 Пришли ссылку на рецепт\n"
+            f"• 📸 Фото рецепта из книги или экрана\n"
+            f"• 🎙 Голосовое сообщение\n"
+            f"• 📝 Текст рецепта\n"
+            f"• /add — явный режим добавления\n\n"
+            f"Откройте ПОЛЯНУ кнопкой внизу экрана 👇",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -1234,7 +1692,10 @@ async def run_bot():
             menu_button=MenuButtonWebApp(text="ПОЛЯНА", web_app=WebAppInfo(url=FRONTEND_URL))
         )
         await bot.set_my_commands(
-            [BotCommand(command="start", description="Главное меню")],
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="add", description="Добавить рецепт в библиотеку"),
+            ],
             scope=BotCommandScopeAllPrivateChats(),
         )
         log.info("Bot polling...")
