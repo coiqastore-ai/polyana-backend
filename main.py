@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     BotCommand, BotCommandScopeAllPrivateChats,
     MenuButtonWebApp, Message, CallbackQuery,
@@ -1929,7 +1929,7 @@ async def cmd_add(message: Message):
 
 # ── Text / URL handler ────────────────────────────────────────────────────────
 
-@dp.message(F.text & ~F.text.startswith("/"), ~VoiceStates.editing)
+@dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
 async def handle_text_message(message: Message, state: FSMContext):
     if not message.from_user or pool is None:
         return
