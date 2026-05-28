@@ -10,11 +10,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BotCommand, BotCommandScopeAllPrivateChats,
-    MenuButtonWebApp, Message,
+    MenuButtonWebApp, Message, CallbackQuery,
     ReplyKeyboardRemove, WebAppInfo,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("polyana")
@@ -598,13 +600,21 @@ async def _llm_parse_image(image_bytes: bytes) -> dict | None:
     return data
 
 
+_WHISPER_PROMPT = (
+    "Кулинарный рецепт. Точно распознай названия продуктов, цифры и единицы измерения: "
+    "граммы, килограммы, штуки, ложки, стаканы. "
+    "Пример правильного ввода: «возьмите 500 граммов свинины, 3 луковицы, 2 столовые ложки масла»."
+)
+
 async def _transcribe_voice(audio_bytes: bytes) -> str:
-    """Transcribe voice via OpenRouter (openai/whisper-large-v3)."""
+    """Transcribe voice via OpenRouter (openai/whisper-large-v3) with culinary hint."""
     client = _get_or_client()
     resp = await client.audio.transcriptions.create(
         model="openai/whisper-large-v3",
         file=("voice.ogg", io.BytesIO(audio_bytes), "audio/ogg"),
         language="ru",
+        temperature=0.1,
+        prompt=_WHISPER_PROMPT,
     )
     return resp.text
 
@@ -1855,6 +1865,10 @@ async def toggle_shopping_item(
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
+# FSM states for voice recipe editing flow
+class VoiceStates(StatesGroup):
+    editing = State()   # User is typing a corrected transcript
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -1915,8 +1929,8 @@ async def cmd_add(message: Message):
 
 # ── Text / URL handler ────────────────────────────────────────────────────────
 
-@dp.message(F.text & ~F.text.startswith("/"))
-async def handle_text_message(message: Message):
+@dp.message(F.text & ~F.text.startswith("/"), ~VoiceStates.editing)
+async def handle_text_message(message: Message, state: FSMContext):
     if not message.from_user or pool is None:
         return
     text = message.text or ""
@@ -1964,21 +1978,102 @@ async def handle_photo_message(message: Message):
         await _reply_parse_error(status, e, "рецепт на фото")
 
 
-# ── Voice handler ─────────────────────────────────────────────────────────────
+# ── Voice handler (FSM) ───────────────────────────────────────────────────────
+
+def _voice_transcript_kb(transcript: str) -> InlineKeyboardMarkup:
+    """Keyboard shown after transcription: confirm / edit / cancel."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Верно, сохранить",   callback_data="voice_ok")],
+        [InlineKeyboardButton(text="✏️ Исправить текст",    callback_data="voice_edit")],
+        [InlineKeyboardButton(text="❌ Отмена",             callback_data="voice_cancel")],
+    ])
+
 
 @dp.message(F.voice)
-async def handle_voice_message(message: Message):
+async def handle_voice_message(message: Message, state: FSMContext):
     if not message.from_user or pool is None:
         return
-    status = await message.reply("⏳ Слушаю и распознаю...")
+    status = await message.reply("🎙 Распознаю голос…")
     try:
         file = await bot.get_file(message.voice.file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
-        recipe = await parse_and_save_recipe(message.from_user.id, audio_bytes=buf.getvalue())
+        transcript = await _transcribe_voice(buf.getvalue())
+        log.info("Voice transcript: %s", transcript[:200])
+    except Exception as e:
+        await status.edit_text(f"❌ Не удалось распознать голос.\n<code>{str(e)[:200]}</code>")
+        return
+
+    if not transcript or len(transcript.strip()) < 5:
+        await status.edit_text("🤷 Голосовое слишком короткое или тихое — ничего не разобрал.")
+        return
+
+    # Save transcript in FSM so callbacks can use it
+    await state.update_data(transcript=transcript, user_id=message.from_user.id)
+
+    preview = transcript[:400] + ("…" if len(transcript) > 400 else "")
+    await status.edit_text(
+        f"📝 <b>Распознанный текст:</b>\n\n<i>{preview}</i>\n\nВсё верно?",
+        reply_markup=_voice_transcript_kb(transcript),
+    )
+
+
+@dp.callback_query(F.data == "voice_ok")
+async def voice_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    transcript = data.get("transcript", "")
+    user_id = data.get("user_id") or (callback.from_user.id if callback.from_user else None)
+    if not transcript or not user_id:
+        await callback.answer("Сессия истекла, пришли голосовое снова", show_alert=True)
+        return
+    await callback.message.edit_text("⏳ Разбираю рецепт…", reply_markup=None)
+    try:
+        recipe = await parse_and_save_recipe(
+            user_id,
+            text=f"[Голосовое сообщение, расшифровка Whisper]\n\n{transcript}",
+        )
+        await state.clear()
+        await _reply_recipe_saved(callback.message, recipe)
+    except Exception as e:
+        await _reply_parse_error(callback.message, e, "рецепт из голосового")
+        await state.clear()
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "voice_edit")
+async def voice_edit(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(VoiceStates.editing)
+    await callback.message.edit_text(
+        "✏️ Отправьте исправленный текст рецепта (можно дополнить/поправить):",
+        reply_markup=None,
+    )
+    await callback.answer()
+
+
+@dp.message(VoiceStates.editing, F.text)
+async def voice_edited_text(message: Message, state: FSMContext):
+    if not message.from_user or pool is None:
+        return
+    edited = (message.text or "").strip()
+    if len(edited) < 10:
+        await message.reply("Текст слишком короткий, попробуй ещё раз.")
+        return
+    await state.update_data(transcript=edited)
+    status = await message.reply("⏳ Разбираю рецепт…")
+    try:
+        recipe = await parse_and_save_recipe(message.from_user.id, text=edited)
+        await state.clear()
         await _reply_recipe_saved(message, recipe, status)
     except Exception as e:
         await _reply_parse_error(status, e, "рецепт из голосового")
+        await state.clear()
+
+
+@dp.callback_query(F.data == "voice_cancel")
+async def voice_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Отменено.", reply_markup=None)
+    await callback.answer()
 
 
 # ── /start command ────────────────────────────────────────────────────────────
