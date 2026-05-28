@@ -309,6 +309,16 @@ async def init_db():
             END $$;
         """)
 
+        # ── Migration H: shopping_items — add added_by column ─────────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='added_by')
+                    THEN ALTER TABLE shopping_items ADD COLUMN added_by BIGINT; END IF;
+            END $$;
+        """)
+
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
         await c.execute("""
             DO $$
@@ -482,6 +492,65 @@ def _get_or_client():
     return _or_client
 
 
+async def _llm_normalize_ingredients(raw_strings: list[str]) -> list[dict]:
+    """
+    Post-process raw ingredient strings from recipe-scrapers
+    (e.g. '500г свинины шейки') into structured dicts with qty/unit/category.
+    Falls back gracefully: if LLM fails, returns original strings as name-only.
+    """
+    if not raw_strings:
+        return []
+    # Skip if already very few items — not worth an LLM call
+    # Build a numbered list for the LLM
+    numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(raw_strings))
+    client = _get_or_client()
+    prompt = (
+        "Нормализуй список ингредиентов рецепта. "
+        "Каждая строка содержит количество, единицу и название вместе. "
+        "Верни JSON-массив объектов строго в том же порядке:\n"
+        '[{"name":"Свинина шейка","qty":500,"unit":"г","category":"мясо"}]\n\n'
+        "Правила:\n"
+        "- name: только название продукта, без количества\n"
+        "- qty: только число (float) или null\n"
+        "- unit: г/кг/мл/л/шт/ст.л/ч.л/щепотка/по вкусу  или \"\"\n"
+        "- category: мясо|рыба|овощи|фрукты|молочное|яйца|крупы|мука|масло|соусы|специи|орехи|сахар|консервы|хлеб|грибы|напитки|прочее\n"
+        "- Не выдумывай, не меняй состав\n\n"
+        f"Список ({len(raw_strings)} шт.):\n{numbered}"
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model="google/gemini-2.5-flash",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=2000,
+        )
+        data = json.loads(resp.choices[0].message.content)
+        # Response may be {"items": [...]} or just [...]
+        items = data if isinstance(data, list) else data.get("items") or data.get("ingredients") or []
+        if len(items) == len(raw_strings):
+            result = []
+            for item in items:
+                raw_qty = item.get("qty")
+                qty_val = None
+                if raw_qty not in (None, "", 0):
+                    try:
+                        qty_val = float(str(raw_qty).replace(",", "."))
+                    except (TypeError, ValueError):
+                        pass
+                result.append({
+                    "name": (item.get("name") or "").strip() or raw_strings[len(result)],
+                    "qty": qty_val,
+                    "unit": (item.get("unit") or "").strip(),
+                    "category": item.get("category") or "прочее",
+                })
+            return result
+    except Exception as e:
+        log.warning("_llm_normalize_ingredients failed: %s", e)
+    # Fallback: return as name-only
+    return [{"name": s.strip(), "qty": None, "unit": "", "category": "прочее"} for s in raw_strings]
+
+
 async def _llm_parse_text(text: str, source_type: str = "text") -> dict | None:
     """Parse recipe from text using Gemini 2.5 Flash via OpenRouter."""
     client = _get_or_client()
@@ -574,7 +643,7 @@ def _html_to_text(html: str) -> str:
     return soup.get_text(separator="\n", strip=True)[:8000]
 
 
-def _try_recipe_scraper(url: str, html: str) -> dict | None:
+async def _try_recipe_scraper(url: str, html: str) -> dict | None:
     """Try recipe-scrapers with pre-fetched HTML. Returns None if site not supported."""
     try:
         from recipe_scrapers import scrape_html
@@ -584,9 +653,7 @@ def _try_recipe_scraper(url: str, html: str) -> dict | None:
             servings = int(re.search(r'\d+', raw_yield).group()) if re.search(r'\d+', raw_yield) else 4
         except Exception:
             servings = 4
-        ingredients = []
-        for ing_str in (scraper.ingredients() or []):
-            ingredients.append({"name": ing_str.strip(), "qty": None, "unit": ""})
+        raw_ingredient_strings = [s.strip() for s in (scraper.ingredients() or []) if s.strip()]
         steps = []
         try:
             for s in (scraper.instructions_list() or []):
@@ -597,10 +664,14 @@ def _try_recipe_scraper(url: str, html: str) -> dict | None:
             if raw:
                 steps = [{"text": raw.strip()}]
         title = scraper.title() or ""
-        if not title or not ingredients:
+        if not title or not raw_ingredient_strings:
             return None   # scraper found nothing useful, fall through to LLM
+
+        # Normalize raw strings ("500г свинины") → {name, qty, unit, category}
+        ingredients = await _llm_normalize_ingredients(raw_ingredient_strings)
+
         return {
-            "name": title or "Рецепт",
+            "name": title,
             "servings": servings,
             "cook_time_minutes": scraper.total_time() or None,
             "ingredients": ingredients,
@@ -636,7 +707,7 @@ async def parse_and_save_recipe(
             raise ValueError(f"Не удалось загрузить страницу (HTTP {code}).") from exc
 
         # 2. Try recipe-scrapers (structured, no LLM cost)
-        parsed = _try_recipe_scraper(url, html)
+        parsed = await _try_recipe_scraper(url, html)
         if parsed is None:
             # 3. LLM fallback: feed plain text
             page_text = _html_to_text(html)
@@ -1703,6 +1774,59 @@ async def sync_shopping_list(
 
     count = await _generate_shopping_list(event_id, db)
     return {"generated": count}
+
+
+# ── POST /api/events/{id}/shopping  (manual add) ─────────────────────────────
+
+@app.post("/api/events/{event_id}/shopping", status_code=201)
+async def add_manual_shopping_item(
+    event_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name required")
+    qty_str = (body.get("quantity") or "").strip() or None
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO shopping_items (event_id, name, quantity, is_generated, bought, added_by)
+        VALUES ($1, $2, $3, FALSE, FALSE, $4)
+        RETURNING *
+        """,
+        event_id, name, qty_str, user_id,
+    )
+    return {"id": row["id"], "name": row["name"], "quantity": row["quantity"],
+            "bought": row["bought"], "is_generated": False}
+
+
+# ── DELETE /api/events/{id}/shopping/{item_id} ────────────────────────────────
+
+@app.delete("/api/events/{event_id}/shopping/{item_id}", status_code=204)
+async def delete_shopping_item(
+    event_id: int, item_id: int,
+    user_id: int = Depends(get_current_user), db=Depends(get_db)
+):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+    await db.execute(
+        "DELETE FROM shopping_items WHERE id=$1 AND event_id=$2", item_id, event_id
+    )
 
 
 # ── PATCH /api/events/{id}/shopping/{item_id} ────────────────────────────────
