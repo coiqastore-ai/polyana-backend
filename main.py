@@ -327,6 +327,27 @@ async def init_db():
             ALTER TABLE recipes ADD COLUMN IF NOT EXISTS source_photo_file_id TEXT;
         """)
 
+        # ── Migration J: shopping_items — add `quantity` (legacy table had
+        #    total_grams/total_display instead). ALL inserts write `quantity`,
+        #    so without this column generation and manual-add both fail. ───────
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='quantity')
+                THEN
+                    ALTER TABLE shopping_items ADD COLUMN quantity TEXT;
+                    -- Backfill from the legacy display column if it exists
+                    IF EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='shopping_items' AND column_name='total_display')
+                    THEN
+                        UPDATE shopping_items SET quantity = total_display
+                        WHERE quantity IS NULL AND total_display IS NOT NULL;
+                    END IF;
+                END IF;
+            END $$;
+        """)
+
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
         await c.execute("""
             DO $$
