@@ -1979,7 +1979,23 @@ async def get_shopping_list(
         for cat in sorted(grouped.keys(), key=cat_sort)
     ]
 
-    return {"items": categories, "total": total, "bought": bought_count}
+    # Diagnostics so the UI can explain an empty list (no recipes vs no ingredients)
+    linked_recipes = await db.fetchval(
+        "SELECT COUNT(*) FROM event_recipes WHERE event_id=$1", event_id
+    ) or 0
+    ingredient_rows = await db.fetchval(
+        """
+        SELECT COUNT(*) FROM event_recipes er
+        JOIN ingredients i ON i.recipe_id = er.recipe_id
+        WHERE er.event_id=$1 AND COALESCE(TRIM(i.name),'') <> ''
+        """,
+        event_id,
+    ) or 0
+
+    return {
+        "items": categories, "total": total, "bought": bought_count,
+        "linked_recipes": linked_recipes, "ingredient_rows": ingredient_rows,
+    }
 
 
 # ── POST /api/events/{id}/shopping/sync ───────────────────────────────────────
