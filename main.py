@@ -1891,21 +1891,35 @@ async def _generate_shopping_list(event_id: int, db) -> int:
         "DELETE FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE", event_id
     )
 
-    # Insert aggregated items
+    # Insert aggregated items — per-row guarded so one bad row can't wipe the list
+    inserted = 0
     for key, item in agg.items():
         qty_val = item["qty"] if item["qty"] > 0 else None
         qty_str = _fmt_qty(qty_val)
         display_qty = f"{qty_str} {item['unit']}".strip() if qty_str else (item["unit"] or None)
         was_bought = bought_state.get(key, False)
-        await db.execute(
-            """
-            INSERT INTO shopping_items (event_id, name, quantity, qty, unit, category, is_generated, bought)
-            VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
-            """,
-            event_id, item["name"], display_qty, qty_val, item["unit"], item["category"], was_bought,
-        )
+        try:
+            await db.execute(
+                """
+                INSERT INTO shopping_items (event_id, name, quantity, qty, unit, category, is_generated, bought)
+                VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
+                """,
+                event_id, item["name"], display_qty, qty_val, item["unit"], item["category"], was_bought,
+            )
+            inserted += 1
+        except asyncpg.UndefinedColumnError:
+            # Older schema — insert what the base table guarantees
+            await db.execute(
+                "INSERT INTO shopping_items (event_id, name, quantity, bought) VALUES ($1,$2,$3,$4)",
+                event_id, item["name"], display_qty, was_bought,
+            )
+            inserted += 1
+        except Exception:
+            log.exception("shopping insert failed for event %s item %r", event_id, item.get("name"))
+            continue
+    log.info("shopping generated for event %s: %s/%s items", event_id, inserted, len(agg))
 
-    return len(agg)
+    return inserted
 
 
 async def _resync_shopping_if_exists(event_id: int, db) -> None:
