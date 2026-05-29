@@ -1853,14 +1853,23 @@ async def _generate_shopping_list(event_id: int, db) -> int:
     # Aggregate by (lower_name, unit) — sum qty × multiplier
     agg: dict[tuple, dict] = {}
     for row in rows:
-        key = (row["name"].lower().strip(), (row["unit"] or "").strip().lower())
-        mult = float(row["servings_multiplier"] or 1.0)
-        qty = (float(row["qty"]) if row["qty"] else 0.0) * mult
+        raw_name = (row["name"] or "").strip()
+        if not raw_name:
+            continue  # skip ingredients with empty/NULL name — never crash the list
+        key = (raw_name.lower(), (row["unit"] or "").strip().lower())
+        try:
+            mult = float(row["servings_multiplier"] or 1.0)
+        except (TypeError, ValueError):
+            mult = 1.0
+        try:
+            qty = (float(row["qty"]) if row["qty"] else 0.0) * mult
+        except (TypeError, ValueError):
+            qty = 0.0
         if key in agg:
             agg[key]["qty"] = (agg[key]["qty"] or 0.0) + qty
         else:
             agg[key] = {
-                "name": row["name"].strip(),
+                "name": raw_name,
                 "qty": qty,
                 "unit": (row["unit"] or "").strip(),
                 "category": row["category"] or "прочее",
@@ -1872,8 +1881,9 @@ async def _generate_shopping_list(event_id: int, db) -> int:
         event_id,
     )
     bought_state = {
-        (p["name"].lower().strip(), (p["unit"] or "").strip().lower()): p["bought"]
+        ((p["name"] or "").strip().lower(), (p["unit"] or "").strip().lower()): p["bought"]
         for p in prev
+        if (p["name"] or "").strip()
     }
 
     # Remove previously generated items (keep manual ones)
@@ -1929,7 +1939,12 @@ async def get_shopping_list(
         "SELECT 1 FROM shopping_items WHERE event_id=$1 AND is_generated=TRUE LIMIT 1", event_id
     )
     if not has_generated:
-        await _generate_shopping_list(event_id, db)
+        try:
+            await _generate_shopping_list(event_id, db)
+        except Exception:
+            # Never let generation failure blank the whole shopping screen —
+            # log the real cause and fall through to whatever items exist.
+            log.exception("shopping auto-generate failed for event %s", event_id)
 
     items = await db.fetch(
         "SELECT * FROM shopping_items WHERE event_id=$1 ORDER BY category, name", event_id
