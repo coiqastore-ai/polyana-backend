@@ -1835,10 +1835,15 @@ CATEGORY_ORDER = [
 ]
 
 
+_last_gen_error: dict[int, str] = {}  # TEMP diagnostics: last generation error per event
+
+
 async def _generate_shopping_list(event_id: int, db) -> int:
     """Aggregate ingredients from all event recipes into shopping_items.
     Deletes previously generated items, inserts fresh aggregated ones.
     Returns number of items generated."""
+
+    _last_gen_error.pop(event_id, None)
 
     rows = await db.fetch(
         """
@@ -1914,8 +1919,9 @@ async def _generate_shopping_list(event_id: int, db) -> int:
                 event_id, item["name"], display_qty, was_bought,
             )
             inserted += 1
-        except Exception:
+        except Exception as e:
             log.exception("shopping insert failed for event %s item %r", event_id, item.get("name"))
+            _last_gen_error[event_id] = f"{type(e).__name__}: {e}"
             continue
     log.info("shopping generated for event %s: %s/%s items", event_id, inserted, len(agg))
 
@@ -1955,10 +1961,11 @@ async def get_shopping_list(
     if not has_generated:
         try:
             await _generate_shopping_list(event_id, db)
-        except Exception:
+        except Exception as e:
             # Never let generation failure blank the whole shopping screen —
             # log the real cause and fall through to whatever items exist.
             log.exception("shopping auto-generate failed for event %s", event_id)
+            _last_gen_error[event_id] = f"{type(e).__name__}: {e}"
 
     items = await db.fetch(
         "SELECT * FROM shopping_items WHERE event_id=$1 ORDER BY category, name", event_id
@@ -2009,6 +2016,7 @@ async def get_shopping_list(
     return {
         "items": categories, "total": total, "bought": bought_count,
         "linked_recipes": linked_recipes, "ingredient_rows": ingredient_rows,
+        "debug_gen_error": _last_gen_error.get(event_id),
     }
 
 
