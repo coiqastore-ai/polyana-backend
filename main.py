@@ -2022,14 +2022,26 @@ async def add_manual_shopping_item(
         raise HTTPException(400, "name required")
     qty_str = (body.get("quantity") or "").strip() or None
 
-    row = await db.fetchrow(
-        """
-        INSERT INTO shopping_items (event_id, name, quantity, is_generated, bought, added_by)
-        VALUES ($1, $2, $3, FALSE, FALSE, $4)
-        RETURNING *
-        """,
-        event_id, name, qty_str, user_id,
-    )
+    try:
+        row = await db.fetchrow(
+            """
+            INSERT INTO shopping_items (event_id, name, quantity, is_generated, bought, added_by)
+            VALUES ($1, $2, $3, FALSE, FALSE, $4)
+            RETURNING *
+            """,
+            event_id, name, qty_str, user_id,
+        )
+    except asyncpg.UndefinedColumnError:
+        # Older schema may be missing extended columns — fall back to minimal insert
+        log.warning("shopping_items missing extended columns; minimal insert for event %s", event_id)
+        row = await db.fetchrow(
+            "INSERT INTO shopping_items (event_id, name, quantity, bought) VALUES ($1,$2,$3,FALSE) RETURNING *",
+            event_id, name, qty_str,
+        )
+    except Exception as e:
+        log.exception("manual shopping add failed for event %s", event_id)
+        raise HTTPException(500, f"add failed: {type(e).__name__}: {e}")
+
     return {"id": row["id"], "name": row["name"], "quantity": row["quantity"],
             "bought": row["bought"], "is_generated": False}
 
