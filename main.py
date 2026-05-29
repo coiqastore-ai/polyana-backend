@@ -2149,55 +2149,6 @@ async def toggle_shopping_item(
     return {"id": item_id, "bought": bought}
 
 
-# ── TEMP debug endpoints (token-gated) — REMOVE after fixing shopping aggregation ──
-_DEBUG_TOKEN = "qYjcJj7KjBJVD3h5VCx69d41iJTVLdl-"
-
-
-def _debug_guard(k: str | None):
-    if k != _DEBUG_TOKEN:
-        raise HTTPException(404, "Not found")
-
-
-@app.get("/api/_debug/events")
-async def _debug_events(k: str | None = Query(default=None), db=Depends(get_db)):
-    _debug_guard(k)
-    rows = await db.fetch("SELECT id, name FROM events ORDER BY id")
-    return [{"id": r["id"], "name": r["name"]} for r in rows]
-
-
-@app.get("/api/_debug/gen/{event_id}")
-async def _debug_gen(event_id: int, k: str | None = Query(default=None), db=Depends(get_db)):
-    _debug_guard(k)
-    cols = await db.fetch(
-        "SELECT column_name, data_type FROM information_schema.columns "
-        "WHERE table_name='shopping_items' ORDER BY ordinal_position"
-    )
-    sel = await db.fetch(
-        """
-        SELECT i.name, i.qty, i.unit, i.category, er.servings_multiplier
-        FROM event_recipes er
-        JOIN ingredients i ON i.recipe_id = er.recipe_id
-        WHERE er.event_id = $1
-        """,
-        event_id,
-    )
-    try:
-        inserted = await _generate_shopping_list(event_id, db)
-    except Exception as e:
-        inserted = f"EXC: {type(e).__name__}: {e}"
-    items = await db.fetch(
-        "SELECT id, name, qty, unit, category, is_generated, bought FROM shopping_items WHERE event_id=$1",
-        event_id,
-    )
-    return {
-        "shopping_columns": [dict(c) for c in cols],
-        "select_rows": [dict(r) for r in sel],
-        "generate_result": inserted,
-        "gen_error": _last_gen_error.get(event_id),
-        "items_now": [dict(i) for i in items],
-    }
-
-
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 # FSM states for voice recipe editing flow
