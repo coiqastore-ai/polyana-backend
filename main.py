@@ -31,6 +31,11 @@ FRONTEND_URL = ENV("FRONTEND_URL", "")
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
+YOOKASSA_SHOP_ID = ENV("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = ENV("YOOKASSA_SECRET_KEY", "")
+
+# Prices in kopecks
+PRICE_AI_INVITE = 4900   # 49 ₽ — AI invitation (includes 1 free reroll)
 
 pool = None
 _db_ready = False
@@ -348,6 +353,37 @@ async def init_db():
                     END IF;
                 END IF;
             END $$;
+        """)
+
+        # ── Migration K: payments — balance, ledger, invite grants ────────────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS user_balance (
+                telegram_user_id BIGINT PRIMARY KEY,
+                balance          INT NOT NULL DEFAULT 0,   -- kopecks
+                updated_at       TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS payment_txns (
+                id               SERIAL PRIMARY KEY,
+                telegram_user_id BIGINT NOT NULL,
+                kind             TEXT NOT NULL,
+                amount           INT NOT NULL,             -- kopecks: +credit / -debit
+                balance_after    INT,
+                ref              TEXT,                     -- external id (idempotency)
+                meta             JSONB,
+                created_at       TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_txn_kind_ref
+                ON payment_txns(kind, ref) WHERE ref IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_txn_user ON payment_txns(telegram_user_id);
+            CREATE TABLE IF NOT EXISTS invite_grants (
+                id               SERIAL PRIMARY KEY,
+                telegram_user_id BIGINT NOT NULL,
+                event_id         INT NOT NULL,
+                remaining        INT NOT NULL DEFAULT 0,
+                created_at       TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_grant_user_event
+                ON invite_grants(telegram_user_id, event_id);
         """)
 
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
@@ -2153,6 +2189,149 @@ async def toggle_shopping_item(
     return {"id": item_id, "bought": bought}
 
 
+# ── Balance / ledger ──────────────────────────────────────────────────────────
+
+async def _get_balance(db, uid: int) -> int:
+    return await db.fetchval(
+        "SELECT balance FROM user_balance WHERE telegram_user_id=$1", uid
+    ) or 0
+
+
+async def _credit(db, uid: int, amount: int, kind: str, ref: str | None = None,
+                  meta: dict | None = None) -> int:
+    """Add funds. Idempotent when `ref` is given (unique on kind+ref)."""
+    meta_json = json.dumps(meta) if meta else None
+    try:
+        async with db.transaction():
+            row = await db.fetchrow(
+                """
+                INSERT INTO user_balance (telegram_user_id, balance) VALUES ($1,$2)
+                ON CONFLICT (telegram_user_id)
+                DO UPDATE SET balance = user_balance.balance + $2, updated_at = NOW()
+                RETURNING balance
+                """,
+                uid, amount,
+            )
+            bal = row["balance"]
+            await db.execute(
+                "INSERT INTO payment_txns (telegram_user_id, kind, amount, balance_after, ref, meta) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                uid, kind, amount, bal, ref, meta_json,
+            )
+            return bal
+    except asyncpg.UniqueViolationError:
+        # Already processed (duplicate ref) — transaction rolled back, no double credit
+        return await _get_balance(db, uid)
+
+
+async def _debit(db, uid: int, amount: int, kind: str, meta: dict | None = None) -> int | None:
+    """Subtract funds atomically. Returns new balance, or None if insufficient."""
+    meta_json = json.dumps(meta) if meta else None
+    async with db.transaction():
+        bal = await db.fetchval(
+            "SELECT balance FROM user_balance WHERE telegram_user_id=$1 FOR UPDATE", uid
+        ) or 0
+        if bal < amount:
+            return None
+        new_bal = bal - amount
+        await db.execute(
+            "UPDATE user_balance SET balance=$2, updated_at=NOW() WHERE telegram_user_id=$1",
+            uid, new_bal,
+        )
+        await db.execute(
+            "INSERT INTO payment_txns (telegram_user_id, kind, amount, balance_after, meta) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            uid, kind, -amount, new_bal, meta_json,
+        )
+        return new_bal
+
+
+@app.get("/api/balance")
+async def get_balance_endpoint(user_id: int = Depends(get_current_user), db=Depends(get_db)):
+    bal = await _get_balance(db, user_id)
+    return {"balance": bal, "balance_rub": round(bal / 100, 2)}
+
+
+# ── YooKassa top-up ───────────────────────────────────────────────────────────
+
+_TOPUP_AMOUNTS = {49, 149, 299, 499, 999}   # rubles
+
+
+@app.post("/api/balance/topup")
+async def create_topup(body: dict, user_id: int = Depends(get_current_user)):
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        raise HTTPException(503, "Платежи временно недоступны")
+    try:
+        amount_rub = int(body.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount_rub = 0
+    if amount_rub not in _TOPUP_AMOUNTS:
+        raise HTTPException(400, "Недопустимая сумма")
+
+    payload = {
+        "amount": {"value": f"{amount_rub}.00", "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "redirect", "return_url": FRONTEND_URL or "https://t.me"},
+        "description": f"Пополнение баланса ПОЛЯНА на {amount_rub} ₽",
+        "metadata": {"user_id": str(user_id)},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                json=payload,
+                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+                headers={"Idempotence-Key": secrets.token_hex(16)},
+            )
+        data = r.json()
+    except Exception as e:
+        log.exception("yookassa create payment failed")
+        raise HTTPException(502, f"ЮКасса недоступна: {type(e).__name__}")
+    url = (data.get("confirmation") or {}).get("confirmation_url")
+    if not url:
+        raise HTTPException(502, f"ЮКасса не вернула ссылку: {data.get('description') or data}")
+    return {"confirmation_url": url, "payment_id": data.get("id")}
+
+
+@app.post("/api/yookassa/webhook")
+async def yookassa_webhook(body: dict, db=Depends(get_db)):
+    """YooKassa server-to-server notification. We DO NOT trust the body — we
+    re-fetch the authoritative payment from the API before crediting, so a
+    forged webhook can't credit anyone."""
+    obj = body.get("object") or {}
+    pid = obj.get("id")
+    if not pid or not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        return {"ok": True}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"https://api.yookassa.ru/v3/payments/{pid}",
+                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            )
+        real = r.json()
+    except Exception:
+        log.exception("yookassa verify failed for %s", pid)
+        return {"ok": True}
+
+    if real.get("status") != "succeeded":
+        return {"ok": True}
+    try:
+        uid = int((real.get("metadata") or {}).get("user_id") or 0)
+        kopecks = int(round(float(real["amount"]["value"]) * 100))
+    except Exception:
+        return {"ok": True}
+    if uid and kopecks > 0:
+        new_bal = await _credit(db, uid, kopecks, "topup_yookassa", ref=pid,
+                                meta={"amount_rub": real["amount"]["value"]})
+        try:
+            await bot.send_message(
+                uid, f"✅ Баланс пополнен на {int(kopecks/100)} ₽.\nТекущий баланс: {int(new_bal/100)} ₽"
+            )
+        except Exception:
+            pass
+    return {"ok": True}
+
+
 # ── Invitation image generation ───────────────────────────────────────────────
 
 _RU_MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
@@ -2284,15 +2463,45 @@ async def make_invite_image(
     theme = invite.theme_or_default(requested_theme) if requested_theme else None
 
     if mode == "ai":
-        # NOTE: billing/balance gating is added in the payments step. For now AI
-        # mode runs directly (and fails gracefully if OpenRouter has no credits).
+        # Billing: a paid generation grants 1 free reroll for the same event.
+        grant = await db.fetchrow(
+            "SELECT id, remaining FROM invite_grants "
+            "WHERE telegram_user_id=$1 AND event_id=$2 AND remaining>0 ORDER BY id DESC LIMIT 1",
+            user_id, event_id,
+        )
+        if not grant:
+            bal = await _get_balance(db, user_id)
+            if bal < PRICE_AI_INVITE:
+                raise HTTPException(402, detail={
+                    "error": "insufficient_balance",
+                    "price": PRICE_AI_INVITE,
+                    "balance": bal,
+                })
+
         auto_theme, scene = await _compose_invite_scene(
             ev["name"], date_str, time_str, ev["location"], dishes
         )
         use_theme = theme or auto_theme or invite.DEFAULT_THEME
         scene = scene or invite.THEMES[use_theme]["prompt"]
-        bg = await _openrouter_background(scene)
+        bg = await _openrouter_background(scene)   # may raise — charge only after success
         png = invite.render_on_background(bg, evt, use_theme)
+
+        # Charge only after a successful generation
+        if grant:
+            await db.execute(
+                "UPDATE invite_grants SET remaining=remaining-1 WHERE id=$1", grant["id"]
+            )
+        else:
+            new_bal = await _debit(db, user_id, PRICE_AI_INVITE, "charge_ai_invite",
+                                   {"event_id": event_id})
+            if new_bal is None:
+                log.warning("debit race for user %s on invite; serving anyway", user_id)
+            else:
+                # grant 1 free reroll for this event
+                await db.execute(
+                    "INSERT INTO invite_grants (telegram_user_id, event_id, remaining) VALUES ($1,$2,1)",
+                    user_id, event_id,
+                )
     else:
         use_theme = theme or invite.DEFAULT_THEME
         png = invite.render_typographic(evt, use_theme)
