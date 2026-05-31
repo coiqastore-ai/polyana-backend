@@ -15,7 +15,7 @@ from aiogram.types import (
     MenuButtonWebApp, Message, CallbackQuery,
     ReplyKeyboardRemove, WebAppInfo,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile,
+    BufferedInputFile, LabeledPrice,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -33,9 +33,19 @@ PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
 YOOKASSA_SHOP_ID = ENV("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = ENV("YOOKASSA_SECRET_KEY", "")
+# 54-ФЗ receipt: VAT code (1 = без НДС for ИП на УСН/патенте). Set to "" to skip receipts.
+YOOKASSA_VAT_CODE = ENV("YOOKASSA_VAT_CODE", "1")
 
 # Prices in kopecks
 PRICE_AI_INVITE = 4900   # 49 ₽ — AI invitation (includes 1 free reroll)
+
+# Telegram Stars: how many ₽ of balance one Star credits. Buyer pays ~1.7-2₽
+# per Star in-app, so crediting ~1.7₽/Star keeps it roughly fair. TUNE THIS.
+STAR_RUB_RATE = 1.7
+
+# Referral program
+REFERRAL_PERCENT = 10        # % of a referee's spend credited to the referrer
+REFERRAL_HOLD_HOURS = 24     # delay before a bonus matures (chargeback protection)
 
 pool = None
 _db_ready = False
@@ -384,6 +394,28 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_grant_user_event
                 ON invite_grants(telegram_user_id, event_id);
+        """)
+
+        # ── Migration L: referrals ────────────────────────────────────────────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                referee_id   BIGINT PRIMARY KEY,
+                referrer_id  BIGINT NOT NULL,
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id);
+            CREATE TABLE IF NOT EXISTS referral_bonuses (
+                id            SERIAL PRIMARY KEY,
+                referrer_id   BIGINT NOT NULL,
+                referee_id    BIGINT NOT NULL,
+                source_ref    TEXT UNIQUE,        -- idempotency per charge
+                amount        INT NOT NULL,       -- kopecks
+                available_at  TIMESTAMPTZ NOT NULL,
+                paid          BOOLEAN DEFAULT FALSE,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_refbonus_due
+                ON referral_bonuses(available_at) WHERE NOT paid;
         """)
 
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
@@ -2224,32 +2256,111 @@ async def _credit(db, uid: int, amount: int, kind: str, ref: str | None = None,
         return await _get_balance(db, uid)
 
 
-async def _debit(db, uid: int, amount: int, kind: str, meta: dict | None = None) -> int | None:
-    """Subtract funds atomically. Returns new balance, or None if insufficient."""
+async def _debit(db, uid: int, amount: int, kind: str, meta: dict | None = None) -> tuple[int | None, int | None]:
+    """Subtract funds atomically. Returns (new_balance, txn_id), or (None, None)."""
     meta_json = json.dumps(meta) if meta else None
     async with db.transaction():
         bal = await db.fetchval(
             "SELECT balance FROM user_balance WHERE telegram_user_id=$1 FOR UPDATE", uid
         ) or 0
         if bal < amount:
-            return None
+            return None, None
         new_bal = bal - amount
         await db.execute(
             "UPDATE user_balance SET balance=$2, updated_at=NOW() WHERE telegram_user_id=$1",
             uid, new_bal,
         )
-        await db.execute(
+        txn_id = await db.fetchval(
             "INSERT INTO payment_txns (telegram_user_id, kind, amount, balance_after, meta) "
-            "VALUES ($1,$2,$3,$4,$5)",
+            "VALUES ($1,$2,$3,$4,$5) RETURNING id",
             uid, kind, -amount, new_bal, meta_json,
         )
-        return new_bal
+        return new_bal, txn_id
+
+
+async def _accrue_referral_bonus(db, referee_id: int, spend: int, source_ref: str) -> None:
+    """If the referee was referred, schedule a matured-in-24h bonus for the referrer."""
+    referrer = await db.fetchval(
+        "SELECT referrer_id FROM referrals WHERE referee_id=$1", referee_id
+    )
+    if not referrer or referrer == referee_id:
+        return
+    bonus = spend * REFERRAL_PERCENT // 100
+    if bonus <= 0:
+        return
+    await db.execute(
+        """
+        INSERT INTO referral_bonuses (referrer_id, referee_id, source_ref, amount, available_at)
+        VALUES ($1,$2,$3,$4, NOW() + ($5 || ' hours')::interval)
+        ON CONFLICT (source_ref) DO NOTHING
+        """,
+        referrer, referee_id, source_ref, bonus, str(REFERRAL_HOLD_HOURS),
+    )
+
+
+async def _referral_maturation_loop():
+    """Credit matured referral bonuses to referrers. Runs every 10 minutes."""
+    while True:
+        try:
+            if pool is not None:
+                async with pool.acquire() as db:
+                    rows = await db.fetch(
+                        "SELECT id, referrer_id, amount FROM referral_bonuses "
+                        "WHERE NOT paid AND available_at <= NOW() LIMIT 200"
+                    )
+                    for r in rows:
+                        await _credit(db, r["referrer_id"], r["amount"], "referral_bonus",
+                                      ref=f"refbonus:{r['id']}")
+                        await db.execute(
+                            "UPDATE referral_bonuses SET paid=TRUE WHERE id=$1", r["id"])
+                        try:
+                            await bot.send_message(
+                                r["referrer_id"],
+                                f"💰 Реферальный бонус +{int(r['amount']/100)} ₽ зачислен на баланс!")
+                        except Exception:
+                            pass
+        except Exception:
+            log.exception("referral maturation loop error")
+        await asyncio.sleep(600)
 
 
 @app.get("/api/balance")
 async def get_balance_endpoint(user_id: int = Depends(get_current_user), db=Depends(get_db)):
     bal = await _get_balance(db, user_id)
     return {"balance": bal, "balance_rub": round(bal / 100, 2)}
+
+
+_bot_username: str | None = None
+
+
+async def _get_bot_username() -> str:
+    global _bot_username
+    if _bot_username is None:
+        try:
+            me = await bot.get_me()
+            _bot_username = me.username or ""
+        except Exception:
+            _bot_username = ""
+    return _bot_username
+
+
+@app.get("/api/referral")
+async def referral_info(user_id: int = Depends(get_current_user), db=Depends(get_db)):
+    username = await _get_bot_username()
+    link = f"https://t.me/{username}?start=ref_{user_id}" if username else ""
+    invited = await db.fetchval(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", user_id) or 0
+    earned = await db.fetchval(
+        "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", user_id) or 0
+    pending = await db.fetchval(
+        "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", user_id) or 0
+    return {
+        "link": link,
+        "percent": REFERRAL_PERCENT,
+        "invited": invited,
+        "earned_rub": round(earned / 100, 2),
+        "pending_rub": round(pending / 100, 2),
+    }
 
 
 # ── YooKassa top-up ───────────────────────────────────────────────────────────
@@ -2275,6 +2386,27 @@ async def create_topup(body: dict, user_id: int = Depends(get_current_user)):
         "description": f"Пополнение баланса ПОЛЯНА на {amount_rub} ₽",
         "metadata": {"user_id": str(user_id)},
     }
+
+    # 54-ФЗ fiscal receipt (needs a customer contact: email or phone)
+    email = (body.get("email") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if YOOKASSA_VAT_CODE and (email or phone):
+        customer = {}
+        if email:
+            customer["email"] = email
+        if phone:
+            customer["phone"] = phone
+        payload["receipt"] = {
+            "customer": customer,
+            "items": [{
+                "description": "Пополнение баланса (цифровая услуга)",
+                "quantity": "1.00",
+                "amount": {"value": f"{amount_rub}.00", "currency": "RUB"},
+                "vat_code": int(YOOKASSA_VAT_CODE),
+                "payment_subject": "service",
+                "payment_mode": "full_payment",
+            }],
+        }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
@@ -2291,6 +2423,31 @@ async def create_topup(body: dict, user_id: int = Depends(get_current_user)):
     if not url:
         raise HTTPException(502, f"ЮКасса не вернула ссылку: {data.get('description') or data}")
     return {"confirmation_url": url, "payment_id": data.get("id")}
+
+
+@app.post("/api/balance/topup-stars")
+async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user)):
+    """Create a Telegram Stars invoice link. Buyer pays in Stars; on success the
+    bot's successful_payment handler credits the balance (ruble-equivalent)."""
+    try:
+        amount_rub = int(body.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount_rub = 0
+    if amount_rub not in _TOPUP_AMOUNTS:
+        raise HTTPException(400, "Недопустимая сумма")
+    stars = max(1, round(amount_rub / STAR_RUB_RATE))
+    try:
+        link = await bot.create_invoice_link(
+            title=f"Баланс ПОЛЯНА: {amount_rub} ₽",
+            description=f"Пополнение баланса на {amount_rub} ₽",
+            payload=f"topup:{user_id}:{amount_rub}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{amount_rub} ₽", amount=stars)],
+        )
+    except Exception as e:
+        log.exception("create stars invoice failed")
+        raise HTTPException(502, f"Не удалось создать счёт: {type(e).__name__}")
+    return {"invoice_link": link, "stars": stars}
 
 
 @app.post("/api/yookassa/webhook")
@@ -2492,8 +2649,8 @@ async def make_invite_image(
                 "UPDATE invite_grants SET remaining=remaining-1 WHERE id=$1", grant["id"]
             )
         else:
-            new_bal = await _debit(db, user_id, PRICE_AI_INVITE, "charge_ai_invite",
-                                   {"event_id": event_id})
+            new_bal, txn_id = await _debit(db, user_id, PRICE_AI_INVITE, "charge_ai_invite",
+                                           {"event_id": event_id})
             if new_bal is None:
                 log.warning("debit race for user %s on invite; serving anyway", user_id)
             else:
@@ -2502,6 +2659,8 @@ async def make_invite_image(
                     "INSERT INTO invite_grants (telegram_user_id, event_id, remaining) VALUES ($1,$2,1)",
                     user_id, event_id,
                 )
+                # referral: 10% of this spend to the referrer (matures in 24h)
+                await _accrue_referral_bonus(db, user_id, PRICE_AI_INVITE, f"txn:{txn_id}")
     else:
         use_theme = theme or invite.DEFAULT_THEME
         png = invite.render_typographic(evt, use_theme)
@@ -2802,6 +2961,43 @@ async def voice_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ── Telegram Stars payments ─────────────────────────────────────────────────────
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(query):
+    # Must answer within 10s, otherwise Telegram cancels the payment
+    try:
+        await bot.answer_pre_checkout_query(query.id, ok=True)
+    except Exception:
+        log.exception("pre_checkout answer failed")
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message):
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+    if not payload.startswith("topup:") or pool is None:
+        return
+    try:
+        _, uid_s, rub_s = payload.split(":")
+        uid = int(uid_s)
+        kopecks = int(rub_s) * 100
+    except Exception:
+        log.warning("bad stars payload: %s", payload)
+        return
+    charge_id = sp.telegram_payment_charge_id   # idempotency key
+    async with pool.acquire() as db:
+        new_bal = await _credit(db, uid, kopecks, "topup_stars", ref=charge_id,
+                                meta={"stars": sp.total_amount})
+    try:
+        await message.answer(
+            f"✅ Баланс пополнен на {int(kopecks/100)} ₽ (⭐ {sp.total_amount}).\n"
+            f"Текущий баланс: {int(new_bal/100)} ₽"
+        )
+    except Exception:
+        pass
+
+
 # ── /start command ────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -2811,6 +3007,24 @@ async def cmd_start(message: Message):
     user = message.from_user
     text = message.text or ""
     arg = text.split(maxsplit=1)[1] if " " in text else None
+
+    # Referral capture: ?start=ref_<referrer_id> (only for a brand-new referee)
+    if arg and arg.startswith("ref_") and pool is not None:
+        try:
+            referrer_id = int(arg.replace("ref_", ""))
+        except ValueError:
+            referrer_id = 0
+        if referrer_id and referrer_id != user.id:
+            try:
+                async with pool.acquire() as db:
+                    await db.execute(
+                        "INSERT INTO referrals (referee_id, referrer_id) VALUES ($1,$2) "
+                        "ON CONFLICT (referee_id) DO NOTHING",
+                        user.id, referrer_id,
+                    )
+            except Exception:
+                log.exception("referral capture failed")
+        # fall through to the normal welcome below
 
     if arg and arg.startswith("event_"):
         try:
@@ -2907,6 +3121,8 @@ async def _bg_init():
         log.error("init_db error: %s", e)
     # Start bot regardless
     asyncio.create_task(run_bot())
+    # Start referral bonus maturation worker
+    asyncio.create_task(_referral_maturation_loop())
 
 
 @app.on_event("startup")
