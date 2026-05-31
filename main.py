@@ -2161,9 +2161,8 @@ def _debug_guard(k: str | None):
 @app.get("/api/_debug/genimg")
 async def _debug_genimg(
     k: str | None = Query(default=None),
-    q: str | None = Query(default=None),    # quality: low|medium|high
-    sz: str | None = Query(default=None),   # size: e.g. 1024x1536
-    nest: int = Query(default=0),           # 1 => put params under image_config
+    ar: str | None = Query(default=None),     # image_config.aspect_ratio e.g. 9:16
+    isize: str | None = Query(default=None),  # image_config.image_size e.g. 1K|2K
 ):
     _debug_guard(k)
     if not OPENROUTER_KEY:
@@ -2181,19 +2180,13 @@ async def _debug_genimg(
         "messages": [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],
     }
-    if nest:
-        cfg: dict = {}
-        if q:
-            cfg["quality"] = q
-        if sz:
-            cfg["size"] = sz
-        if cfg:
-            payload["image_config"] = cfg
-    else:
-        if q:
-            payload["quality"] = q
-        if sz:
-            payload["size"] = sz
+    cfg: dict = {}
+    if ar:
+        cfg["aspect_ratio"] = ar
+    if isize:
+        cfg["image_size"] = isize
+    if cfg:
+        payload["image_config"] = cfg
 
     try:
         async with httpx.AsyncClient(timeout=180) as client:
@@ -2205,7 +2198,7 @@ async def _debug_genimg(
     except Exception as e:
         raise HTTPException(500, f"request failed: {type(e).__name__}: {e}")
 
-    out: dict = {"status": r.status_code, "sent_params": {"q": q, "sz": sz, "nest": nest}}
+    out: dict = {"status": r.status_code, "sent_params": {"ar": ar, "isize": isize}}
     try:
         data = r.json()
     except Exception:
