@@ -1,5 +1,6 @@
-import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re
+import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64
 import httpx
+import invite
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
@@ -2147,6 +2148,102 @@ async def toggle_shopping_item(
         bought, item_id, event_id,
     )
     return {"id": item_id, "bought": bought}
+
+
+# ── Invitation image generation ───────────────────────────────────────────────
+
+_RU_MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+_RU_WDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def _fmt_event_dt(dt) -> tuple[str | None, str | None]:
+    if not dt:
+        return (None, None)
+    try:
+        date_str = f"{_RU_WDAYS[dt.weekday()]}, {dt.day} {_RU_MONTHS[dt.month - 1]}"
+        time_str = f"{dt.hour:02d}:{dt.minute:02d}"
+        return date_str, time_str
+    except Exception:
+        return (str(dt)[:16], None)
+
+
+async def _openrouter_background(scene_prompt: str) -> bytes:
+    """Generate a vertical 9:16 1K background (no text) via gpt-5.4-image-2."""
+    if not OPENROUTER_KEY:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set")
+    prompt = (
+        "Vertical 9:16 invitation poster background. " + scene_prompt + ". "
+        "Keep the top third darker and uncluttered to leave room for overlay text. "
+        "No text, no letters, no words, no captions. Photographic, high detail, soft bokeh."
+    )
+    payload = {
+        "model": "openai/gpt-5.4-image-2",
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"],
+        "image_config": {"aspect_ratio": "9:16", "image_size": "1K"},
+    }
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            json=payload,
+        )
+    data = r.json()
+    err = data.get("error")
+    if err:
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise HTTPException(502, f"Не удалось сгенерировать фон: {msg}")
+    try:
+        url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
+        return base64.b64decode(url.split(",", 1)[1])
+    except Exception:
+        raise HTTPException(502, "Модель не вернула изображение")
+
+
+@app.post("/api/events/{event_id}/invite")
+async def make_invite_image(
+    event_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db),
+):
+    ev = await db.fetchrow("SELECT * FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+    is_collab = await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
+    if ev["telegram_user_id"] != user_id and not is_collab:
+        raise HTTPException(403, "Access denied")
+
+    theme = invite.theme_or_default((body.get("theme") or "").strip())
+    mode = (body.get("mode") or "free").strip()
+    date_str, time_str = _fmt_event_dt(ev["event_date"])
+    evt = {
+        "name": ev["name"],
+        "date_str": date_str,
+        "time_str": time_str,
+        "place": ev["location"],
+        "host_name": (body.get("host_name") or "").strip() or None,
+    }
+
+    if mode == "ai":
+        # NOTE: billing/balance gating is added in the payments step. For now AI
+        # mode runs directly (and fails gracefully if OpenRouter has no credits).
+        bg = await _openrouter_background(invite.THEMES[theme]["prompt"])
+        png = invite.render_on_background(bg, evt, theme)
+    else:
+        png = invite.render_typographic(evt, theme)
+
+    return {
+        "image": "data:image/png;base64," + base64.b64encode(png).decode(),
+        "mode": mode,
+        "theme": theme,
+    }
+
+
+@app.get("/api/invite/themes")
+async def list_invite_themes(user_id: int = Depends(get_current_user)):
+    return [{"key": k, "title": k.capitalize()} for k in invite.THEMES.keys()]
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
