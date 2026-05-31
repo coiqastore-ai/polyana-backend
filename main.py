@@ -493,7 +493,7 @@ JSON-схема (все поля опциональны кроме name):
   "name": "название на русском",
   "name_original": "оригинал если не русский",
   "emoji": "одна эмодзи",
-  "servings": 4,
+  "servings": null,
   "cook_time_minutes": 90,
   "category": "ужин",
   "original_language": "ru",
@@ -504,6 +504,7 @@ JSON-схема (все поля опциональны кроме name):
 category: завтрак|обед|ужин|десерт|суп|салат|закуска|напиток|выпечка|другое
 unit: г/кг/мл/л/шт/ст.л/ч.л/щепотка/по вкусу
 qty: только число (1.5, 200, 3)
+servings: число порций ТОЛЬКО если оно явно указано в рецепте; если не указано — верни null, НЕ угадывай.
 Переведи название на русский если оригинал не русский."""
 
 _or_client = None
@@ -687,10 +688,11 @@ async def _try_recipe_scraper(url: str, html: str) -> dict | None:
         from recipe_scrapers import scrape_html
         scraper = scrape_html(html, org_url=url)
         try:
-            raw_yield = str(scraper.yields() or "4")
-            servings = int(re.search(r'\d+', raw_yield).group()) if re.search(r'\d+', raw_yield) else 4
+            raw_yield = str(scraper.yields() or "")
+            m = re.search(r'\d+', raw_yield)
+            servings = int(m.group()) if m else None
         except Exception:
-            servings = 4
+            servings = None
         raw_ingredient_strings = [s.strip() for s in (scraper.ingredients() or []) if s.strip()]
         steps = []
         try:
@@ -807,7 +809,7 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 parsed.get("source_url"),
                 parsed.get("source_type", "manual"),
                 parsed.get("original_language"),
-                int(parsed["servings"]) if parsed.get("servings") else 4,
+                int(parsed["servings"]) if parsed.get("servings") else None,
                 int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
                 parsed.get("category"),
                 parsed.get("source_photo_file_id"),
@@ -2265,10 +2267,11 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     header = "📚 Рецепт уже в библиотеке!" if already else "✅ <b>Сохранено в библиотеку!</b>"
     ct_str = f"⏱ {ct} мин · " if ct else ""
     cat_str = f"[{recipe['category']}] " if recipe.get("category") else ""
+    serv_str = f"🍽 {recipe['servings']} порц. · " if recipe.get("servings") else ""
     body = (
         f"{header}\n\n"
         f"{recipe['emoji']} <b>{recipe['name']}</b>\n"
-        f"{cat_str}🍽 {recipe['servings']} порц. · {ct_str}"
+        f"{cat_str}{serv_str}{ct_str}"
         f"🥕 {recipe['ingredients_count']} ингр."
     )
     recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
