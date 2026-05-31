@@ -2170,6 +2170,44 @@ def _fmt_event_dt(dt) -> tuple[str | None, str | None]:
         return (str(dt)[:16], None)
 
 
+async def _compose_invite_scene(name, date_str, time_str, place, dishes) -> tuple[str | None, str | None]:
+    """Let a cheap text model analyze the event (season/time/place/format + dishes)
+    and produce a tailored image scene prompt + a matching palette theme key."""
+    try:
+        client = _get_or_client()
+    except Exception:
+        return None, None
+    themes = "|".join(invite.THEMES.keys())
+    dishes_str = ", ".join(dishes[:8]) if dishes else "(не указаны)"
+    prompt = (
+        "Ты — арт-директор. По данным о событии придумай ФОН для вертикального "
+        "приглашения-постера. Проанализируй сезон и время суток (по дате/времени), "
+        "место, формат события и блюда. Верни строго JSON:\n"
+        '{"theme":"<одно из: ' + themes + '>",'
+        '"scene":"<яркий промпт НА АНГЛИЙСКОМ: сцена с этими блюдами на столе и '
+        'подходящим антуражем, фотореализм, мягкое боке, БЕЗ текста и букв>"}\n\n'
+        f"Событие: {name}\n"
+        f"Когда: {date_str or '?'} {time_str or ''}\n"
+        f"Место: {place or '?'}\n"
+        f"Блюда: {dishes_str}\n"
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model="google/gemini-2.5-flash",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.6,
+            max_tokens=400,
+        )
+        data = json.loads(resp.choices[0].message.content)
+        theme = invite.theme_or_default((data.get("theme") or "").strip())
+        scene = (data.get("scene") or "").strip() or None
+        return theme, scene
+    except Exception as e:
+        log.warning("_compose_invite_scene failed: %s", e)
+        return None, None
+
+
 async def _openrouter_background(scene_prompt: str) -> bytes:
     """Generate a vertical 9:16 1K background (no text) via gpt-5.4-image-2."""
     if not OPENROUTER_KEY:
@@ -2217,29 +2255,51 @@ async def make_invite_image(
     if ev["telegram_user_id"] != user_id and not is_collab:
         raise HTTPException(403, "Access denied")
 
-    theme = invite.theme_or_default((body.get("theme") or "").strip())
+    requested_theme = (body.get("theme") or "").strip()
     mode = (body.get("mode") or "free").strip()
     date_str, time_str = _fmt_event_dt(ev["event_date"])
+
+    # Dishes linked to the event (shown in the menu block + fed to the AI scene)
+    dish_rows = await db.fetch(
+        """
+        SELECT r.name FROM event_recipes er
+        JOIN recipes r ON r.id = er.recipe_id
+        WHERE er.event_id = $1
+        ORDER BY er.added_at
+        """,
+        event_id,
+    )
+    dishes = [d["name"] for d in dish_rows if d["name"]]
+
     evt = {
         "name": ev["name"],
         "date_str": date_str,
         "time_str": time_str,
         "place": ev["location"],
         "host_name": (body.get("host_name") or "").strip() or None,
+        "dishes": dishes,
     }
+
+    theme = invite.theme_or_default(requested_theme) if requested_theme else None
 
     if mode == "ai":
         # NOTE: billing/balance gating is added in the payments step. For now AI
         # mode runs directly (and fails gracefully if OpenRouter has no credits).
-        bg = await _openrouter_background(invite.THEMES[theme]["prompt"])
-        png = invite.render_on_background(bg, evt, theme)
+        auto_theme, scene = await _compose_invite_scene(
+            ev["name"], date_str, time_str, ev["location"], dishes
+        )
+        use_theme = theme or auto_theme or invite.DEFAULT_THEME
+        scene = scene or invite.THEMES[use_theme]["prompt"]
+        bg = await _openrouter_background(scene)
+        png = invite.render_on_background(bg, evt, use_theme)
     else:
-        png = invite.render_typographic(evt, theme)
+        use_theme = theme or invite.DEFAULT_THEME
+        png = invite.render_typographic(evt, use_theme)
 
     return {
         "image": "data:image/png;base64," + base64.b64encode(png).decode(),
         "mode": mode,
-        "theme": theme,
+        "theme": use_theme,
     }
 
 

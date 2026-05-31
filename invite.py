@@ -113,6 +113,14 @@ def _wrap(draw, text, font, max_w) -> list[str]:
     return lines
 
 
+def _ellipsize(draw, text, font, max_w) -> str:
+    if _text_w(draw, text, font) <= max_w:
+        return text
+    while text and _text_w(draw, text + "…", font) > max_w:
+        text = text[:-1]
+    return (text + "…") if text else ""
+
+
 def _fit_title(draw, text, max_w, start_size, min_size) -> tuple[ImageFont.FreeTypeFont, list[str]]:
     """Shrink the title font until it wraps into at most 3 lines that fit."""
     size = start_size
@@ -152,7 +160,7 @@ def _draw_scrim(img: Image.Image, from_top=True, strength=180) -> None:
     """Darken the text area so overlay text stays legible over any background."""
     w, h = img.size
     scrim = Image.new("L", (1, h), 0)
-    span = int(h * 0.55)
+    span = int(h * 0.66)
     for y in range(h):
         if from_top:
             a = max(0, strength - int(strength * y / span)) if y < span else 0
@@ -229,6 +237,28 @@ def _draw_text_layer(img: Image.Image, event: dict, theme_key: str,
         y += int(h * 0.006)
         host_font = _font(_FONT_REG, int(w * 0.04))
         draw.text((margin, y), f"Приглашает: {host}", font=host_font, fill=(210, 210, 210))
+        y += int(w * 0.04)
+
+    # Menu (dishes that will be at the event)
+    dishes = [str(d).strip() for d in (event.get("dishes") or []) if str(d).strip()]
+    if dishes:
+        y += int(h * 0.026)
+        ml_font = _font(_FONT_BOLD, int(w * 0.034))
+        draw.text((margin, y), "В МЕНЮ", font=ml_font, fill=accent)
+        y += int(w * 0.034) + int(h * 0.012)
+        item_font = _font(_FONT_REG, int(w * 0.04))
+        bullet_x = margin + int(w * 0.012)
+        text_x = margin + int(w * 0.05)
+        r = max(2, int(w * 0.008))
+        for d in dishes[:4]:
+            name = _ellipsize(draw, d, item_font, max_w - int(w * 0.05))
+            cy2 = y + int(w * 0.04) // 2
+            draw.ellipse([bullet_x - r, cy2 - r, bullet_x + r, cy2 + r], fill=accent)
+            draw.text((text_x, y), name, font=item_font, fill=(238, 238, 238))
+            y += int(w * 0.04) + int(h * 0.009)
+        if len(dishes) > 4:
+            more_font = _font(_FONT_REG, int(w * 0.036))
+            draw.text((text_x, y), f"+ ещё {len(dishes) - 4}", font=more_font, fill=(200, 200, 200))
 
     # Brand (bottom)
     brand_font = _font(_FONT_REG, int(w * 0.034))
