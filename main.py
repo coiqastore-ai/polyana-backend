@@ -2149,6 +2149,100 @@ async def toggle_shopping_item(
     return {"id": item_id, "bought": bought}
 
 
+# ── TEMP debug: parameterized image-gen test (token-gated) — REMOVE after tuning ──
+_DEBUG_TOKEN = "vKH_-ysL2yo3PxL7zbg2YGOiDgNcRG6C"
+
+
+def _debug_guard(k: str | None):
+    if k != _DEBUG_TOKEN:
+        raise HTTPException(404, "Not found")
+
+
+@app.get("/api/_debug/genimg")
+async def _debug_genimg(
+    k: str | None = Query(default=None),
+    q: str | None = Query(default=None),    # quality: low|medium|high
+    sz: str | None = Query(default=None),   # size: e.g. 1024x1536
+    nest: int = Query(default=0),           # 1 => put params under image_config
+):
+    _debug_guard(k)
+    if not OPENROUTER_KEY:
+        raise HTTPException(500, "OPENROUTER_API_KEY not set")
+
+    prompt = (
+        "Vertical 9:16 invitation poster background. Warm summer evening at a Russian "
+        "country dacha: glowing string lights, a festive table softly out of focus, "
+        "cozy golden-hour mood, lush greenery. Keep the top third darker and uncluttered "
+        "to leave room for overlay text. No text, no letters, no words, no captions. "
+        "Photographic, high detail, beautiful soft bokeh."
+    )
+    payload: dict = {
+        "model": "openai/gpt-5.4-image-2",
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"],
+    }
+    if nest:
+        cfg: dict = {}
+        if q:
+            cfg["quality"] = q
+        if sz:
+            cfg["size"] = sz
+        if cfg:
+            payload["image_config"] = cfg
+    else:
+        if q:
+            payload["quality"] = q
+        if sz:
+            payload["size"] = sz
+
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                json=payload,
+            )
+    except Exception as e:
+        raise HTTPException(500, f"request failed: {type(e).__name__}: {e}")
+
+    out: dict = {"status": r.status_code, "sent_params": {"q": q, "sz": sz, "nest": nest}}
+    try:
+        data = r.json()
+    except Exception:
+        out["text"] = r.text[:3000]
+        return out
+
+    out["usage"] = data.get("usage")
+    if isinstance(data.get("error"), (dict, str)):
+        out["error"] = data["error"]
+
+    img_b64 = None
+    try:
+        msg = data["choices"][0]["message"]
+        imgs = msg.get("images") or []
+        out["images_count"] = len(imgs)
+        if imgs and isinstance(imgs[0], dict):
+            u = (imgs[0].get("image_url") or {}).get("url") or imgs[0].get("url")
+            if u and u.startswith("data:"):
+                img_b64 = u.split(",", 1)[1]
+    except Exception as e:
+        out["extract_error"] = f"{type(e).__name__}: {e}"
+
+    # decode PNG dimensions server-side (no PIL needed)
+    if img_b64:
+        import base64 as _b64, struct as _st
+        try:
+            raw = _b64.b64decode(img_b64)
+            if raw[:8] == b"\x89PNG\r\n\x1a\n":
+                w, h = _st.unpack(">II", raw[16:24])
+                out["dimensions"] = f"{w}x{h}"
+        except Exception:
+            pass
+    out["image_b64_len"] = len(img_b64) if img_b64 else 0
+    out["image_b64"] = img_b64
+    return out
+
+
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 # FSM states for voice recipe editing flow
