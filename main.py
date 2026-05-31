@@ -15,6 +15,7 @@ from aiogram.types import (
     MenuButtonWebApp, Message, CallbackQuery,
     ReplyKeyboardRemove, WebAppInfo,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    BufferedInputFile,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -2306,6 +2307,39 @@ async def make_invite_image(
 @app.get("/api/invite/themes")
 async def list_invite_themes(user_id: int = Depends(get_current_user)):
     return [{"key": k, "title": k.capitalize()} for k in invite.THEMES.keys()]
+
+
+@app.post("/api/events/{event_id}/invite/send")
+async def send_invite_to_chat(
+    event_id: int, body: dict,
+    user_id: int = Depends(get_current_user), db=Depends(get_db),
+):
+    """Send a generated invitation image to the user's Telegram chat so they can
+    forward it to guests (the Mini App can't share an image directly)."""
+    ev = await db.fetchrow("SELECT name FROM events WHERE id=$1", event_id)
+    if not ev:
+        raise HTTPException(404, "Event not found")
+
+    data_url = (body.get("image") or "").strip()
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+    try:
+        png = base64.b64decode(data_url)
+    except Exception:
+        raise HTTPException(400, "bad image")
+    if not png:
+        raise HTTPException(400, "empty image")
+
+    try:
+        await bot.send_photo(
+            chat_id=user_id,
+            photo=BufferedInputFile(png, filename="invite.png"),
+            caption=f"🎉 Приглашение на «{ev['name']}» — перешлите гостям!",
+        )
+    except Exception as e:
+        log.exception("send invite failed for user %s", user_id)
+        raise HTTPException(502, f"Не удалось отправить: {type(e).__name__}")
+    return {"ok": True}
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
