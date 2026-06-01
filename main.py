@@ -2365,7 +2365,7 @@ async def referral_info(user_id: int = Depends(get_current_user), db=Depends(get
 
 # ── YooKassa top-up ───────────────────────────────────────────────────────────
 
-_TOPUP_AMOUNTS = {49, 149, 299, 499, 999}   # rubles
+_TOPUP_AMOUNTS = {100, 200, 500, 1000}   # rubles (minimum top-up 100 ₽)
 
 
 @app.post("/api/balance/topup")
@@ -2775,6 +2775,55 @@ async def cmd_add(message: Message):
     )
 
 
+async def _send_referral(msg: Message, uid: int):
+    async with pool.acquire() as db:
+        invited = await db.fetchval(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
+        earned = await db.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", uid) or 0
+        pending = await db.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", uid) or 0
+    username = await _get_bot_username()
+    link = f"https://t.me/{username}?start=ref_{uid}" if username else "(ссылка недоступна)"
+    text = (
+        "💰 <b>Партнёрская программа</b>\n\n"
+        f"Приглашай друзей и получай <b>{REFERRAL_PERCENT}%</b> с их трат в боте — "
+        "бонусом на баланс (начисляется через 24 часа).\n\n"
+        f"🔗 Твоя ссылка:\n{link}\n\n"
+        f"👥 Приглашено: <b>{invited}</b>\n"
+        f"✅ Заработано: <b>{int(earned/100)} ₽</b>\n"
+        f"⏳ Ждёт зачисления: <b>{int(pending/100)} ₽</b>"
+    )
+    kb = None
+    if username:
+        share = f"https://t.me/share/url?url={link}&text=Попробуй%20ПОЛЯНУ%20%F0%9F%8C%BF"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)
+        ]])
+    await msg.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("ref"))
+async def cmd_ref(message: Message):
+    if not message.from_user or pool is None:
+        return
+    await _send_referral(message, message.from_user.id)
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    await message.answer(
+        "📄 <b>Правила и документы</b>\n\n"
+        "• Пользовательское соглашение\n"
+        "• Политика конфиденциальности\n"
+        "• Условия партнёрской программы\n\n"
+        "Документы готовятся и будут опубликованы здесь до старта приёма оплат. "
+        "Оплачивая услуги бота, вы соглашаетесь с ними.\n\n"
+        "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
+        "тратятся внутри бота и не выводятся.</i>"
+    )
+
+
 # ── Text recipe buffering ─────────────────────────────────────────────────────
 # A long recipe pasted into Telegram is auto-split into multiple messages
 # (>4096 chars), or a user may send it in parts. We debounce: accumulate
@@ -3076,6 +3125,13 @@ async def cmd_start(message: Message):
             reply_markup=kb,
         )
     else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
+            [
+                InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
+                InlineKeyboardButton(text="📄 Правила", callback_data="show_terms"),
+            ],
+        ]) if FRONTEND_URL else None
         await message.answer(
             f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
             f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
@@ -3085,9 +3141,23 @@ async def cmd_start(message: Message):
             f"• 🎙 Голосовое сообщение\n"
             f"• 📝 Текст рецепта\n"
             f"• /add — явный режим добавления\n\n"
-            f"Откройте ПОЛЯНУ кнопкой внизу экрана 👇",
-            reply_markup=ReplyKeyboardRemove(),
+            f"💰 /ref — партнёрская программа · 📄 /terms — правила\n\n"
+            f"Откройте ПОЛЯНУ кнопкой ниже 👇",
+            reply_markup=kb,
         )
+
+
+@dp.callback_query(F.data == "show_ref")
+async def cb_show_ref(callback: CallbackQuery):
+    if pool is not None and callback.from_user and callback.message:
+        await _send_referral(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "show_terms")
+async def cb_show_terms(callback: CallbackQuery):
+    await cmd_terms(callback.message)
+    await callback.answer()
 
 
 async def run_bot():
@@ -3099,6 +3169,8 @@ async def run_bot():
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="add", description="Добавить рецепт в библиотеку"),
+                BotCommand(command="ref", description="Партнёрская программа"),
+                BotCommand(command="terms", description="Правила и документы"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
