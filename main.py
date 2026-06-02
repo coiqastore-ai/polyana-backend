@@ -2617,6 +2617,9 @@ async def _openrouter_background(scene_prompt: str) -> bytes:
         "messages": [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],
         "image_config": {"aspect_ratio": "9:16", "image_size": "1K"},
+        # Cap output so OpenRouter doesn't pre-reserve the full 65536-token budget
+        # (~$2). One 1K 9:16 image is ~4k tokens; 12k gives headroom, reserves ~$0.36.
+        "max_tokens": 12000,
     }
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
