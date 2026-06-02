@@ -2450,6 +2450,62 @@ async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user
     return {"invoice_link": link, "stars": stars}
 
 
+@app.get("/api/_debug/yoo")
+async def _debug_yoo(k: str | None = Query(default=None)):
+    """TEMP token-gated: try to create a YooKassa payment with and without the
+    receipt, return raw responses to pinpoint why payment fails. REMOVE later."""
+    if k != "OUYqE306H2RrLIZ5Y5u-ZMDIN_ijUzNh":
+        raise HTTPException(404, "Not found")
+    out = {
+        "shop_id_set": bool(YOOKASSA_SHOP_ID),
+        "secret_set": bool(YOOKASSA_SECRET_KEY),
+        "vat_code": YOOKASSA_VAT_CODE,
+        "frontend_url": FRONTEND_URL or None,
+    }
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        out["verdict"] = "Ключи ЮКассы не заданы в env"
+        return out
+
+    base = {
+        "amount": {"value": "100.00", "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "redirect", "return_url": FRONTEND_URL or "https://t.me"},
+        "description": "diag",
+        "metadata": {"user_id": "0"},
+    }
+    with_receipt = dict(base)
+    if YOOKASSA_VAT_CODE:
+        with_receipt["receipt"] = {
+            "customer": {"email": "test@example.com"},
+            "items": [{
+                "description": "Пополнение баланса (цифровая услуга)",
+                "quantity": "1.00",
+                "amount": {"value": "100.00", "currency": "RUB"},
+                "vat_code": int(YOOKASSA_VAT_CODE),
+                "payment_subject": "service",
+                "payment_mode": "full_payment",
+            }],
+        }
+
+    async def _try(payload):
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post("https://api.yookassa.ru/v3/payments", json=payload,
+                                 auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+                                 headers={"Idempotence-Key": secrets.token_hex(16)})
+            d = r.json()
+            return {"http": r.status_code, "status": d.get("status"),
+                    "has_url": bool((d.get("confirmation") or {}).get("confirmation_url")),
+                    "error": d.get("description") or d.get("code") or d.get("type"),
+                    "params": d.get("parameter")}
+        except Exception as e:
+            return {"exc": f"{type(e).__name__}: {e}"}
+
+    out["no_receipt"] = await _try(base)
+    out["with_receipt"] = await _try(with_receipt)
+    return out
+
+
 @app.post("/api/yookassa/webhook")
 async def yookassa_webhook(body: dict, db=Depends(get_db)):
     """YooKassa server-to-server notification. We DO NOT trust the body — we
