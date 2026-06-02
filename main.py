@@ -36,6 +36,11 @@ YOOKASSA_SECRET_KEY = ENV("YOOKASSA_SECRET_KEY", "")
 # 54-ФЗ receipt: VAT code (1 = без НДС for ИП на УСН/патенте). Set to "" to skip receipts.
 YOOKASSA_VAT_CODE = ENV("YOOKASSA_VAT_CODE", "1")
 
+# Admin alerts (low-balance / outages) go to this Telegram chat id. @chigra89.
+ADMIN_CHAT_ID = int(ENV("ADMIN_CHAT_ID", "257938367") or 0)
+SUPPORT_HANDLE = ENV("SUPPORT_HANDLE", "@chigra89")
+OPENROUTER_LOW_BALANCE_USD = float(ENV("OPENROUTER_LOW_BALANCE_USD", "5"))
+
 # Prices in kopecks
 PRICE_AI_INVITE = 4900   # 49 ₽ — AI invitation (includes 1 free reroll)
 
@@ -2548,6 +2553,56 @@ async def _compose_invite_scene(name, date_str, time_str, place, dishes) -> tupl
         return None, None
 
 
+async def _alert_admin(text: str) -> None:
+    """Send an operational alert to the admin chat (best-effort)."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_CHAT_ID, text)
+    except Exception:
+        log.exception("admin alert failed")
+
+
+_low_balance_alerted = False
+
+
+async def _openrouter_remaining_usd() -> float | None:
+    """Remaining OpenRouter credit in USD, or None if unavailable."""
+    if not OPENROUTER_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                "https://openrouter.ai/api/v1/credits",
+                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            )
+        d = (r.json() or {}).get("data") or {}
+        return float(d.get("total_credits", 0)) - float(d.get("total_usage", 0))
+    except Exception:
+        log.exception("openrouter credits check failed")
+        return None
+
+
+async def _openrouter_balance_loop():
+    """Alert admin once when OpenRouter credit drops below threshold; reset on recovery."""
+    global _low_balance_alerted
+    while True:
+        try:
+            rem = await _openrouter_remaining_usd()
+            if rem is not None:
+                if rem < OPENROUTER_LOW_BALANCE_USD and not _low_balance_alerted:
+                    _low_balance_alerted = True
+                    await _alert_admin(
+                        f"⚠️ OpenRouter: остаток ${rem:.2f} (< ${OPENROUTER_LOW_BALANCE_USD:.0f}). "
+                        f"Пополни, пока генерация не встала: https://openrouter.ai/settings/credits"
+                    )
+                elif rem >= OPENROUTER_LOW_BALANCE_USD and _low_balance_alerted:
+                    _low_balance_alerted = False  # recovered → re-arm
+        except Exception:
+            log.exception("openrouter balance loop error")
+        await asyncio.sleep(1800)   # every 30 min
+
+
 async def _openrouter_background(scene_prompt: str) -> bytes:
     """Generate a vertical 9:16 1K background (no text) via gpt-5.4-image-2."""
     if not OPENROUTER_KEY:
@@ -2578,9 +2633,14 @@ async def _openrouter_background(scene_prompt: str) -> bytes:
         # never show the raw "add more credits / openrouter.ai" text to end users.
         if r.status_code == 402 or "credit" in low or "afford" in low or "quota" in low:
             log.error("OpenRouter out of credits/quota: %s", msg)
-            raise HTTPException(503, "Генерация временно недоступна, попробуйте позже")
+            await _alert_admin(
+                "🚨 OpenRouter: КОНЧИЛИСЬ КРЕДИТЫ — генерация не работает, "
+                "оплатившие пользователи заблокированы! Пополни: "
+                "https://openrouter.ai/settings/credits"
+            )
+            raise HTTPException(503, f"Генерация временно недоступна. Напишите в поддержку {SUPPORT_HANDLE}")
         log.error("OpenRouter image error: %s", msg)
-        raise HTTPException(502, "Не удалось сгенерировать фон, попробуйте ещё раз")
+        raise HTTPException(502, f"Не удалось сгенерировать фон, попробуйте ещё раз. Если повторяется — {SUPPORT_HANDLE}")
     try:
         url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
         return base64.b64decode(url.split(",", 1)[1])
@@ -2832,6 +2892,24 @@ async def cmd_terms(message: Message):
         "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
         "тратятся внутри бота и не выводятся.</i>"
     )
+
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    if message.from_user:
+        await message.answer(f"Твой chat_id: <code>{message.from_user.id}</code>")
+
+
+@dp.message(Command("opbalance"))
+async def cmd_opbalance(message: Message):
+    """Admin-only: check remaining OpenRouter credit on demand."""
+    if not message.from_user or message.from_user.id != ADMIN_CHAT_ID:
+        return
+    rem = await _openrouter_remaining_usd()
+    if rem is None:
+        await message.answer("Не удалось получить остаток OpenRouter.")
+    else:
+        await message.answer(f"💳 OpenRouter остаток: <b>${rem:.2f}</b>")
 
 
 # ── Text recipe buffering ─────────────────────────────────────────────────────
@@ -3205,6 +3283,8 @@ async def _bg_init():
     asyncio.create_task(run_bot())
     # Start referral bonus maturation worker
     asyncio.create_task(_referral_maturation_loop())
+    # Start OpenRouter low-balance monitor (alerts admin)
+    asyncio.create_task(_openrouter_balance_loop())
 
 
 @app.on_event("startup")
