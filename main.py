@@ -2573,7 +2573,14 @@ async def _openrouter_background(scene_prompt: str) -> bytes:
     err = data.get("error")
     if err:
         msg = err.get("message") if isinstance(err, dict) else str(err)
-        raise HTTPException(502, f"Не удалось сгенерировать фон: {msg}")
+        low = str(msg).lower()
+        # Provider-side credit/quota problems are OUR issue, not the user's —
+        # never show the raw "add more credits / openrouter.ai" text to end users.
+        if r.status_code == 402 or "credit" in low or "afford" in low or "quota" in low:
+            log.error("OpenRouter out of credits/quota: %s", msg)
+            raise HTTPException(503, "Генерация временно недоступна, попробуйте позже")
+        log.error("OpenRouter image error: %s", msg)
+        raise HTTPException(502, "Не удалось сгенерировать фон, попробуйте ещё раз")
     try:
         url = data["choices"][0]["message"]["images"][0]["image_url"]["url"]
         return base64.b64decode(url.split(",", 1)[1])
