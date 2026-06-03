@@ -2479,19 +2479,25 @@ async def _debug_genimg2(k: str | None = Query(default=None)):
         d = r.json()
     except Exception as e:
         return {"remaining_usd": rem, "exc": f"{type(e).__name__}: {e}"}
-    msg = None
+    out = {"remaining_usd": rem, "http": r.status_code, "error": d.get("error")}
     try:
-        msg = (d.get("choices") or [{}])[0].get("message", {})
-    except Exception:
-        pass
-    return {
-        "remaining_usd": rem,
-        "http": r.status_code,
-        "error": d.get("error"),
-        "usage": d.get("usage"),
-        "has_image": bool(msg and msg.get("images")),
-        "finish": (d.get("choices") or [{}])[0].get("finish_reason") if d.get("choices") else None,
-    }
+        url = d["choices"][0]["message"]["images"][0]["image_url"]["url"]
+        bg = base64.b64decode(url.split(",", 1)[1])
+        out["bg_bytes"] = len(bg)
+    except Exception as e:
+        out["extract_err"] = f"{type(e).__name__}: {e}"
+        return out
+    # Full pipeline: render overlay + base64 (tests Pillow/fonts on Railway)
+    try:
+        evt = {"name": "Тест", "date_str": "сб, 30 мая", "time_str": "21:00",
+               "place": "Дача", "host_name": "Игорь", "dishes": ["Шашлык", "Хачапури"]}
+        png = invite.render_on_background(bg, evt, "шашлык")
+        out["png_bytes"] = len(png)
+        out["b64_len"] = len("data:image/png;base64," + base64.b64encode(png).decode())
+        out["ok"] = True
+    except Exception as e:
+        out["render_err"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 @app.get("/api/_debug/txns")
