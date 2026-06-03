@@ -2458,6 +2458,29 @@ async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user
     return {"invoice_link": link, "stars": stars}
 
 
+@app.get("/api/_debug/txns")
+async def _debug_txns(k: str | None = Query(default=None),
+                      refund_uid: int = Query(default=0),
+                      refund_kop: int = Query(default=0),
+                      db=Depends(get_db)):
+    """TEMP token-gated: inspect recent ledger + balances; optional manual refund.
+    REMOVE later."""
+    if k != "gMXDqVxzPNyawHdR-jYMcY6mrvE95MRM":
+        raise HTTPException(404, "Not found")
+    if refund_uid and refund_kop:
+        bal = await _credit(db, refund_uid, refund_kop, "manual_refund",
+                            ref=f"refund:{refund_uid}:{secrets.token_hex(4)}")
+        return {"refunded_uid": refund_uid, "refunded_kop": refund_kop, "new_balance": bal}
+    txns = await db.fetch(
+        "SELECT id, telegram_user_id, kind, amount, balance_after, created_at "
+        "FROM payment_txns ORDER BY id DESC LIMIT 25")
+    bals = await db.fetch("SELECT telegram_user_id, balance FROM user_balance ORDER BY balance DESC")
+    return {
+        "txns": [dict(t) | {"created_at": str(t["created_at"])} for t in txns],
+        "balances": [dict(b) for b in bals],
+    }
+
+
 @app.post("/api/yookassa/webhook")
 async def yookassa_webhook(body: dict, db=Depends(get_db)):
     """YooKassa server-to-server notification. We DO NOT trust the body — we
@@ -2727,13 +2750,16 @@ async def make_invite_image(
             if new_bal is None:
                 log.warning("debit race for user %s on invite; serving anyway", user_id)
             else:
-                # grant 1 free reroll for this event
-                await db.execute(
-                    "INSERT INTO invite_grants (telegram_user_id, event_id, remaining) VALUES ($1,$2,1)",
-                    user_id, event_id,
-                )
-                # referral: 10% of this spend to the referrer (matures in 24h)
-                await _accrue_referral_bonus(db, user_id, PRICE_AI_INVITE, f"txn:{txn_id}")
+                # Post-charge side-effects must NEVER fail image delivery — else the
+                # user is charged but gets no picture (500 after committed debit).
+                try:
+                    await db.execute(
+                        "INSERT INTO invite_grants (telegram_user_id, event_id, remaining) VALUES ($1,$2,1)",
+                        user_id, event_id,
+                    )
+                    await _accrue_referral_bonus(db, user_id, PRICE_AI_INVITE, f"txn:{txn_id}")
+                except Exception:
+                    log.exception("post-charge side-effects failed for user %s", user_id)
     else:
         use_theme = theme or invite.DEFAULT_THEME
         png = invite.render_typographic(evt, use_theme)
