@@ -2458,71 +2458,6 @@ async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user
     return {"invoice_link": link, "stars": stars}
 
 
-@app.get("/api/_debug/genimg2")
-async def _debug_genimg2(k: str | None = Query(default=None)):
-    """TEMP token-gated: run the real image-gen call, return raw OpenRouter
-    diagnostics (no image bytes, no payment data). REMOVE later."""
-    if k != "r8kxofsGFpM8B-RqWEfe5KrEBvzs_bY-":
-        raise HTTPException(404, "Not found")
-    rem = await _openrouter_remaining_usd()
-    payload = {
-        "model": "openai/gpt-5.4-image-2",
-        "messages": [{"role": "user", "content": "Vertical 9:16 cozy dacha evening, string lights, no text."}],
-        "modalities": ["image", "text"],
-        "image_config": {"aspect_ratio": "9:16", "image_size": "1K"},
-        "max_tokens": 12000,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post("https://openrouter.ai/api/v1/chat/completions",
-                             headers={"Authorization": f"Bearer {OPENROUTER_KEY}"}, json=payload)
-        d = r.json()
-    except Exception as e:
-        return {"remaining_usd": rem, "exc": f"{type(e).__name__}: {e}"}
-    out = {"remaining_usd": rem, "http": r.status_code, "error": d.get("error")}
-    try:
-        url = d["choices"][0]["message"]["images"][0]["image_url"]["url"]
-        bg = base64.b64decode(url.split(",", 1)[1])
-        out["bg_bytes"] = len(bg)
-    except Exception as e:
-        out["extract_err"] = f"{type(e).__name__}: {e}"
-        return out
-    # Full pipeline: render overlay + base64 (tests Pillow/fonts on Railway)
-    try:
-        evt = {"name": "Тест", "date_str": "сб, 30 мая", "time_str": "21:00",
-               "place": "Дача", "host_name": "Игорь", "dishes": ["Шашлык", "Хачапури"]}
-        png = invite.render_on_background(bg, evt, "шашлык")
-        out["png_bytes"] = len(png)
-        out["b64_len"] = len("data:image/png;base64," + base64.b64encode(png).decode())
-        out["ok"] = True
-    except Exception as e:
-        out["render_err"] = f"{type(e).__name__}: {e}"
-    return out
-
-
-@app.get("/api/_debug/txns")
-async def _debug_txns(k: str | None = Query(default=None),
-                      refund_uid: int = Query(default=0),
-                      refund_kop: int = Query(default=0),
-                      db=Depends(get_db)):
-    """TEMP token-gated: inspect recent ledger + balances; optional manual refund.
-    REMOVE later."""
-    if k != "gMXDqVxzPNyawHdR-jYMcY6mrvE95MRM":
-        raise HTTPException(404, "Not found")
-    if refund_uid and refund_kop:
-        bal = await _credit(db, refund_uid, refund_kop, "manual_refund",
-                            ref=f"refund:{refund_uid}:{secrets.token_hex(4)}")
-        return {"refunded_uid": refund_uid, "refunded_kop": refund_kop, "new_balance": bal}
-    txns = await db.fetch(
-        "SELECT id, telegram_user_id, kind, amount, balance_after, created_at "
-        "FROM payment_txns ORDER BY id DESC LIMIT 25")
-    bals = await db.fetch("SELECT telegram_user_id, balance FROM user_balance ORDER BY balance DESC")
-    return {
-        "txns": [dict(t) | {"created_at": str(t["created_at"])} for t in txns],
-        "balances": [dict(b) for b in bals],
-    }
-
-
 @app.post("/api/yookassa/webhook")
 async def yookassa_webhook(body: dict, db=Depends(get_db)):
     """YooKassa server-to-server notification. We DO NOT trust the body — we
@@ -2755,60 +2690,13 @@ async def make_invite_image(
         "dishes": dishes,
     }
 
-    theme = invite.theme_or_default(requested_theme) if requested_theme else None
-
-    if mode == "ai":
-        # Billing: a paid generation grants 1 free reroll for the same event.
-        grant = await db.fetchrow(
-            "SELECT id, remaining FROM invite_grants "
-            "WHERE telegram_user_id=$1 AND event_id=$2 AND remaining>0 ORDER BY id DESC LIMIT 1",
-            user_id, event_id,
-        )
-        if not grant:
-            bal = await _get_balance(db, user_id)
-            if bal < PRICE_AI_INVITE:
-                raise HTTPException(402, detail={
-                    "error": "insufficient_balance",
-                    "price": PRICE_AI_INVITE,
-                    "balance": bal,
-                })
-
-        auto_theme, scene = await _compose_invite_scene(
-            ev["name"], date_str, time_str, ev["location"], dishes
-        )
-        use_theme = theme or auto_theme or invite.DEFAULT_THEME
-        scene = scene or invite.THEMES[use_theme]["prompt"]
-        bg = await _openrouter_background(scene)   # may raise — charge only after success
-        png = invite.render_on_background(bg, evt, use_theme)
-
-        # Charge only after a successful generation
-        if grant:
-            await db.execute(
-                "UPDATE invite_grants SET remaining=remaining-1 WHERE id=$1", grant["id"]
-            )
-        else:
-            new_bal, txn_id = await _debit(db, user_id, PRICE_AI_INVITE, "charge_ai_invite",
-                                           {"event_id": event_id})
-            if new_bal is None:
-                log.warning("debit race for user %s on invite; serving anyway", user_id)
-            else:
-                # Post-charge side-effects must NEVER fail image delivery — else the
-                # user is charged but gets no picture (500 after committed debit).
-                try:
-                    await db.execute(
-                        "INSERT INTO invite_grants (telegram_user_id, event_id, remaining) VALUES ($1,$2,1)",
-                        user_id, event_id,
-                    )
-                    await _accrue_referral_bonus(db, user_id, PRICE_AI_INVITE, f"txn:{txn_id}")
-                except Exception:
-                    log.exception("post-charge side-effects failed for user %s", user_id)
-    else:
-        use_theme = theme or invite.DEFAULT_THEME
-        png = invite.render_typographic(evt, use_theme)
+    # Paid AI invitations removed — free typographic template only (no charge, no LLM).
+    use_theme = invite.theme_or_default(requested_theme) if requested_theme else invite.DEFAULT_THEME
+    png = invite.render_typographic(evt, use_theme)
 
     return {
         "image": "data:image/png;base64," + base64.b64encode(png).decode(),
-        "mode": mode,
+        "mode": "free",
         "theme": use_theme,
     }
 
