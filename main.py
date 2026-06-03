@@ -2458,6 +2458,42 @@ async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user
     return {"invoice_link": link, "stars": stars}
 
 
+@app.get("/api/_debug/genimg2")
+async def _debug_genimg2(k: str | None = Query(default=None)):
+    """TEMP token-gated: run the real image-gen call, return raw OpenRouter
+    diagnostics (no image bytes, no payment data). REMOVE later."""
+    if k != "r8kxofsGFpM8B-RqWEfe5KrEBvzs_bY-":
+        raise HTTPException(404, "Not found")
+    rem = await _openrouter_remaining_usd()
+    payload = {
+        "model": "openai/gpt-5.4-image-2",
+        "messages": [{"role": "user", "content": "Vertical 9:16 cozy dacha evening, string lights, no text."}],
+        "modalities": ["image", "text"],
+        "image_config": {"aspect_ratio": "9:16", "image_size": "1K"},
+        "max_tokens": 12000,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post("https://openrouter.ai/api/v1/chat/completions",
+                             headers={"Authorization": f"Bearer {OPENROUTER_KEY}"}, json=payload)
+        d = r.json()
+    except Exception as e:
+        return {"remaining_usd": rem, "exc": f"{type(e).__name__}: {e}"}
+    msg = None
+    try:
+        msg = (d.get("choices") or [{}])[0].get("message", {})
+    except Exception:
+        pass
+    return {
+        "remaining_usd": rem,
+        "http": r.status_code,
+        "error": d.get("error"),
+        "usage": d.get("usage"),
+        "has_image": bool(msg and msg.get("images")),
+        "finish": (d.get("choices") or [{}])[0].get("finish_reason") if d.get("choices") else None,
+    }
+
+
 @app.get("/api/_debug/txns")
 async def _debug_txns(k: str | None = Query(default=None),
                       refund_uid: int = Query(default=0),
