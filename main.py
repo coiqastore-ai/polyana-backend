@@ -64,6 +64,23 @@ async def get_db():
         yield c
 
 
+async def track(user_id, event_type, props=None, event_ref=None, src_payload=None):
+    """Fire-and-forget analytics. Own connection, swallows errors — never breaks a request.
+    Server-truth for North Star (K-factor), activation and the viral loop."""
+    if pool is None or not event_type:
+        return
+    try:
+        async with pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO analytics_events (user_id, event_type, props, event_ref, src_payload) "
+                "VALUES ($1,$2,$3::jsonb,$4,$5)",
+                user_id, str(event_type)[:64], json.dumps(props or {}),
+                event_ref, (str(src_payload)[:128] if src_payload else None),
+            )
+    except Exception:
+        log.exception("analytics track failed: %s", event_type)
+
+
 async def init_db():
     global pool, _db_ready
     pool = await asyncio.wait_for(
@@ -421,6 +438,22 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_refbonus_due
                 ON referral_bonuses(available_at) WHERE NOT paid;
+        """)
+
+        # ── Analytics: append-only event log (North Star / K-factor / funnel) ──
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_events (
+                id          BIGSERIAL PRIMARY KEY,
+                ts          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                user_id     BIGINT,
+                event_type  TEXT NOT NULL,
+                props       JSONB NOT NULL DEFAULT '{}',
+                event_ref   BIGINT,
+                src_payload TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ae_type_ts ON analytics_events(event_type, ts);
+            CREATE INDEX IF NOT EXISTS idx_ae_user    ON analytics_events(user_id);
+            CREATE INDEX IF NOT EXISTS idx_ae_ref     ON analytics_events(event_ref);
         """)
 
         # ── Migration C: Seed event_recipes from old recipes.event_id ────────
@@ -1096,6 +1129,24 @@ async def migration_check(db=Depends(get_db)):
         "SELECT column_name FROM information_schema.columns WHERE table_name='event_recipes' ORDER BY ordinal_position"
     )
 
+    # Analytics funnel snapshot (deploy verification + lightweight K-factor dashboard)
+    try:
+        ae = await db.fetch(
+            "SELECT event_type, COUNT(*) c, COUNT(DISTINCT user_id) u FROM analytics_events GROUP BY event_type"
+        )
+        analytics = {r["event_type"]: {"count": r["c"], "users": r["u"]} for r in ae}
+        joined = await db.fetchval("SELECT COUNT(*) FROM analytics_events WHERE event_type='guest_joined'")
+        became = await db.fetchval("SELECT COUNT(*) FROM analytics_events WHERE event_type='guest_became_organizer'")
+        avg_guests = await db.fetchval(
+            "SELECT COALESCE(AVG(c),0) FROM (SELECT event_ref, COUNT(*) c FROM analytics_events "
+            "WHERE event_type='guest_joined' GROUP BY event_ref) t"
+        )
+        g2o = (became / joined) if joined else 0.0
+        analytics["_guest_to_organizer"] = round(g2o, 3)
+        analytics["_k_factor"] = round(float(avg_guests or 0) * g2o, 3)
+    except Exception as e:
+        analytics = {"error": type(e).__name__}
+
     return {
         "блок1_recipes_without_user": recipes_without_user,
         "блок1_recipes_user_id_zero": recipes_with_zero,
@@ -1104,6 +1155,7 @@ async def migration_check(db=Depends(get_db)):
         "блок4_indexes_on_recipes": [{"name": r["indexname"], "def": r["indexdef"]} for r in indexes],
         "блок4_constraints_on_recipes": [{"name": r["conname"], "type": r["contype"], "def": r["def"]} for r in constraints],
         "event_recipes_columns": [r["column_name"] for r in er_columns],
+        "analytics": analytics,
     }
 
 
@@ -1175,6 +1227,15 @@ async def create_event(body: dict, user_id: int = Depends(get_current_user), db=
     if not name:
         raise HTTPException(400, "name required")
 
+    # K-factor: read state BEFORE creating this event.
+    #  prior_owned == 0 AND has_joined > 0  → a guest just converted into an organizer.
+    prior_owned = await db.fetchval(
+        "SELECT COUNT(*) FROM events WHERE telegram_user_id=$1", user_id
+    )
+    has_joined = await db.fetchval(
+        "SELECT COUNT(*) FROM collaborators WHERE telegram_user_id=$1 AND role<>'owner'", user_id
+    )
+
     event_date = None
     raw = body.get("event_date")
     if raw:
@@ -1201,6 +1262,9 @@ async def create_event(body: dict, user_id: int = Depends(get_current_user), db=
         row["id"], user_id,
         body.get("owner_first_name", ""), body.get("owner_username", ""),
     )
+    await track(user_id, "event_created", props={"event_id": row["id"]}, event_ref=row["id"])
+    if (prior_owned or 0) == 0 and (has_joined or 0) > 0:
+        await track(user_id, "guest_became_organizer", props={"event_id": row["id"]}, event_ref=row["id"])
     return {"id": row["id"], "name": row["name"], "share_token": row["share_token"], "owner_id": user_id}
 
 
@@ -1902,8 +1966,12 @@ async def get_share_link(event_id: int, user_id: int = Depends(get_current_user)
 
 @app.post("/api/events/{event_id}/join")
 async def join_event(event_id: int, body: dict, user_id: int = Depends(get_current_user), db=Depends(get_db)):
-    if not await db.fetchrow("SELECT id FROM events WHERE id=$1", event_id):
+    ev = await db.fetchrow("SELECT telegram_user_id FROM events WHERE id=$1", event_id)
+    if not ev:
         raise HTTPException(404, "Not found")
+    was_new = not await db.fetchval(
+        "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user_id
+    )
     await db.execute(
         """
         INSERT INTO collaborators (event_id, telegram_user_id, first_name, username, role)
@@ -1912,6 +1980,10 @@ async def join_event(event_id: int, body: dict, user_id: int = Depends(get_curre
         """,
         event_id, user_id, body.get("first_name", ""), body.get("username", ""),
     )
+    if was_new and ev["telegram_user_id"] != user_id:
+        await track(user_id, "guest_joined",
+                    props={"event_id": event_id, "owner_id": ev["telegram_user_id"]},
+                    event_ref=event_id)
     return {"status": "joined", "role": "collaborator"}
 
 
@@ -2488,6 +2560,8 @@ async def yookassa_webhook(body: dict, db=Depends(get_db)):
     if uid and kopecks > 0:
         new_bal = await _credit(db, uid, kopecks, "topup_yookassa", ref=pid,
                                 meta={"amount_rub": real["amount"]["value"]})
+        await track(uid, "payment_succeeded",
+                    props={"kopecks": kopecks, "method": "yookassa", "ref": pid})
         try:
             await bot.send_message(
                 uid, f"✅ Баланс пополнен на {int(kopecks/100)} ₽.\nТекущий баланс: {int(new_bal/100)} ₽"
@@ -3085,6 +3159,8 @@ async def on_successful_payment(message: Message):
     async with pool.acquire() as db:
         new_bal = await _credit(db, uid, kopecks, "topup_stars", ref=charge_id,
                                 meta={"stars": sp.total_amount})
+    await track(uid, "payment_succeeded",
+                props={"kopecks": kopecks, "method": "stars", "stars": sp.total_amount, "ref": charge_id})
     try:
         await message.answer(
             f"✅ Баланс пополнен на {int(kopecks/100)} ₽ (⭐ {sp.total_amount}).\n"
@@ -3103,6 +3179,9 @@ async def cmd_start(message: Message):
     user = message.from_user
     text = message.text or ""
     arg = text.split(maxsplit=1)[1] if " " in text else None
+
+    # Analytics: top-of-funnel + attribution source (ref_<id> / event_<id> / organic)
+    await track(user.id, "user_start", src_payload=(arg or "organic"))
 
     # Referral capture: ?start=ref_<referrer_id> (only for a brand-new referee)
     if arg and arg.startswith("ref_") and pool is not None:
@@ -3141,6 +3220,9 @@ async def cmd_start(message: Message):
             return
 
         async with pool.acquire() as db:
+            was_new = not await db.fetchval(
+                "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user.id
+            )
             await db.execute(
                 """
                 INSERT INTO collaborators (event_id, telegram_user_id, first_name, username, role)
@@ -3149,6 +3231,10 @@ async def cmd_start(message: Message):
                 """,
                 event_id, user.id, user.first_name, user.username or "",
             )
+        if was_new and event["telegram_user_id"] != user.id:
+            await track(user.id, "guest_joined",
+                        props={"event_id": event_id, "owner_id": event["telegram_user_id"], "via": "bot"},
+                        event_ref=event_id)
 
         ev_date = "дата не указана"
         if event["event_date"]:
