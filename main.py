@@ -710,30 +710,45 @@ async def _llm_parse_text(text: str, source_type: str = "text") -> dict | None:
     return data
 
 
+# Vision models tried in order — gemini first (multimodal, reliable), qwen fallback.
+_VISION_MODELS = ["google/gemini-2.5-flash", "qwen/qwen2.5-vl-72b-instruct"]
+
+
 async def _llm_parse_image(image_bytes: bytes) -> dict | None:
-    """Parse recipe from image using Qwen 2.5 VL via OpenRouter."""
+    """Parse recipe from image. Tries several vision models so one provider being
+    rate-limited (429) doesn't kill the import."""
     import base64
     client = _get_or_client()
     b64 = base64.b64encode(image_bytes).decode()
-    resp = await client.chat.completions.create(
-        model="qwen/qwen2.5-vl-72b-instruct",
-        messages=[
-            {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": "Это изображение рецепта. Извлеки и верни JSON."},
-            ]},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        max_tokens=2500,
+    messages = [
+        {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text", "text": "Это изображение рецепта. Извлеки и верни JSON."},
+        ]},
+    ]
+    last_err = None
+    for model in _VISION_MODELS:
+        try:
+            resp = await client.chat.completions.create(
+                model=model, messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.1, max_tokens=2500,
+            )
+            data = json.loads(resp.choices[0].message.content)
+            if data.get("not_a_recipe"):
+                return None
+            data["source_type"] = "photo"
+            return data
+        except Exception as e:
+            last_err = e
+            log.warning("vision parse via %s failed: %s", model, e)
+            continue
+    log.error("all vision models failed: %s", last_err)
+    raise ValueError(
+        "Сервис распознавания фото сейчас перегружен. Попробуй через минуту "
+        "или пришли рецепт текстом / ссылкой."
     )
-    raw = resp.choices[0].message.content
-    data = json.loads(raw)
-    if data.get("not_a_recipe"):
-        return None
-    data["source_type"] = "photo"
-    return data
 
 
 _WHISPER_PROMPT = (
@@ -2858,9 +2873,11 @@ async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецеп
         await status_msg.edit_text(f"🤷 {msg}")
     elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
         await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
+    elif "429" in msg or "rate-limit" in msg.lower() or "temporarily" in msg.lower():
+        await status_msg.edit_text("⏳ Сервис распознавания перегружен. Попробуй через минуту.")
     else:
         log.error("parse error (%s): %s", hint, err)
-        await status_msg.edit_text(f"❌ Ошибка при разборе.\n<code>{msg[:300]}</code>")
+        await status_msg.edit_text("❌ Не получилось разобрать. Попробуй ещё раз или пришли текст/ссылку.")
 
 
 # ── /add command ──────────────────────────────────────────────────────────────
