@@ -787,12 +787,39 @@ _BROWSER_HEADERS = {
 }
 
 
+async def _ensure_public_url(u: str) -> None:
+    """SSRF guard: allow only http(s) to a publicly-routable host. Raises ValueError."""
+    import ipaddress
+    from urllib.parse import urlparse
+    p = urlparse(u)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("Недопустимый URL")
+    try:
+        infos = await asyncio.get_event_loop().getaddrinfo(p.hostname, None)
+    except Exception:
+        raise ValueError("Не удалось разрешить адрес сайта")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            raise ValueError("Доступ к этому адресу запрещён")
+
+
 async def _fetch_page_html(url: str) -> str:
-    """Fetch raw HTML with browser-like headers. Raises httpx.HTTPStatusError on failure."""
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        resp = await client.get(url, headers=_BROWSER_HEADERS)
-        resp.raise_for_status()
-    return resp.text
+    """Fetch HTML with browser-like headers. SSRF-guarded: public hosts only,
+    each redirect hop re-validated (raises ValueError / HTTPStatusError on failure)."""
+    cur = url
+    async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
+        for _ in range(5):
+            await _ensure_public_url(cur)
+            resp = await client.get(cur, headers=_BROWSER_HEADERS)
+            loc = resp.headers.get("location")
+            if resp.is_redirect and loc:
+                cur = str(httpx.URL(cur).join(loc))
+                continue
+            resp.raise_for_status()
+            return resp.text
+    raise ValueError("Слишком много перенаправлений")
 
 
 def _html_to_text(html: str) -> str:
@@ -1095,8 +1122,10 @@ async def get_recipe_photo(file_id: str):
 
 
 @app.get("/api/admin/migration-check")
-async def migration_check(db=Depends(get_db)):
-    """Structural migration verification — returns only counts/metadata, no user data."""
+async def migration_check(user_id: int = Depends(get_current_user), db=Depends(get_db)):
+    """Structural migration verification — admin only."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Forbidden")
     # БЛОК 1: orphan check
     recipes_without_user = await db.fetchval(
         "SELECT COUNT(*) FROM recipes WHERE user_id IS NULL"
