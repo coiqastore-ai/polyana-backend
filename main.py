@@ -1090,7 +1090,7 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok", "service": "ПОЛЯНА API v3.0",
-        "rev": "vision-fix-1",
+        "rev": "audit-fixes-1",
         "db_ready": _db_ready,
         "db_error": _db_error,
     }
