@@ -2043,6 +2043,66 @@ def _fmt_qty(qty: float | None) -> str:
     return f"{qty:.2f}".rstrip("0").rstrip(".")
 
 
+# Unit canonicalization for merging the same product across recipes.
+# dimension -> base unit: mass=граммы, vol=мл, count=шт.
+_UNIT_CANON = {
+    "г": ("mass", 1), "гр": ("mass", 1), "грамм": ("mass", 1), "граммов": ("mass", 1), "g": ("mass", 1),
+    "кг": ("mass", 1000), "kg": ("mass", 1000), "килограмм": ("mass", 1000),
+    "мл": ("vol", 1), "ml": ("vol", 1),
+    "л": ("vol", 1000), "l": ("vol", 1000), "литр": ("vol", 1000), "литров": ("vol", 1000),
+    "ст.л": ("vol", 15), "ст.л.": ("vol", 15), "стл": ("vol", 15), "ст. л": ("vol", 15), "ст ложка": ("vol", 15),
+    "ч.л": ("vol", 5), "ч.л.": ("vol", 5), "чл": ("vol", 5), "ч. л": ("vol", 5),
+    "стакан": ("vol", 200), "стакана": ("vol", 200),
+    "шт": ("count", 1), "шт.": ("count", 1), "штук": ("count", 1), "штуки": ("count", 1),
+}
+_TASTE_UNITS = {"", "по вкусу", "щепотка", "щепотки", "щепоть", "на вкус"}
+
+
+def _norm_name(name: str) -> str:
+    """Grouping key for the same product (lowercase, whitespace-collapsed)."""
+    return " ".join((name or "").lower().split())
+
+
+def _merge_measures(entries: list) -> str:
+    """entries: list of (qty_float, unit_str) for ONE product. Sum per dimension
+    (mass→г/кг, vol→мл/л, count→шт), list unknown units separately, fold
+    unquantified ('по вкусу') in. Returns one human display string."""
+    mass = vol = count = 0.0
+    raw: dict = {}
+    taste = False
+    for qty, unit in entries:
+        u = (unit or "").strip().lower()
+        q = qty or 0.0
+        c = _UNIT_CANON.get(u)
+        if c:
+            dim, f = c
+            if dim == "mass":
+                mass += q * f
+            elif dim == "vol":
+                vol += q * f
+            else:
+                count += q * f
+        elif u in _TASTE_UNITS:
+            taste = True
+        elif q > 0:
+            key = (unit or "").strip()
+            raw[key] = raw.get(key, 0.0) + q
+        else:
+            taste = True
+    parts = []
+    if mass > 0:
+        parts.append(f"{_fmt_qty(mass / 1000)} кг" if mass >= 1000 else f"{_fmt_qty(mass)} г")
+    if vol > 0:
+        parts.append(f"{_fmt_qty(vol / 1000)} л" if vol >= 1000 else f"{_fmt_qty(vol)} мл")
+    if count > 0:
+        parts.append(f"{_fmt_qty(count)} шт")
+    for u, q in raw.items():
+        parts.append(f"{_fmt_qty(q)} {u}".strip())
+    if not parts and taste:
+        return "по вкусу"
+    return " + ".join(parts)
+
+
 CATEGORY_ORDER = [
     "мясо", "рыба", "овощи", "фрукты", "молочное", "яйца",
     "крупы", "мука", "масло", "соусы", "специи", "орехи",
@@ -2070,13 +2130,14 @@ async def _generate_shopping_list(event_id: int, db) -> int:
         event_id,
     )
 
-    # Aggregate by (lower_name, unit) — sum qty × multiplier
-    agg: dict[tuple, dict] = {}
+    # Group by normalized product NAME (not name+unit), collecting every (qty,unit)
+    # entry so the same product across recipes/units merges into one line.
+    agg: dict = {}
     for row in rows:
         raw_name = (row["name"] or "").strip()
         if not raw_name:
             continue  # skip ingredients with empty/NULL name — never crash the list
-        key = (raw_name.lower(), (row["unit"] or "").strip().lower())
+        key = _norm_name(raw_name)
         try:
             mult = float(row["servings_multiplier"] or 1.0)
         except (TypeError, ValueError):
@@ -2085,15 +2146,11 @@ async def _generate_shopping_list(event_id: int, db) -> int:
             qty = (float(row["qty"]) if row["qty"] else 0.0) * mult
         except (TypeError, ValueError):
             qty = 0.0
-        if key in agg:
-            agg[key]["qty"] = (agg[key]["qty"] or 0.0) + qty
-        else:
-            agg[key] = {
-                "name": raw_name,
-                "qty": qty,
-                "unit": (row["unit"] or "").strip(),
-                "category": row["category"] or "прочее",
-            }
+        g = agg.get(key)
+        if g is None:
+            g = {"name": raw_name, "category": row["category"] or "прочее", "entries": []}
+            agg[key] = g
+        g["entries"].append((qty, (row["unit"] or "").strip()))
 
     # Preserve "bought" state across regeneration (key by lower name + unit)
     prev = await db.fetch(
@@ -2101,7 +2158,7 @@ async def _generate_shopping_list(event_id: int, db) -> int:
         event_id,
     )
     bought_state = {
-        ((p["name"] or "").strip().lower(), (p["unit"] or "").strip().lower()): p["bought"]
+        _norm_name(p["name"]): p["bought"]
         for p in prev
         if (p["name"] or "").strip()
     }
@@ -2114,9 +2171,7 @@ async def _generate_shopping_list(event_id: int, db) -> int:
     # Insert aggregated items — per-row guarded so one bad row can't wipe the list
     inserted = 0
     for key, item in agg.items():
-        qty_val = item["qty"] if item["qty"] > 0 else None
-        qty_str = _fmt_qty(qty_val)
-        display_qty = f"{qty_str} {item['unit']}".strip() if qty_str else (item["unit"] or None)
+        display_qty = _merge_measures(item["entries"]) or None
         was_bought = bought_state.get(key, False)
         try:
             await db.execute(
@@ -2124,7 +2179,7 @@ async def _generate_shopping_list(event_id: int, db) -> int:
                 INSERT INTO shopping_items (event_id, name, quantity, qty, unit, category, is_generated, bought)
                 VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
                 """,
-                event_id, item["name"], display_qty, qty_val, item["unit"], item["category"], was_bought,
+                event_id, item["name"], display_qty, None, "", item["category"], was_bought,
             )
             inserted += 1
         except asyncpg.UndefinedColumnError:
