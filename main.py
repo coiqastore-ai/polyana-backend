@@ -2461,89 +2461,16 @@ async def referral_info(user_id: int = Depends(get_current_user), db=Depends(get
 _TOPUP_AMOUNTS = {100, 200, 500, 1000}   # rubles (minimum top-up 100 ₽)
 
 
+# Top-up DISABLED: no paid feature currently consumes balance, so accepting money
+# would be money-in / nothing-out. Endpoints kept (410) so old clients fail cleanly.
 @app.post("/api/balance/topup")
 async def create_topup(body: dict, user_id: int = Depends(get_current_user)):
-    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
-        raise HTTPException(503, "Платежи временно недоступны")
-    try:
-        amount_rub = int(body.get("amount") or 0)
-    except (TypeError, ValueError):
-        amount_rub = 0
-    if amount_rub not in _TOPUP_AMOUNTS:
-        raise HTTPException(400, "Недопустимая сумма")
-
-    payload = {
-        "amount": {"value": f"{amount_rub}.00", "currency": "RUB"},
-        "capture": True,
-        "confirmation": {"type": "redirect", "return_url": FRONTEND_URL or "https://t.me"},
-        "description": f"Пополнение баланса ПОЛЯНА на {amount_rub} ₽",
-        "metadata": {"user_id": str(user_id)},
-    }
-
-    # 54-ФЗ fiscal receipt. The shop has fiscalization enabled, so YooKassa
-    # REQUIRES a receipt → a customer contact (email) is mandatory here.
-    email = (body.get("email") or "").strip()
-    phone = (body.get("phone") or "").strip()
-    if YOOKASSA_VAT_CODE:
-        if not (email or phone):
-            raise HTTPException(400, "Для чека нужен email — укажите его и повторите")
-        customer = {}
-        if email:
-            customer["email"] = email
-        if phone:
-            customer["phone"] = phone
-        payload["receipt"] = {
-            "customer": customer,
-            "items": [{
-                "description": "Пополнение баланса (цифровая услуга)",
-                "quantity": "1.00",
-                "amount": {"value": f"{amount_rub}.00", "currency": "RUB"},
-                "vat_code": int(YOOKASSA_VAT_CODE),
-                "payment_subject": "service",
-                "payment_mode": "full_payment",
-            }],
-        }
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                "https://api.yookassa.ru/v3/payments",
-                json=payload,
-                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-                headers={"Idempotence-Key": secrets.token_hex(16)},
-            )
-        data = r.json()
-    except Exception as e:
-        log.exception("yookassa create payment failed")
-        raise HTTPException(502, f"ЮКасса недоступна: {type(e).__name__}")
-    url = (data.get("confirmation") or {}).get("confirmation_url")
-    if not url:
-        raise HTTPException(502, f"ЮКасса не вернула ссылку: {data.get('description') or data}")
-    return {"confirmation_url": url, "payment_id": data.get("id")}
+    raise HTTPException(410, "Пополнение временно отключено")
 
 
 @app.post("/api/balance/topup-stars")
 async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user)):
-    """Create a Telegram Stars invoice link. Buyer pays in Stars; on success the
-    bot's successful_payment handler credits the balance (ruble-equivalent)."""
-    try:
-        amount_rub = int(body.get("amount") or 0)
-    except (TypeError, ValueError):
-        amount_rub = 0
-    if amount_rub not in _TOPUP_AMOUNTS:
-        raise HTTPException(400, "Недопустимая сумма")
-    stars = max(1, round(amount_rub / STAR_RUB_RATE))
-    try:
-        link = await bot.create_invoice_link(
-            title=f"Баланс ПОЛЯНА: {amount_rub} ₽",
-            description=f"Пополнение баланса на {amount_rub} ₽",
-            payload=f"topup:{user_id}:{amount_rub}",
-            currency="XTR",
-            prices=[LabeledPrice(label=f"{amount_rub} ₽", amount=stars)],
-        )
-    except Exception as e:
-        log.exception("create stars invoice failed")
-        raise HTTPException(502, f"Не удалось создать счёт: {type(e).__name__}")
-    return {"invoice_link": link, "stars": stars}
+    raise HTTPException(410, "Пополнение временно отключено")
 
 
 @app.post("/api/yookassa/webhook")
@@ -3153,9 +3080,10 @@ async def voice_cancel(callback: CallbackQuery, state: FSMContext):
 
 @dp.pre_checkout_query()
 async def on_pre_checkout(query):
-    # Must answer within 10s, otherwise Telegram cancels the payment
+    # Top-up disabled — decline any lingering Stars invoice so no money is taken.
     try:
-        await bot.answer_pre_checkout_query(query.id, ok=True)
+        await bot.answer_pre_checkout_query(
+            query.id, ok=False, error_message="Пополнение временно отключено")
     except Exception:
         log.exception("pre_checkout answer failed")
 
@@ -3344,9 +3272,8 @@ async def _bg_init():
         log.error("init_db error: %s", e)
     # Start bot regardless
     asyncio.create_task(run_bot())
-    # Start referral bonus maturation worker
-    asyncio.create_task(_referral_maturation_loop())
-    # Start OpenRouter low-balance monitor (alerts admin)
+    # Referral maturation loop disabled — referral bonuses aren't spendable now.
+    # OpenRouter low-balance monitor stays: recipe text/photo/voice parsing still uses it.
     asyncio.create_task(_openrouter_balance_loop())
 
 
