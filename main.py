@@ -751,6 +751,43 @@ async def _llm_parse_image(image_bytes: bytes) -> dict | None:
     )
 
 
+async def _llm_parse_images(images: list[bytes]) -> list[dict]:
+    """Parse 1..N recipes from photos sent as one album. The model decides:
+    several pages of ONE recipe → merge into one; distinct dishes → separate."""
+    import base64
+    client = _get_or_client()
+    content: list = [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(b).decode()}"}}
+        for b in images
+    ]
+    content.append({"type": "text", "text": (
+        f"На фото {len(images)} изображени(й). Это могут быть страницы ОДНОГО рецепта "
+        "или НЕСКОЛЬКО РАЗНЫХ рецептов. Реши сам и верни JSON вида "
+        '{"recipes": [<рецепт>, ...]} — по одному объекту на КАЖДЫЙ отдельный рецепт '
+        "(схема рецепта как в системном промпте). Один рецепт на нескольких фото → массив из одного объекта."
+    )})
+    resp = await client.chat.completions.create(
+        model="qwen/qwen2.5-vl-72b-instruct",
+        messages=[
+            {"role": "system", "content": RECIPE_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=4000,
+    )
+    data = json.loads(resp.choices[0].message.content)
+    recipes = data.get("recipes")
+    if recipes is None:  # model ignored the wrapper → treat whole object as one recipe
+        recipes = [] if data.get("not_a_recipe") else [data]
+    out = []
+    for r in recipes:
+        if isinstance(r, dict) and r.get("name") and not r.get("not_a_recipe"):
+            r["source_type"] = "photo"
+            out.append(r)
+    return out
+
+
 _WHISPER_PROMPT = (
     "Кулинарный рецепт. Точно распознай названия продуктов, цифры и единицы измерения: "
     "граммы, килограммы, штуки, ложки, стаканы. "
@@ -3044,18 +3081,63 @@ async def handle_text_message(message: Message, state: FSMContext):
 
 # ── Photo handler ─────────────────────────────────────────────────────────────
 
+async def _download(file_id: str) -> bytes:
+    f = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(f.file_path, buf)
+    return buf.getvalue()
+
+
+async def _process_photo_album(message: Message, file_ids: list[str]):
+    """Send all album photos to vision in one call; save each detected recipe."""
+    status = await message.reply(f"⏳ Читаю рецепты с фото ({len(file_ids)})...")
+    try:
+        images = [await _download(fid) for fid in file_ids]
+        recipes = await _llm_parse_images(images)
+        if not recipes:
+            raise ValueError("Не удалось распознать рецепт на фото")
+        saved = []
+        for r in recipes:
+            r.setdefault("source_photo_file_id", file_ids[0])
+            saved.append(await _save_parsed_recipe(message.from_user.id, r))
+        await _reply_recipe_saved(message, saved[0], status)
+        for r in saved[1:]:
+            await _reply_recipe_saved(message, r)
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепты на фото")
+
+
+# ponytail: in-memory album buffer. Single worker (Procfile --workers 1), album
+# lands in <2s, lost-on-restart is harmless. If multi-worker later → Redis keyed by media_group_id.
+_albums: dict[str, list[str]] = {}
+
+
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
     if not message.from_user or pool is None:
         return
+
+    mgid = message.media_group_id
+    if mgid:
+        # Album: Telegram sends each photo as a separate message sharing media_group_id.
+        # First message drives processing after a short wait; the rest just add their file_id.
+        first = mgid not in _albums              # atomic: no await before setdefault
+        _albums.setdefault(mgid, []).append(message.photo[-1].file_id)
+        if not first:
+            return
+        await asyncio.sleep(2.0)                  # let the rest of the album arrive
+        file_ids = _albums.pop(mgid, [])
+        if len(file_ids) == 1:
+            mgid = None                           # single photo wrongly flagged → normal path
+        else:
+            await _process_photo_album(message, file_ids)
+            return
+
     status = await message.reply("⏳ Читаю рецепт с фото...")
     try:
         photo = message.photo[-1]   # largest size
-        file = await bot.get_file(photo.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file.file_path, buf)
         recipe = await parse_and_save_recipe(
-            message.from_user.id, image_bytes=buf.getvalue(), image_file_id=photo.file_id
+            message.from_user.id, image_bytes=await _download(photo.file_id), image_file_id=photo.file_id
         )
         await _reply_recipe_saved(message, recipe, status)
     except Exception as e:
