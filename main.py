@@ -21,6 +21,21 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+# ── Split Expenses Module ─────────────────────────────────────────────────
+try:
+    from split_module import (
+        scan_qr_from_image, parse_fns_qr, fetch_fns_receipt,
+        format_receipt_items, create_split_event, add_participant,
+        add_receipt_to_split, set_contribution, calculate_and_notify,
+        handle_receipt_photo, split_main_keyboard, split_event_keyboard,
+        split_confirm_keyboard, split_pricing_keyboard, split_help_text,
+        PHOTO_PARSE_PRICE
+    )
+    SPLIT_AVAILABLE = True
+except ImportError:
+    SPLIT_AVAILABLE = False
+    log.warning("split_module not found — split features disabled")
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("polyana")
 
@@ -31,6 +46,8 @@ FRONTEND_URL = ENV("FRONTEND_URL", "")
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
+OPENROUTER_PROXY_URL = ENV("OPENROUTER_PROXY_URL", "")
+OPENROUTER_PROXY_SECRET = ENV("OPENROUTER_PROXY_SECRET", "")
 YOOKASSA_SHOP_ID = ENV("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = ENV("YOOKASSA_SECRET_KEY", "")
 # 54-ФЗ receipt: VAT code (1 = без НДС for ИП на УСН/патенте). Set to "" to skip receipts.
@@ -623,9 +640,11 @@ def _get_or_client():
         if not OPENROUTER_KEY:
             raise RuntimeError("OPENROUTER_API_KEY не задан в env")
         from openai import AsyncOpenAI
+        _base = OPENROUTER_PROXY_URL.rstrip("/") + "/api/v1" if OPENROUTER_PROXY_URL else "https://openrouter.ai/api/v1"
         _or_client = AsyncOpenAI(
             api_key=OPENROUTER_KEY,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=_base,
+            default_headers={"X-Proxy-Secret": OPENROUTER_PROXY_SECRET} if OPENROUTER_PROXY_SECRET else {},
         )
     return _or_client
 
@@ -2704,23 +2723,32 @@ async def _alert_admin(text: str) -> None:
 _low_balance_alerted = False
 
 
+_last_403_ts = 0.0
+
 async def _openrouter_remaining_usd() -> float | None:
     """Remaining OpenRouter credit in USD, or None if unavailable."""
+    global _last_403_ts
     if not OPENROUTER_KEY:
+        return None
+    if _last_403_ts and (time.time() - _last_403_ts) < 3600:
         return None
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                "https://openrouter.ai/api/v1/credits",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-            )
+            _credits_url = (OPENROUTER_PROXY_URL.rstrip("/") + "/api/v1/credits") if OPENROUTER_PROXY_URL else "https://openrouter.ai/api/v1/credits"
+            _h = {"Authorization": f"Bearer {OPENROUTER_KEY}"}
+            if OPENROUTER_PROXY_SECRET:
+                _h["X-Proxy-Secret"] = OPENROUTER_PROXY_SECRET
+            r = await client.get(_credits_url, headers=_h)
+        if r.status_code == 403:
+            log.warning("OpenRouter credits: 403 from server IP, will retry in 1h")
+            _last_403_ts = time.time()
+            return None
         d = (r.json() or {}).get("data") or {}
+        _last_403_ts = 0.0
         return float(d.get("total_credits", 0)) - float(d.get("total_usage", 0))
     except Exception:
         log.exception("openrouter credits check failed")
         return None
-
-
 async def _openrouter_balance_loop():
     """Alert admin once when OpenRouter credit drops below threshold; reset on recovery."""
     global _low_balance_alerted
@@ -3112,6 +3140,34 @@ async def _process_photo_album(message: Message, file_ids: list[str]):
 _albums: dict[str, list[str]] = {}
 
 
+
+# ── Split Photo Handler ────────────────────────────────────────────────────
+@dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
+async def handle_photo_for_split(message: Message, db=Depends(get_db)):
+    """Handle photo - check if it's for split receipt."""
+    if not SPLIT_AVAILABLE:
+        return  # Let other handlers process
+
+    # Check if there's an active split in this chat
+    event = await db.fetchrow(
+        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        return  # Not a split context, let other handlers process
+
+    # Get photo bytes
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    photo_bytes = await message.bot.download_file(file.file_path)
+
+    # Process receipt
+    msg, is_free = await handle_receipt_photo(
+        db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
+    )
+
+    await message.answer(msg, reply_markup=split_event_keyboard(event['id']))
+
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
     if not message.from_user or pool is None:
@@ -3284,6 +3340,231 @@ async def on_successful_payment(message: Message):
 
 # ── /start command ────────────────────────────────────────────────────────────
 
+
+# ── Split Command ──────────────────────────────────────────────────────────
+@dp.message(Command("split"))
+async def cmd_split(message: Message, db=Depends(get_db)):
+    """Main split command."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        # Create new split event
+        title = args[1].strip()
+        event_id = await create_split_event(db, message.chat.id, title, message.from_user.id)
+        await message.answer(
+            f"✅ Делёж «{title}» создан!\n\n"
+            f"Добавь участников командой /split_add @username\n"
+            f"Или отправь фото чека для сканирования.",
+            reply_markup=split_event_keyboard(event_id)
+        )
+    else:
+        # Show main menu
+        await message.answer(
+            "💰 Делёж расходов\n\n"
+            "Сканируй QR-код на чеке — бесплатно\n\n"
+            "Создай новый делёж или выбери существующий:",
+            reply_markup=split_main_keyboard()
+        )
+
+
+@dp.message(Command("split_add"))
+async def cmd_split_add(message: Message, db=Depends(get_db)):
+    """Add participant to split event."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /split_add @username или /split_add user_id")
+        return
+
+    # Get active split event for this chat
+    event = await db.fetchrow(
+        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа. Создай: /split Название")
+        return
+
+    # Parse participant
+    target = args[1]
+    if target.startswith('@'):
+        # Username - need to resolve
+        await message.answer(f"Добавь @{target[1:]} в чат, затем он сможет присоединиться командой /split_join")
+    else:
+        # User ID
+        try:
+            user_id = int(target)
+            await add_participant(db, event['id'], user_id, f"User {user_id}")
+            await message.answer(f"✅ Участник добавлен!")
+        except ValueError:
+            await message.answer("Неверный формат. Используй @username или user_id")
+
+
+@dp.message(Command("split_join"))
+async def cmd_split_join(message: Message, db=Depends(get_db)):
+    """Join active split event."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    event = await db.fetchrow(
+        "SELECT id, title FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа в этом чате.")
+        return
+
+    added = await add_participant(db, event['id'], message.from_user.id, message.from_user.first_name)
+    if added:
+        await message.answer(
+            f"✅ Ты присоединился к «{event['title']}»!\n\n"
+            f"Отправь фото чека для сканирования."
+        )
+    else:
+        await message.answer("Ты уже в этом дележе.")
+
+
+@dp.message(Command("split_done"))
+async def cmd_split_done(message: Message, db=Depends(get_db)):
+    """Calculate and send debts."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    event = await db.fetchrow(
+        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа.")
+        return
+
+    summary = await calculate_and_notify(db, event['id'], message.bot)
+    await message.answer(summary)
+
+    # Close event
+    await db.execute(
+        "UPDATE split_events SET status = 'closed' WHERE id = $1",
+        event['id']
+    )
+
+
+# ── Split Callbacks ────────────────────────────────────────────────────────
+@dp.callback_query(F.data == "split_new")
+async def cb_split_new(callback: CallbackQuery):
+    """Prompt for new split event name."""
+    await callback.message.answer("Введи название дележа:\n\nПример: /split Шашлык на даче")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_list")
+async def cb_split_list(callback: CallbackQuery, db=Depends(get_db)):
+    """List user's split events."""
+    events = await db.fetch(
+        "SELECT id, title, total, status FROM split_events WHERE organizer_id = $1 ORDER BY id DESC LIMIT 5",
+        callback.from_user.id
+    )
+    if not events:
+        await callback.message.answer("У тебя пока нет дележей.\nСоздай: /split Название")
+    else:
+        lines = ["📋 Твои дележи:\n"]
+        for e in events:
+            status = "🟢" if e['status'] == 'active' else "⚫"
+            lines.append(f"{status} {e['title']} — {e['total']:.0f}₽")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_help")
+async def cb_split_help(callback: CallbackQuery):
+    """Show help."""
+    await callback.message.answer(split_help_text(), reply_markup=split_pricing_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_premium")
+async def cb_split_premium(callback: CallbackQuery):
+    """Show premium features."""
+    from split_module import split_premium_text
+    await callback.message.answer(split_premium_text(), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_back")
+async def cb_split_back(callback: CallbackQuery):
+    """Back to main menu."""
+    await callback.message.edit_text(
+        "💰 Делёж расходов\n\n"
+        "Создай новый делёж или выбери существующий:",
+        reply_markup=split_main_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_add_"))
+async def cb_split_add(callback: CallbackQuery):
+    """Prompt for receipt photo."""
+    event_id = int(callback.data.split("_")[2])
+    await callback.message.answer(
+        "📸 Отправь фото чека\n\n"
+        "🆓 QR-код на чеке — бесплатно\n"
+        "💰 Фото без QR — 10₽",
+        reply_markup=split_event_keyboard(event_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_members_"))
+async def cb_split_members(callback: CallbackQuery, db=Depends(get_db)):
+    """Show event members."""
+    event_id = int(callback.data.split("_")[2])
+    participants = await db.fetch(
+        "SELECT display_name, contributed, is_organizer FROM split_participants WHERE event_id = $1",
+        event_id
+    )
+    if not participants:
+        await callback.message.answer("Пока нет участников.")
+    else:
+        lines = ["👥 Участники:\n"]
+        for p in participants:
+            role = "👑" if p['is_organizer'] else "👤"
+            lines.append(f"{role} {p['display_name']} — вложил {p['contributed']:.0f}₽")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_contribute_"))
+async def cb_split_contribute(callback: CallbackQuery):
+    """Prompt for contribution amount."""
+    event_id = int(callback.data.split("_")[2])
+    await callback.message.answer(
+        "💰 Введи сумму своего вклада:\n\n"
+        "Пример: 500"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_done_"))
+async def cb_split_done(callback: CallbackQuery, db=Depends(get_db)):
+    """Calculate and notify."""
+    event_id = int(callback.data.split("_")[2])
+    summary = await calculate_and_notify(db, event_id, callback.message.bot)
+    await callback.message.answer(summary)
+
+    # Close event
+    await db.execute(
+        "UPDATE split_events SET status = 'closed' WHERE id = $1",
+        event_id
+    )
+    await callback.answer()
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not message.from_user:
@@ -3414,6 +3695,7 @@ async def run_bot():
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="add", description="Добавить рецепт в библиотеку"),
+                BotCommand(command="split", description="Делёж расходов"),
                 BotCommand(command="ref", description="Партнёрская программа"),
                 BotCommand(command="terms", description="Правила и документы"),
             ],
