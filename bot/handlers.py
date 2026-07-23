@@ -191,9 +191,18 @@ async def _flush_text_buffer(user_id: int):
     try:
         recipe = await parse_and_save_recipe(user_id, text=combined)
         await _reply_recipe_saved(status, recipe, status_msg=status)
-    except ValueError:
+    except ValueError as ve:
+        # not_a_recipe — tell the user instead of vanishing silently
+        msg = str(ve) if str(ve) else None
         try:
-            await status.delete()   # silently drop non-recipe text
+            if msg:
+                await status.edit_text(f"🤷 {msg}")
+            else:
+                await status.edit_text(
+                    "🤷 Не похоже на рецепт.\n\n"
+                    "Пришли ссылку, фото, голос или текст с ингредиентами.\n"
+                    "Команда /add — помощь по добавлению."
+                )
         except Exception:
             pass
     except Exception as e:
@@ -220,8 +229,8 @@ async def handle_text_message(message: Message, state: FSMContext):
         return
 
     # Plain text — only try if it's long enough to be a recipe (skip greetings/commands)
-    if len(text) < 30:
-        return   # too short, silently ignore
+    if len(text) < 15:
+        return   # too short (greetings, random chatter) — silently ignore
 
     # Buffer it: a recipe split across several messages gets combined before parsing
     uid = message.from_user.id
