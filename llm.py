@@ -182,6 +182,87 @@ async def _llm_parse_images(images: list[bytes]) -> list[dict]:
     return out
 
 
+# ── Receipt parsing (split expenses) ─────────────────────────────────────────
+
+RECEIPT_SYSTEM_PROMPT = """Ты — парсер кассовых чеков РФ. Распознай чек с фотографии и верни СТРОГО JSON:
+{
+  "store": "название магазина (Пятёрочка, Магнит, Перекрёсток, Лента и т.п.)",
+  "total": 2847.00,
+  "items": [
+    {"name": "название товара", "price": 349.00, "quantity": 1.0, "sum": 349.00}
+  ]
+}
+
+Правила:
+- price — цена за ЕДИНИЦУ товара, sum — цена × количество (в рублях, не копейках)
+- quantity — количество (1.0 если одна штука, 0.5 если полкило и т.п.)
+- Пропускай служебные строки: «КАССИР», «ИТОГО», «СУММА», «СДАЧА», «СПАСИБО ЗА ПОКУПКУ», «ПРОЕЗД», QR-коды
+- Если название товара нечитаемо или сокращено — восстанови до стандартного («МОЛ 3.2%» → «Молоко 3.2%»)
+- total — это итоговая сумма чека из строки «ИТОГО» (если видна), иначе сумма всех items
+- Если на фото НЕ чек (рецепт, документ, случайное фото) — верни {"not_a_receipt": true}
+- Все суммы в рублях с копейками (349.00, не 34900)"""
+
+
+async def _llm_parse_receipt(image_bytes: bytes) -> dict | None:
+    """Parse a store receipt from a photo. Returns {store, total, items} or None
+    if the image is not a receipt. Tries gemini-flash first (cheap, multimodal),
+    qwen-vl as fallback so a single provider 429 doesn't kill the split flow."""
+    import json
+    import base64
+    client = _get_or_client()
+    b64 = base64.b64encode(image_bytes).decode()
+    messages = [
+        {"role": "system", "content": RECEIPT_SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text", "text": "Распознай этот кассовый чек и верни JSON с товарами."},
+        ]},
+    ]
+    last_err = None
+    for model in _VISION_MODELS:
+        try:
+            resp = await client.chat.completions.create(
+                model=model, messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.1, max_tokens=2500,
+            )
+            data = json.loads(resp.choices[0].message.content)
+            if data.get("not_a_receipt"):
+                return None
+            # Normalize: coerce numeric fields, default missing ones
+            items = []
+            for it in (data.get("items") or [])[:60]:  # cap at 60 lines
+                try:
+                    price = round(float(it.get("price", 0)), 2)
+                    qty = float(it.get("quantity", 1) or 1)
+                    s = round(float(it.get("sum", price * qty) or price * qty), 2)
+                    name = str(it.get("name", "")).strip()[:120]
+                    if name and price >= 0:
+                        items.append({"name": name, "price": price, "quantity": qty, "sum": s})
+                except (TypeError, ValueError):
+                    continue
+            total = round(float(data.get("total", 0) or 0), 2)
+            # Sanity: if total missing/wrong, recompute from items
+            items_sum = round(sum(i["sum"] for i in items), 2)
+            if not total or abs(total - items_sum) > max(total, items_sum) * 0.5:
+                total = items_sum
+            if not items:
+                return None
+            return {
+                "store": str(data.get("store", "Магазин")).strip()[:120] or "Магазин",
+                "total": total,
+                "items": items,
+            }
+        except Exception as e:
+            last_err = e
+            log.warning("receipt vision parse via %s failed: %s", model, e)
+            continue
+    log.error("all vision models failed for receipt: %s", last_err)
+    raise ValueError(
+        "Не удалось распознать чек. Попробуй фото получше или чек с QR-кодом."
+    )
+
+
 _WHISPER_PROMPT = (
     "Кулинарный рецепт. Точно распознай названия продуктов, цифры и единицы измерения: "
     "граммы, килограммы, штуки, ложки, стаканы. "

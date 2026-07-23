@@ -23,7 +23,16 @@ from llm import _llm_parse_images, _transcribe_voice, _alert_admin, _openrouter_
 from routes.balance import _credit, _get_bot_username
 
 try:
-    from split_module import split_premium_text
+    from split_module import (
+        handle_receipt_photo,
+        split_main_keyboard,
+        split_event_keyboard,
+        split_confirm_keyboard,
+        split_pricing_keyboard,
+        split_help_text,
+        split_premium_text,
+        calculate_and_notify,
+    )
     SPLIT_AVAILABLE = True
 except ImportError:
     SPLIT_AVAILABLE = False
@@ -277,12 +286,22 @@ async def handle_photo_for_split(message: Message, db=Depends(get_db)):
     file = await message.bot.get_file(photo.file_id)
     photo_bytes = await message.bot.download_file(file.file_path)
 
-    # Process receipt
-    msg, is_free = await handle_receipt_photo(
-        db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
-    )
+    # Process receipt — new signature: (message_text, is_free, receipt_id_or_None)
+    try:
+        msg, is_free, receipt_id = await handle_receipt_photo(
+            db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
+        )
+    except Exception as e:
+        log.exception("split receipt parse failed: %s", e)
+        await message.answer("❌ Не удалось обработать чек. Попробуй другое фото.")
+        return
 
-    await message.answer(msg, reply_markup=split_event_keyboard(event['id']))
+    # If we got a receipt_id → show confirm/cancel keyboard; otherwise the event keyboard
+    if receipt_id:
+        kb = split_confirm_keyboard(receipt_id)
+    else:
+        kb = split_event_keyboard(event['id'])
+    await message.answer(msg, reply_markup=kb)
 
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
@@ -680,6 +699,57 @@ async def cb_split_done(callback: CallbackQuery, db=Depends(get_db)):
         event_id
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_confirm_"))
+async def cb_split_confirm(callback: CallbackQuery, db=Depends(get_db)):
+    """Receipt confirmed — it's already saved; just acknowledge and refresh event total."""
+    try:
+        receipt_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный чек", show_alert=True)
+        return
+    # Recompute event total from all receipts (idempotent)
+    event_id = await db.fetchval(
+        "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
+    )
+    if event_id:
+        await db.execute(
+            """UPDATE split_events SET total = (
+                   SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
+               ) WHERE id = $1""",
+            event_id
+        )
+    await callback.message.edit_text(
+        f"✅ Чек #{receipt_id} принят."
+        + (f"\nОткрыть делёж: /split" if event_id else "")
+    )
+    await callback.answer("Принято ✓")
+
+
+@dp.callback_query(F.data.startswith("split_cancel_"))
+async def cb_split_cancel(callback: CallbackQuery, db=Depends(get_db)):
+    """Receipt cancelled — delete it and refund is NOT done (Vision already ran).
+    We delete the row but keep the debit (the LLM cost was real)."""
+    try:
+        receipt_id = int(callback.data.split("_")[2])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный чек", show_alert=True)
+        return
+    event_id = await db.fetchval(
+        "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
+    )
+    await db.execute("DELETE FROM split_receipts WHERE id=$1", receipt_id)
+    if event_id:
+        await db.execute(
+            """UPDATE split_events SET total = (
+                   SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
+               ) WHERE id = $1""",
+            event_id
+        )
+    await callback.message.edit_text(f"❌ Чек #{receipt_id} отменён.")
+    await callback.answer("Отменено")
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
