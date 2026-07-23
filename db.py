@@ -80,6 +80,7 @@ async def init_db():
                 times_cooked      INT DEFAULT 0,
                 rating            INT,
                 notes             TEXT,
+                share_token       TEXT UNIQUE,
                 created_at        TIMESTAMPTZ DEFAULT NOW(),
                 updated_at        TIMESTAMPTZ DEFAULT NOW()
             );
@@ -497,6 +498,23 @@ async def init_db():
         for row in rows:
             await c.execute(
                 "UPDATE events SET share_token=$1 WHERE id=$2",
+                secrets.token_urlsafe(16), row["id"]
+            )
+
+        # ── Migration: recipes.share_token (for viral recipe sharing) ────────
+        col = await c.fetchval(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='recipes' AND column_name='share_token'"
+        )
+        if not col:
+            await c.execute("ALTER TABLE recipes ADD COLUMN share_token TEXT UNIQUE")
+            log.info("migration: added recipes.share_token")
+
+        # ── Backfill share_token for existing recipes ─────────────────────────
+        rrows = await c.fetch("SELECT id FROM recipes WHERE share_token IS NULL")
+        for row in rrows:
+            await c.execute(
+                "UPDATE recipes SET share_token=$1 WHERE id=$2",
                 secrets.token_urlsafe(16), row["id"]
             )
 

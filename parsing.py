@@ -1,4 +1,4 @@
-import re, logging
+import re, logging, secrets
 import httpx
 from config import _URL_RE, RECIPE_SYSTEM_PROMPT, _BROWSER_HEADERS, FRONTEND_URL
 from db import track
@@ -172,8 +172,8 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 """
                 INSERT INTO recipes
                     (user_id, name, name_original, emoji, source_url, source_type,
-                     original_language, servings, cook_time_minutes, category, source_photo_file_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     original_language, servings, cook_time_minutes, category, source_photo_file_id, share_token)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 RETURNING *
                 """,
                 user_id,
@@ -187,6 +187,7 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
                 parsed.get("category"),
                 parsed.get("source_photo_file_id"),
+                secrets.token_urlsafe(16),
             )
         except asyncpg.UniqueViolationError:
             # Same URL already in this user's library — return existing

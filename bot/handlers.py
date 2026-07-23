@@ -58,10 +58,15 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     )
     recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
     add_url = f"{FRONTEND_URL}?screen=add_to_event&recipe_id={recipe['id']}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
-        InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
+            InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
+        ],
+        [
+            InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_recipe_{recipe['id']}"),
+        ],
+    ])
     if status_msg:
         await status_msg.edit_text(body, reply_markup=kb)
     else:
@@ -836,6 +841,99 @@ async def cmd_start(message: Message):
             f"Нажмите кнопку, чтобы открыть ПОЛЯНУ:",
             reply_markup=kb,
         )
+    elif arg and arg.startswith("recipe_"):
+        # Viral recipe sharing: ?start=recipe_<token> → clone recipe into user's library
+        token = arg.replace("recipe_", "")
+        if pool is None or not token or len(token) > 64:
+            await message.answer("Сервис запускается, попробуйте через минуту.")
+            return
+
+        import secrets as _secrets
+        async with pool.acquire() as db:
+            src = await db.fetchrow("SELECT * FROM recipes WHERE share_token=$1", token)
+            if not src:
+                await message.answer("Рецепт не найден или удалён.")
+                return
+
+            # Idempotent: skip if this user already has a recipe with the same source_url+name
+            existing = None
+            if src["source_url"]:
+                existing = await db.fetchrow(
+                    "SELECT id, share_token FROM recipes WHERE user_id=$1 AND source_url=$2",
+                    user.id, src["source_url"],
+                )
+            if not existing:
+                existing = await db.fetchrow(
+                    "SELECT id, share_token FROM recipes WHERE user_id=$1 AND name=$2",
+                    user.id, src["name"],
+                )
+
+            if existing:
+                # Already in library — show it, don't duplicate
+                ing_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM ingredients WHERE recipe_id=$1", existing["id"]
+                )
+                await _reply_recipe_saved(message, {
+                    "id": existing["id"], "name": src["name"], "emoji": src["emoji"],
+                    "servings": src["servings"], "cook_time_minutes": src["cook_time_minutes"],
+                    "category": src["category"], "ingredients_count": ing_count or 0,
+                    "already_exists": True,
+                })
+                await track(user.id, "recipe_imported_via_share",
+                            props={"token": token, "original_user_id": int(src["user_id"] or 0),
+                                   "duplicate": True})
+                return
+
+            # Clone: new row owned by this user, new share_token, copy photo + metadata
+            new_token = _secrets.token_urlsafe(16)
+            cloned = await db.fetchrow(
+                """
+                INSERT INTO recipes
+                    (user_id, name, name_original, emoji, source_url, source_type, original_language,
+                     servings, cook_time_minutes, category, source_photo_file_id, share_token)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                RETURNING id
+                """,
+                user.id, src["name"], src["name_original"], src["emoji"] or "🍽",
+                src["source_url"], (src["source_type"] or "shared") if not src["source_type"] else src["source_type"],
+                src["original_language"], src["servings"], src["cook_time_minutes"],
+                src["category"], src["source_photo_file_id"], new_token,
+            )
+            new_id = cloned["id"]
+
+            # Copy ingredients
+            src_ings = await db.fetch(
+                "SELECT name, qty, unit, category, sort_order FROM ingredients WHERE recipe_id=$1 ORDER BY sort_order, id",
+                src["id"],
+            )
+            for ing in src_ings:
+                await db.execute(
+                    "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) "
+                    "VALUES ($1,$2,$3,$4,$5,$6)",
+                    new_id, ing["name"], ing["qty"], ing["unit"], ing["category"], ing["sort_order"],
+                )
+
+            # Copy steps
+            src_steps = await db.fetch(
+                "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number",
+                src["id"],
+            )
+            for st in src_steps:
+                await db.execute(
+                    "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                    new_id, st["step_number"], st["text"],
+                )
+
+            await track(user.id, "recipe_imported_via_share",
+                        props={"token": token, "original_user_id": int(src["user_id"] or 0),
+                               "recipe_id": new_id, "duplicate": False})
+
+            await _reply_recipe_saved(message, {
+                "id": new_id, "name": src["name"], "emoji": src["emoji"],
+                "servings": src["servings"], "cook_time_minutes": src["cook_time_minutes"],
+                "category": src["category"], "ingredients_count": len(src_ings),
+                "already_exists": False,
+            })
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
@@ -846,15 +944,14 @@ async def cmd_start(message: Message):
         ]) if FRONTEND_URL else None
         await message.answer(
             f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
-            f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-            f"<b>Как добавить рецепт в библиотеку:</b>\n"
-            f"• 🔗 Пришли ссылку на рецепт\n"
-            f"• 📸 Фото рецепта из книги или экрана\n"
-            f"• 🎙 Голосовое сообщение\n"
-            f"• 📝 Текст рецепта\n"
-            f"• /add — явный режим добавления\n\n"
-            f"💰 /ref — партнёрская программа · 📄 /terms — правила\n\n"
-            f"Откройте ПОЛЯНУ кнопкой ниже 👇",
+            f"ПОЛЯНА — твой кулинарный штаб:\n\n"
+            f"📋 <b>Собирай рецепты</b> — пришли ссылку, фото, голос или текст\n"
+            f"🎉 <b>Планируй застолья</b> с друзьями\n"
+            f"🛒 <b>Общая корзина</b> — ингредиенты всех рецептов в одном списке\n"
+            f"💰 <b>Делите расходы</b> — фото чека, и бот посчитает кто кому должен\n"
+            f"📤 <b>Делись рецептами</b> — друг жмёт одну кнопку, и рецепт у него\n\n"
+            f"<i>С чего начать?</i> Пришли мне ссылку на рецепт или /add\n\n"
+            f"👇 Или открой ПОЛЯНУ",
             reply_markup=kb,
         )
 
@@ -864,6 +961,58 @@ async def cb_show_ref(callback: CallbackQuery):
     if pool is not None and callback.from_user and callback.message:
         await _send_referral(callback.message, callback.from_user.id)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("share_recipe_"))
+async def cb_share_recipe(callback: CallbackQuery):
+    """Generate a forwardable recipe card with a 'Save' deep-link button.
+    The url= button survives Telegram forward, so the friend can install the
+    recipe into their own library with one tap."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    try:
+        recipe_id = int(callback.data.replace("share_recipe_", ""))
+    except ValueError:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    async with pool.acquire() as db:
+        rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        if not rec:
+            await callback.answer("Рецепт не найден", show_alert=True)
+            return
+        token = rec["share_token"]
+        # Backfill token for old recipes created before the migration
+        if not token:
+            import secrets as _s
+            token = _s.token_urlsafe(16)
+            await db.execute("UPDATE recipes SET share_token=$1 WHERE id=$2", token, recipe_id)
+        ing_count = await db.fetchval("SELECT COUNT(*) FROM ingredients WHERE recipe_id=$1", recipe_id)
+        owner_name = callback.from_user.first_name or "Друг"
+
+    username = await _get_bot_username()
+    save_url = f"https://t.me/{username}/?start=recipe_{token}" if username else None
+    if not save_url:
+        await callback.answer("Бот недоступен", show_alert=True)
+        return
+
+    # Forwardable card: text + url= button (survives forward, unlike web_app)
+    ct_str = f"⏱ {rec['cook_time_minutes']} мин · " if rec["cook_time_minutes"] else ""
+    cat_str = f"[{rec['category']}] " if rec["category"] else ""
+    serv_str = f"🍽 {rec['servings']} порц. · " if rec["servings"] else ""
+    body = (
+        f"🍲 <b>{rec['name']}</b>\n"
+        f"{cat_str}{serv_str}{ct_str}🥕 {ing_count or 0} ингр.\n\n"
+        f"<i>{owner_name} делится рецептом из ПОЛЯНЫ.</i>\n\n"
+        f"Нажми кнопку, чтобы сохранить рецепт в свою книгу 👇"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💾 Сохранить в книгу рецептов", url=save_url),
+    ]])
+    await callback.message.answer(body, reply_markup=kb)
+    await track(callback.from_user.id, "recipe_shared",
+                props={"recipe_id": recipe_id, "token": token})
+    await callback.answer("Карточка готова — перешли её другу ✂️")
 
 
 @dp.callback_query(F.data == "show_terms")

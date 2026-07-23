@@ -6,7 +6,7 @@ from parsing import parse_and_save_recipe
 from llm import _llm_normalize_ingredients
 from utils import categorize_ingredient
 from routes.shopping import _resync_shopping_if_exists
-import logging
+import secrets, logging
 
 log = logging.getLogger("polyana")
 
@@ -79,8 +79,8 @@ async def create_recipe(body: dict, user_id: int = Depends(get_current_user), db
         """
         INSERT INTO recipes
             (user_id, name, name_original, emoji, source_url, source_type,
-             original_language, servings, cook_time_minutes, category, notes)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             original_language, servings, cook_time_minutes, category, notes, share_token)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         RETURNING *
         """,
         user_id, name,
@@ -93,6 +93,7 @@ async def create_recipe(body: dict, user_id: int = Depends(get_current_user), db
         body.get("cook_time_min") or body.get("cook_time_minutes"),
         body.get("category"),
         body.get("notes"),
+        secrets.token_urlsafe(16),
     )
 
     for i, ing in enumerate(body.get("ingredients", [])):
@@ -304,6 +305,46 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
                 "qty": i["qty"], "unit": i["unit"] or "",
                 "category": i["category"] or "прочее",
             }
+            for i in ingredients
+        ],
+        "steps": [
+            {"step_number": s["step_number"], "text": s["text"]}
+            for s in steps
+        ],
+    }
+
+
+@router.get("/api/recipes/shared/{token}")
+async def get_shared_recipe(token: str, db=Depends(get_db)):
+    """Public read-only recipe card by share_token (no auth).
+    Used by viral recipe sharing — the link survives Telegram forward."""
+    if not token or len(token) > 64:
+        raise HTTPException(404, "Recipe not found")
+    rec = await db.fetchrow("SELECT * FROM recipes WHERE share_token=$1", token)
+    if not rec:
+        raise HTTPException(404, "Recipe not found")
+    ingredients = await db.fetch(
+        "SELECT * FROM ingredients WHERE recipe_id=$1 ORDER BY sort_order, id", rec["id"]
+    )
+    steps = await db.fetch(
+        "SELECT * FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", rec["id"]
+    )
+    rec_dict = dict(rec)
+    cook_time = rec_dict.get("cook_time_minutes") or rec_dict.get("cook_time_min")
+    return {
+        "id": rec["id"],
+        "name": rec["name"],
+        "name_original": rec_dict.get("name_original"),
+        "emoji": rec["emoji"] or "🍽",
+        "servings": rec["servings"],
+        "cook_time_minutes": cook_time,
+        "source_photo_file_id": rec_dict.get("source_photo_file_id"),
+        "category": rec_dict.get("category"),
+        "share_token": token,
+        "read_only": True,
+        "ingredients": [
+            {"name": i["name"], "qty": i["qty"], "unit": i["unit"] or "",
+             "category": i["category"] or "прочее"}
             for i in ingredients
         ],
         "steps": [
