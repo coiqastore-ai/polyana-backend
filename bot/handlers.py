@@ -2,6 +2,7 @@
 
 Imported for side-effect: importing this module registers handlers on core.dp.
 """
+import asyncio
 import logging
 
 from fastapi import Depends
