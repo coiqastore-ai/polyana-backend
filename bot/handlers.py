@@ -15,7 +15,8 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 
-from core import bot, dp, VoiceStates, pool
+from core import bot, dp, VoiceStates
+import core
 from config import FRONTEND_URL, ADMIN_CHAT_ID, SUPPORT_HANDLE, REFERRAL_PERCENT, STAR_RUB_RATE, PRICE_AI_INVITE, _URL_RE
 from db import get_db, track
 from parsing import parse_and_save_recipe, _save_parsed_recipe
@@ -103,7 +104,7 @@ async def cmd_add(message: Message):
 
 
 async def _send_referral(msg: Message, uid: int):
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         invited = await db.fetchval(
             "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
         earned = await db.fetchval(
@@ -132,7 +133,7 @@ async def _send_referral(msg: Message, uid: int):
 
 @dp.message(Command("ref"))
 async def cmd_ref(message: Message):
-    if not message.from_user or pool is None:
+    if not message.from_user or core.pool is None:
         return
     await _send_referral(message, message.from_user.id)
 
@@ -213,9 +214,11 @@ async def _flush_text_buffer(user_id: int):
 
 @dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
 async def handle_text_message(message: Message, state: FSMContext):
-    if not message.from_user or pool is None:
+    if not message.from_user or core.pool is None:
+        log.warning("text handler: early return — from_user=%s pool=%s", bool(message.from_user), core.pool)
         return
     text = message.text or ""
+    log.info("text handler: user=%s len=%d text=%r", message.from_user.id, len(text), text[:80])
     url_match = _URL_RE.search(text)
 
     if url_match:
@@ -286,11 +289,11 @@ async def handle_photo_for_split(message: Message):
     """Handle photo - check if it's for split receipt."""
     if not SPLIT_AVAILABLE:
         return  # Let other handlers process
-    if pool is None:
+    if core.pool is None:
         return
 
     # Check if there's an active split in this chat
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         event = await db.fetchrow(
             "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
             message.chat.id
@@ -305,7 +308,7 @@ async def handle_photo_for_split(message: Message):
 
     # Process receipt — new signature: (message_text, is_free, receipt_id_or_None)
     try:
-        async with pool.acquire() as db:
+        async with core.pool.acquire() as db:
             msg, is_free, receipt_id = await handle_receipt_photo(
                 db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
             )
@@ -323,7 +326,7 @@ async def handle_photo_for_split(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
-    if not message.from_user or pool is None:
+    if not message.from_user or core.pool is None:
         return
 
     mgid = message.media_group_id
@@ -366,7 +369,7 @@ def _voice_transcript_kb(transcript: str) -> InlineKeyboardMarkup:
 
 @dp.message(F.voice)
 async def handle_voice_message(message: Message, state: FSMContext):
-    if not message.from_user or pool is None:
+    if not message.from_user or core.pool is None:
         return
     status = await message.reply("🎙 Распознаю голос…")
     try:
@@ -427,7 +430,7 @@ async def voice_edit(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(VoiceStates.editing, F.text)
 async def voice_edited_text(message: Message, state: FSMContext):
-    if not message.from_user or pool is None:
+    if not message.from_user or core.pool is None:
         return
     edited = (message.text or "").strip()
     if len(edited) < 10:
@@ -467,7 +470,7 @@ async def on_pre_checkout(query):
 async def on_successful_payment(message: Message):
     sp = message.successful_payment
     payload = sp.invoice_payload or ""
-    if not payload.startswith("topup:") or pool is None:
+    if not payload.startswith("topup:") or core.pool is None:
         return
     try:
         _, uid_s, rub_s = payload.split(":")
@@ -477,7 +480,7 @@ async def on_successful_payment(message: Message):
         log.warning("bad stars payload: %s", payload)
         return
     charge_id = sp.telegram_payment_charge_id   # idempotency key
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         new_bal = await _credit(db, uid, kopecks, "topup_stars", ref=charge_id,
                                 meta={"stars": sp.total_amount})
     await track(uid, "payment_succeeded",
@@ -501,7 +504,7 @@ async def cmd_split(message: Message):
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-    if pool is None:
+    if core.pool is None:
         await message.answer("Сервис запускается, попробуй через минуту.")
         return
 
@@ -509,7 +512,7 @@ async def cmd_split(message: Message):
     if len(args) > 1:
         # Create new split event
         title = args[1].strip()
-        async with pool.acquire() as db:
+        async with core.pool.acquire() as db:
             event_id = await create_split_event(db, message.chat.id, title, message.from_user.id)
         await message.answer(
             f"✅ Делёж «{title}» создан!\n\n"
@@ -533,7 +536,7 @@ async def cmd_split_add(message: Message):
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-    if pool is None:
+    if core.pool is None:
         return
 
     args = message.text.split()
@@ -542,7 +545,7 @@ async def cmd_split_add(message: Message):
         return
 
     # Get active split event for this chat
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         event = await db.fetchrow(
             "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
             message.chat.id
@@ -572,10 +575,10 @@ async def cmd_split_join(message: Message):
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-    if pool is None:
+    if core.pool is None:
         return
 
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         event = await db.fetchrow(
             "SELECT id, title FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
             message.chat.id
@@ -600,10 +603,10 @@ async def cmd_split_done(message: Message):
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-    if pool is None:
+    if core.pool is None:
         return
 
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         event = await db.fetchrow(
             "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
             message.chat.id
@@ -633,10 +636,10 @@ async def cb_split_new(callback: CallbackQuery):
 @dp.callback_query(F.data == "split_list")
 async def cb_split_list(callback: CallbackQuery):
     """List user's split events."""
-    if pool is None:
+    if core.pool is None:
         await callback.answer()
         return
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         events = await db.fetch(
             "SELECT id, title, total, status FROM split_events WHERE organizer_id = $1 ORDER BY id DESC LIMIT 5",
             callback.from_user.id
@@ -694,11 +697,11 @@ async def cb_split_add(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("split_members_"))
 async def cb_split_members(callback: CallbackQuery):
     """Show event members."""
-    if pool is None:
+    if core.pool is None:
         await callback.answer()
         return
     event_id = int(callback.data.split("_")[2])
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         participants = await db.fetch(
             "SELECT display_name, contributed, is_organizer FROM split_participants WHERE event_id = $1",
             event_id
@@ -728,11 +731,11 @@ async def cb_split_contribute(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("split_done_"))
 async def cb_split_done(callback: CallbackQuery):
     """Calculate and notify."""
-    if pool is None:
+    if core.pool is None:
         await callback.answer()
         return
     event_id = int(callback.data.split("_")[2])
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         summary = await calculate_and_notify(db, event_id, callback.message.bot)
         await callback.message.answer(summary)
 
@@ -747,7 +750,7 @@ async def cb_split_done(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("split_confirm_"))
 async def cb_split_confirm(callback: CallbackQuery):
     """Receipt confirmed — it's already saved; just acknowledge and refresh event total."""
-    if pool is None:
+    if core.pool is None:
         await callback.answer()
         return
     try:
@@ -755,7 +758,7 @@ async def cb_split_confirm(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Неверный чек", show_alert=True)
         return
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         # Recompute event total from all receipts (idempotent)
         event_id = await db.fetchval(
             "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
@@ -778,7 +781,7 @@ async def cb_split_confirm(callback: CallbackQuery):
 async def cb_split_cancel(callback: CallbackQuery):
     """Receipt cancelled — delete it and refund is NOT done (Vision already ran).
     We delete the row but keep the debit (the LLM cost was real)."""
-    if pool is None:
+    if core.pool is None:
         await callback.answer()
         return
     try:
@@ -786,7 +789,7 @@ async def cb_split_cancel(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Неверный чек", show_alert=True)
         return
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         event_id = await db.fetchval(
             "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
         )
@@ -814,14 +817,14 @@ async def cmd_start(message: Message):
     await track(user.id, "user_start", src_payload=(arg or "organic"))
 
     # Referral capture: ?start=ref_<referrer_id> (only for a brand-new referee)
-    if arg and arg.startswith("ref_") and pool is not None:
+    if arg and arg.startswith("ref_") and core.pool is not None:
         try:
             referrer_id = int(arg.replace("ref_", ""))
         except ValueError:
             referrer_id = 0
         if referrer_id and referrer_id != user.id:
             try:
-                async with pool.acquire() as db:
+                async with core.pool.acquire() as db:
                     await db.execute(
                         "INSERT INTO referrals (referee_id, referrer_id) VALUES ($1,$2) "
                         "ON CONFLICT (referee_id) DO NOTHING",
@@ -838,18 +841,18 @@ async def cmd_start(message: Message):
             await message.answer("Неверная ссылка.", reply_markup=ReplyKeyboardRemove())
             return
 
-        if pool is None:
+        if core.pool is None:
             await message.answer("Сервис запускается, попробуйте через минуту.", reply_markup=ReplyKeyboardRemove())
             return
 
-        async with pool.acquire() as db:
+        async with core.pool.acquire() as db:
             event = await db.fetchrow("SELECT * FROM events WHERE id=$1", event_id)
 
         if not event:
             await message.answer("Событие не найдено или удалено.", reply_markup=ReplyKeyboardRemove())
             return
 
-        async with pool.acquire() as db:
+        async with core.pool.acquire() as db:
             was_new = not await db.fetchval(
                 "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user.id
             )
@@ -890,12 +893,12 @@ async def cmd_start(message: Message):
     elif arg and arg.startswith("recipe_"):
         # Viral recipe sharing: ?start=recipe_<token> → clone recipe into user's library
         token = arg.replace("recipe_", "")
-        if pool is None or not token or len(token) > 64:
+        if core.pool is None or not token or len(token) > 64:
             await message.answer("Сервис запускается, попробуйте через минуту.")
             return
 
         import secrets as _secrets
-        async with pool.acquire() as db:
+        async with core.pool.acquire() as db:
             src = await db.fetchrow("SELECT * FROM recipes WHERE share_token=$1", token)
             if not src:
                 await message.answer("Рецепт не найден или удалён.")
@@ -1004,7 +1007,7 @@ async def cmd_start(message: Message):
 
 @dp.callback_query(F.data == "show_ref")
 async def cb_show_ref(callback: CallbackQuery):
-    if pool is not None and callback.from_user and callback.message:
+    if core.pool is not None and callback.from_user and callback.message:
         await _send_referral(callback.message, callback.from_user.id)
     await callback.answer()
 
@@ -1014,7 +1017,7 @@ async def cb_share_recipe(callback: CallbackQuery):
     """Generate a forwardable recipe card with a 'Save' deep-link button.
     The url= button survives Telegram forward, so the friend can install the
     recipe into their own library with one tap."""
-    if not callback.from_user or pool is None:
+    if not callback.from_user or core.pool is None:
         await callback.answer()
         return
     try:
@@ -1022,7 +1025,7 @@ async def cb_share_recipe(callback: CallbackQuery):
     except ValueError:
         await callback.answer("Ошибка", show_alert=True)
         return
-    async with pool.acquire() as db:
+    async with core.pool.acquire() as db:
         rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
         if not rec:
             await callback.answer("Рецепт не найден", show_alert=True)
