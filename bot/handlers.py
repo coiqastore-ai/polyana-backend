@@ -273,16 +273,19 @@ _albums: dict[str, list[str]] = {}
 
 # ── Split Photo Handler ────────────────────────────────────────────────────
 @dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
-async def handle_photo_for_split(message: Message, db=Depends(get_db)):
+async def handle_photo_for_split(message: Message):
     """Handle photo - check if it's for split receipt."""
     if not SPLIT_AVAILABLE:
         return  # Let other handlers process
+    if pool is None:
+        return
 
     # Check if there's an active split in this chat
-    event = await db.fetchrow(
-        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
-        message.chat.id
-    )
+    async with pool.acquire() as db:
+        event = await db.fetchrow(
+            "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
     if not event:
         return  # Not a split context, let other handlers process
 
@@ -293,9 +296,10 @@ async def handle_photo_for_split(message: Message, db=Depends(get_db)):
 
     # Process receipt — new signature: (message_text, is_free, receipt_id_or_None)
     try:
-        msg, is_free, receipt_id = await handle_receipt_photo(
-            db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
-        )
+        async with pool.acquire() as db:
+            msg, is_free, receipt_id = await handle_receipt_photo(
+                db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
+            )
     except Exception as e:
         log.exception("split receipt parse failed: %s", e)
         await message.answer("❌ Не удалось обработать чек. Попробуй другое фото.")
@@ -483,17 +487,21 @@ async def on_successful_payment(message: Message):
 
 # ── Split Command ──────────────────────────────────────────────────────────
 @dp.message(Command("split"))
-async def cmd_split(message: Message, db=Depends(get_db)):
+async def cmd_split(message: Message):
     """Main split command."""
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+    if pool is None:
+        await message.answer("Сервис запускается, попробуй через минуту.")
         return
 
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
         # Create new split event
         title = args[1].strip()
-        event_id = await create_split_event(db, message.chat.id, title, message.from_user.id)
+        async with pool.acquire() as db:
+            event_id = await create_split_event(db, message.chat.id, title, message.from_user.id)
         await message.answer(
             f"✅ Делёж «{title}» создан!\n\n"
             f"Добавь участников командой /split_add @username\n"
@@ -511,10 +519,12 @@ async def cmd_split(message: Message, db=Depends(get_db)):
 
 
 @dp.message(Command("split_add"))
-async def cmd_split_add(message: Message, db=Depends(get_db)):
+async def cmd_split_add(message: Message):
     """Add participant to split event."""
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+    if pool is None:
         return
 
     args = message.text.split()
@@ -523,45 +533,49 @@ async def cmd_split_add(message: Message, db=Depends(get_db)):
         return
 
     # Get active split event for this chat
-    event = await db.fetchrow(
-        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
-        message.chat.id
-    )
-    if not event:
-        await message.answer("Нет активного дележа. Создай: /split Название")
-        return
+    async with pool.acquire() as db:
+        event = await db.fetchrow(
+            "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
+        if not event:
+            await message.answer("Нет активного дележа. Создай: /split Название")
+            return
 
-    # Parse participant
-    target = args[1]
-    if target.startswith('@'):
-        # Username - need to resolve
-        await message.answer(f"Добавь @{target[1:]} в чат, затем он сможет присоединиться командой /split_join")
-    else:
-        # User ID
-        try:
-            user_id = int(target)
-            await add_participant(db, event['id'], user_id, f"User {user_id}")
-            await message.answer(f"✅ Участник добавлен!")
-        except ValueError:
-            await message.answer("Неверный формат. Используй @username или user_id")
+        # Parse participant
+        target = args[1]
+        if target.startswith('@'):
+            # Username - need to resolve
+            await message.answer(f"Добавь @{target[1:]} в чат, затем он сможет присоединиться командой /split_join")
+        else:
+            # User ID
+            try:
+                user_id = int(target)
+                await add_participant(db, event['id'], user_id, f"User {user_id}")
+                await message.answer(f"✅ Участник добавлен!")
+            except ValueError:
+                await message.answer("Неверный формат. Используй @username или user_id")
 
 
 @dp.message(Command("split_join"))
-async def cmd_split_join(message: Message, db=Depends(get_db)):
+async def cmd_split_join(message: Message):
     """Join active split event."""
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-
-    event = await db.fetchrow(
-        "SELECT id, title FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
-        message.chat.id
-    )
-    if not event:
-        await message.answer("Нет активного дележа в этом чате.")
+    if pool is None:
         return
 
-    added = await add_participant(db, event['id'], message.from_user.id, message.from_user.first_name)
+    async with pool.acquire() as db:
+        event = await db.fetchrow(
+            "SELECT id, title FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
+        if not event:
+            await message.answer("Нет активного дележа в этом чате.")
+            return
+
+        added = await add_participant(db, event['id'], message.from_user.id, message.from_user.first_name)
     if added:
         await message.answer(
             f"✅ Ты присоединился к «{event['title']}»!\n\n"
@@ -572,28 +586,31 @@ async def cmd_split_join(message: Message, db=Depends(get_db)):
 
 
 @dp.message(Command("split_done"))
-async def cmd_split_done(message: Message, db=Depends(get_db)):
+async def cmd_split_done(message: Message):
     """Calculate and send debts."""
     if not SPLIT_AVAILABLE:
         await message.answer("Модуль «Делёж» пока не подключён.")
         return
-
-    event = await db.fetchrow(
-        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
-        message.chat.id
-    )
-    if not event:
-        await message.answer("Нет активного дележа.")
+    if pool is None:
         return
 
-    summary = await calculate_and_notify(db, event['id'], message.bot)
-    await message.answer(summary)
+    async with pool.acquire() as db:
+        event = await db.fetchrow(
+            "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
+        if not event:
+            await message.answer("Нет активного дележа.")
+            return
 
-    # Close event
-    await db.execute(
-        "UPDATE split_events SET status = 'closed' WHERE id = $1",
-        event['id']
-    )
+        summary = await calculate_and_notify(db, event['id'], message.bot)
+        await message.answer(summary)
+
+        # Close event
+        await db.execute(
+            "UPDATE split_events SET status = 'closed' WHERE id = $1",
+            event['id']
+        )
 
 
 # ── Split Callbacks ────────────────────────────────────────────────────────
@@ -605,12 +622,16 @@ async def cb_split_new(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "split_list")
-async def cb_split_list(callback: CallbackQuery, db=Depends(get_db)):
+async def cb_split_list(callback: CallbackQuery):
     """List user's split events."""
-    events = await db.fetch(
-        "SELECT id, title, total, status FROM split_events WHERE organizer_id = $1 ORDER BY id DESC LIMIT 5",
-        callback.from_user.id
-    )
+    if pool is None:
+        await callback.answer()
+        return
+    async with pool.acquire() as db:
+        events = await db.fetch(
+            "SELECT id, title, total, status FROM split_events WHERE organizer_id = $1 ORDER BY id DESC LIMIT 5",
+            callback.from_user.id
+        )
     if not events:
         await callback.message.answer("У тебя пока нет дележей.\nСоздай: /split Название")
     else:
@@ -662,13 +683,17 @@ async def cb_split_add(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("split_members_"))
-async def cb_split_members(callback: CallbackQuery, db=Depends(get_db)):
+async def cb_split_members(callback: CallbackQuery):
     """Show event members."""
+    if pool is None:
+        await callback.answer()
+        return
     event_id = int(callback.data.split("_")[2])
-    participants = await db.fetch(
-        "SELECT display_name, contributed, is_organizer FROM split_participants WHERE event_id = $1",
-        event_id
-    )
+    async with pool.acquire() as db:
+        participants = await db.fetch(
+            "SELECT display_name, contributed, is_organizer FROM split_participants WHERE event_id = $1",
+            event_id
+        )
     if not participants:
         await callback.message.answer("Пока нет участников.")
     else:
@@ -692,39 +717,47 @@ async def cb_split_contribute(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("split_done_"))
-async def cb_split_done(callback: CallbackQuery, db=Depends(get_db)):
+async def cb_split_done(callback: CallbackQuery):
     """Calculate and notify."""
+    if pool is None:
+        await callback.answer()
+        return
     event_id = int(callback.data.split("_")[2])
-    summary = await calculate_and_notify(db, event_id, callback.message.bot)
-    await callback.message.answer(summary)
+    async with pool.acquire() as db:
+        summary = await calculate_and_notify(db, event_id, callback.message.bot)
+        await callback.message.answer(summary)
 
-    # Close event
-    await db.execute(
-        "UPDATE split_events SET status = 'closed' WHERE id = $1",
-        event_id
-    )
+        # Close event
+        await db.execute(
+            "UPDATE split_events SET status = 'closed' WHERE id = $1",
+            event_id
+        )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("split_confirm_"))
-async def cb_split_confirm(callback: CallbackQuery, db=Depends(get_db)):
+async def cb_split_confirm(callback: CallbackQuery):
     """Receipt confirmed — it's already saved; just acknowledge and refresh event total."""
+    if pool is None:
+        await callback.answer()
+        return
     try:
         receipt_id = int(callback.data.split("_")[2])
     except (IndexError, ValueError):
         await callback.answer("Неверный чек", show_alert=True)
         return
-    # Recompute event total from all receipts (idempotent)
-    event_id = await db.fetchval(
-        "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
-    )
-    if event_id:
-        await db.execute(
-            """UPDATE split_events SET total = (
-                   SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
-               ) WHERE id = $1""",
-            event_id
+    async with pool.acquire() as db:
+        # Recompute event total from all receipts (idempotent)
+        event_id = await db.fetchval(
+            "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
         )
+        if event_id:
+            await db.execute(
+                """UPDATE split_events SET total = (
+                       SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
+                   ) WHERE id = $1""",
+                event_id
+            )
     await callback.message.edit_text(
         f"✅ Чек #{receipt_id} принят."
         + (f"\nОткрыть делёж: /split" if event_id else "")
@@ -733,25 +766,29 @@ async def cb_split_confirm(callback: CallbackQuery, db=Depends(get_db)):
 
 
 @dp.callback_query(F.data.startswith("split_cancel_"))
-async def cb_split_cancel(callback: CallbackQuery, db=Depends(get_db)):
+async def cb_split_cancel(callback: CallbackQuery):
     """Receipt cancelled — delete it and refund is NOT done (Vision already ran).
     We delete the row but keep the debit (the LLM cost was real)."""
+    if pool is None:
+        await callback.answer()
+        return
     try:
         receipt_id = int(callback.data.split("_")[2])
     except (IndexError, ValueError):
         await callback.answer("Неверный чек", show_alert=True)
         return
-    event_id = await db.fetchval(
-        "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
-    )
-    await db.execute("DELETE FROM split_receipts WHERE id=$1", receipt_id)
-    if event_id:
-        await db.execute(
-            """UPDATE split_events SET total = (
-                   SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
-               ) WHERE id = $1""",
-            event_id
+    async with pool.acquire() as db:
+        event_id = await db.fetchval(
+            "SELECT event_id FROM split_receipts WHERE id=$1", receipt_id
         )
+        await db.execute("DELETE FROM split_receipts WHERE id=$1", receipt_id)
+        if event_id:
+            await db.execute(
+                """UPDATE split_events SET total = (
+                       SELECT COALESCE(SUM(total), 0) FROM split_receipts WHERE event_id = $1
+                   ) WHERE id = $1""",
+                event_id
+            )
     await callback.message.edit_text(f"❌ Чек #{receipt_id} отменён.")
     await callback.answer("Отменено")
 
