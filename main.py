@@ -2965,7 +2965,7 @@ async def _format_recipe_for_share(recipe_id: int) -> str:
         steps = await db.fetch(
             "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id
         )
-    lines = [f"{rec['emoji'] or '🍽'} <b>{rec['name']}</b>"]
+    lines = [f"{rec['emoji'] or '🍽'} {rec['name']}"]
     meta = []
     if rec.get('category'):
         meta.append(rec['category'])
@@ -2976,7 +2976,7 @@ async def _format_recipe_for_share(recipe_id: int) -> str:
     if meta:
         lines.append(" · ".join(meta))
     if ings:
-        lines.append(f"\n🥄 <b>Ингредиенты ({len(ings)}):</b>")
+        lines.append(f"\n🥄 Ингредиенты ({len(ings)}):")
         for ing in ings:
             q = ing['qty']
             if q and q != 0:
@@ -2986,28 +2986,11 @@ async def _format_recipe_for_share(recipe_id: int) -> str:
                 qty = ''
             lines.append(f"  • {ing['name']}" + (f" — {qty}" if qty else ""))
     if steps:
-        lines.append(f"\n📋 <b>Приготовление:</b>")
+        lines.append(f"\n📋 Приготовление:")
         for s in steps:
             lines.append(f"  {s['step_number']}. {s['text']}")
     lines.append(f"\n🌿 Рецепт из ПОЛЯНЫ")
     return "\n".join(lines)
-
-
-async def _get_share_contacts(user_id: int) -> list[dict]:
-    """Get unique users who interacted with this user through events."""
-    if pool is None:
-        return []
-    async with pool.acquire() as db:
-        rows = await db.fetch(
-            """SELECT DISTINCT c.telegram_user_id, c.first_name, c.username
-               FROM collaborators c
-               JOIN events e ON e.id = c.event_id
-               WHERE e.telegram_user_id = $1 AND c.telegram_user_id != $1
-               ORDER BY c.first_name NULLS LAST
-               LIMIT 20""",
-            user_id,
-        )
-    return [dict(r) for r in rows]
 
 
 @dp.callback_query(F.data.startswith("share_recipe_"))
@@ -3021,301 +3004,23 @@ async def handle_share_recipe(callback: CallbackQuery):
         await callback.answer("Ошибка", show_alert=True)
         return
 
-    contacts = await _get_share_contacts(callback.from_user.id)
-
-    if not contacts:
-        # No contacts — send recipe text for manual forwarding
-        text = await _format_recipe_for_share(recipe_id)
-        if not text:
-            await callback.answer("Рецепт не найден", show_alert=True)
-            return
-        bot_username = await _get_bot_username()
-        share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start=recipe_{recipe_id}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)
-        ]])
-        await callback.message.answer(
-            "👤 У вас пока нет контактов для пересылки.\n"
-            "Поделитесь рецептом вручную или попросите друга присоединиться к событию.",
-            reply_markup=kb,
-        )
-        await callback.answer()
-        return
-
-    # Show contact picker
-    buttons = []
-    for c in contacts[:8]:  # max 8 contacts (Telegram limit: 8 buttons per row)
-        name = c['first_name'] or c['username'] or str(c['telegram_user_id'])
-        buttons.append([InlineKeyboardButton(
-            text=f"👤 {name}",
-            callback_data=f"share_to:{recipe_id}:{c['telegram_user_id']}"
-        )])
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="share_cancel")])
-
-    await callback.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "share_cancel")
-async def handle_share_cancel(callback: CallbackQuery):
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отменено")
-
-
-@dp.callback_query(F.data.startswith("share_to:"))
-async def handle_share_to_contact(callback: CallbackQuery):
-    if not callback.from_user:
-        await callback.answer()
-        return
-    try:
-        parts = callback.data.split(":")
-        recipe_id = int(parts[1])
-        contact_id = int(parts[2])
-    except (ValueError, IndexError):
-        await callback.answer("Ошибка", show_alert=True)
-        return
-
-    # Format the recipe
     text = await _format_recipe_for_share(recipe_id)
     if not text:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
 
-    # Send to the contact with "Save" button
-    save_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="💾 Сохранить рецепт",
-            callback_data=f"save_shared:{recipe_id}:{callback.from_user.id}"
-        )
+    # Send the full recipe text + native Telegram share button
+    share_url = "https://t.me/share/url?url=" + urllib.parse.quote(
+        f"https://t.me/{await _get_bot_username()}?start=recipe_{recipe_id}",
+        safe=""
+    ) + "&text=" + urllib.parse.quote(text, safe="")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📤 Выбрать контакт", url=share_url)
     ]])
 
-    try:
-        await bot.send_message(
-            chat_id=contact_id,
-            text=f"🌿 <b>Рецепт от {callback.from_user.first_name or 'друга'}:</b>\n\n{text}",
-            reply_markup=save_kb,
-        )
-        await callback.answer("✅ Рецепт отправлен!")
-        # Update the button text to show sent status
-        await callback.message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Отправлено", callback_data="noop")
-            ]])
-        )
-    except Exception as e:
-        log.warning("Failed to share recipe to %s: %s", contact_id, e)
-        await callback.answer("❌ Не удалось отправить. Возможно, пользователь не начинал диалог с ботом.", show_alert=True)
-
-
-@dp.callback_query(F.data == "noop")
-async def handle_noop(callback: CallbackQuery):
+    await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("save_shared:"))
-async def handle_save_shared_recipe(callback: CallbackQuery):
-    if not callback.from_user:
-        await callback.answer()
-        return
-    try:
-        parts = callback.data.split(":")
-        recipe_id = int(parts[1])
-        from_user_id = int(parts[2])
-    except (ValueError, IndexError):
-        await callback.answer("Ошибка", show_alert=True)
-        return
-
-    recipient_id = callback.from_user.id
-
-    # Check if already saved
-    if pool is None:
-        await callback.answer("БД недоступна", show_alert=True)
-        return
-
-    async with pool.acquire() as db:
-        existing = await db.fetchval(
-            "SELECT id FROM recipes WHERE user_id=$1 AND name=(SELECT name FROM recipes WHERE id=$2)",
-            recipient_id, recipe_id,
-        )
-        if existing:
-            await callback.answer("ℹ️ Рецепт уже в вашей библиотеке", show_alert=True)
-            return
-
-        # Copy recipe
-        orig = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
-        if not orig:
-            await callback.answer("Рецепт не найден", show_alert=True)
-            return
-
-        new_rec = await db.fetchrow(
-            """INSERT INTO recipes
-                (user_id, name, name_original, emoji, source_url, source_type,
-                 original_language, servings, cook_time_minutes, category, source_photo_file_id)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-               RETURNING id""",
-            recipient_id,
-            orig['name'], orig['name_original'], orig['emoji'],
-            orig['source_url'], 'shared', orig['original_language'],
-            orig['servings'], orig['cook_time_minutes'], orig['category'],
-            orig['source_photo_file_id'],
-        )
-        new_id = new_rec['id']
-
-        # Copy ingredients
-        ings = await db.fetch(
-            "SELECT name, qty, unit, category, sort_order FROM ingredients WHERE recipe_id=$1", recipe_id
-        )
-        for ing in ings:
-            await db.execute(
-                """INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order)
-                   VALUES ($1,$2,$3,$4,$5,$6)""",
-                new_id, ing['name'], ing['qty'], ing['unit'], ing['category'], ing['sort_order'],
-            )
-
-        # Copy steps
-        steps = await db.fetch(
-            "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1", recipe_id
-        )
-        for s in steps:
-            await db.execute(
-                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
-                new_id, s['step_number'], s['text'],
-            )
-
-    await callback.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Сохранено в библиотеку!", callback_data="noop")
-        ]])
-    )
-    await callback.answer("✅ Рецепт сохранён в вашей библиотеке!")
-
-async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
-    msg = str(err)
-    if isinstance(err, ValueError):
-        # User-facing ValueError: show the message directly, it's already human-readable
-        await status_msg.edit_text(f"🤷 {msg}")
-    elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
-        await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
-    elif "429" in msg or "rate-limit" in msg.lower() or "temporarily" in msg.lower():
-        await status_msg.edit_text("⏳ Сервис распознавания перегружен. Попробуй через минуту.")
-    else:
-        log.error("parse error (%s): %s", hint, err)
-        await status_msg.edit_text("❌ Не получилось разобрать. Попробуй ещё раз или пришли текст/ссылку.")
-
-
-# ── /add command ──────────────────────────────────────────────────────────────
-
-@dp.message(Command("add"))
-async def cmd_add(message: Message):
-    await message.answer(
-        "📥 <b>Добавление рецепта</b>\n\n"
-        "Пришлите мне:\n"
-        "• 🔗 Ссылку на любой сайт с рецептом\n"
-        "• 📝 Текст рецепта\n"
-        "• 📸 Фото рецепта (из книги, экрана)\n"
-        "• 🎙 Голосовое сообщение\n\n"
-        "<i>Рецепт сохранится в вашу личную библиотеку.</i>"
-    )
-
-
-async def _send_referral(msg: Message, uid: int):
-    async with pool.acquire() as db:
-        invited = await db.fetchval(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
-        earned = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", uid) or 0
-        pending = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", uid) or 0
-    username = await _get_bot_username()
-    link = f"https://t.me/{username}?start=ref_{uid}" if username else "(ссылка недоступна)"
-    text = (
-        "💰 <b>Партнёрская программа</b>\n\n"
-        f"Приглашай друзей и получай <b>{REFERRAL_PERCENT}%</b> с их трат в боте — "
-        "бонусом на баланс (начисляется через 24 часа).\n\n"
-        f"🔗 Твоя ссылка:\n{link}\n\n"
-        f"👥 Приглашено: <b>{invited}</b>\n"
-        f"✅ Заработано: <b>{int(earned/100)} ₽</b>\n"
-        f"⏳ Ждёт зачисления: <b>{int(pending/100)} ₽</b>"
-    )
-    kb = None
-    if username:
-        share = f"https://t.me/share/url?url={link}&text=Попробуй%20ПОЛЯНУ%20%F0%9F%8C%BF"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)
-        ]])
-    await msg.answer(text, reply_markup=kb)
-
-
-@dp.message(Command("ref"))
-async def cmd_ref(message: Message):
-    if not message.from_user or pool is None:
-        return
-    await _send_referral(message, message.from_user.id)
-
-
-@dp.message(Command("terms"))
-async def cmd_terms(message: Message):
-    await message.answer(
-        "📄 <b>Правила и документы</b>\n\n"
-        "• Пользовательское соглашение\n"
-        "• Политика конфиденциальности\n"
-        "• Условия партнёрской программы\n\n"
-        "Документы готовятся и будут опубликованы здесь до старта приёма оплат. "
-        "Оплачивая услуги бота, вы соглашаетесь с ними.\n\n"
-        "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
-        "тратятся внутри бота и не выводятся.</i>"
-    )
-
-
-@dp.message(Command("myid"))
-async def cmd_myid(message: Message):
-    if message.from_user:
-        await message.answer(f"Твой chat_id: <code>{message.from_user.id}</code>")
-
-
-@dp.message(Command("opbalance"))
-async def cmd_opbalance(message: Message):
-    """Admin-only: check remaining OpenRouter credit on demand."""
-    if not message.from_user or message.from_user.id != ADMIN_CHAT_ID:
-        return
-    rem = await _openrouter_remaining_usd()
-    if rem is None:
-        await message.answer("Не удалось получить остаток OpenRouter.")
-    else:
-        await message.answer(f"💳 OpenRouter остаток: <b>${rem:.2f}</b>")
-
-
-# ── Text recipe buffering ─────────────────────────────────────────────────────
-# A long recipe pasted into Telegram is auto-split into multiple messages
-# (>4096 chars), or a user may send it in parts. We debounce: accumulate
-# consecutive text messages for a few seconds, then parse them as one recipe.
-
-_text_buffers: dict[int, dict] = {}
-_TEXT_DEBOUNCE_SEC = 3.5
-
-
-async def _flush_text_buffer(user_id: int):
-    try:
-        await asyncio.sleep(_TEXT_DEBOUNCE_SEC)
-    except asyncio.CancelledError:
-        return   # a new part arrived; a fresh task will handle the flush
-    buf = _text_buffers.pop(user_id, None)
-    if not buf:
-        return
-    combined = "\n".join(buf["parts"]).strip()
-    status = buf["status_msg"]
-    try:
-        recipe = await parse_and_save_recipe(user_id, text=combined)
-        await _reply_recipe_saved(status, recipe, status_msg=status)
-    except ValueError:
-        try:
-            await status.delete()   # silently drop non-recipe text
-        except Exception:
-            pass
-    except Exception as e:
-        await _reply_parse_error(status, e, "рецепт")
 
 
 # ── Text / URL handler ────────────────────────────────────────────────────────
