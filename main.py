@@ -2978,7 +2978,12 @@ async def _format_recipe_for_share(recipe_id: int) -> str:
     if ings:
         lines.append(f"\n🥄 <b>Ингредиенты ({len(ings)}):</b>")
         for ing in ings:
-            qty = f"{fmtIngQty(ing['qty'])} {ing['unit'] or ''}".strip() if ing['qty'] else ""
+            q = ing['qty']
+            if q and q != 0:
+                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip('0').rstrip('.')
+                qty = f"{q_str} {ing['unit'] or ''}".strip()
+            else:
+                qty = ''
             lines.append(f"  • {ing['name']}" + (f" — {qty}" if qty else ""))
     if steps:
         lines.append(f"\n📋 <b>Приготовление:</b>")
