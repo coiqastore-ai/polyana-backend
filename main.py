@@ -2187,6 +2187,85 @@ async def prepare_recipe_share(
 
 # ── Share link & join ─────────────────────────────────────────────────────────
 
+@app.post("/api/recipes/share/{token}/prepare-message")
+async def prepare_share_message(
+    token: str,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Prepare an inline message for sharing via shareMessage()."""
+    share = await db.fetchrow(
+        "SELECT * FROM recipe_shares WHERE token=$1 AND revoked_at IS NULL", token
+    )
+    if not share:
+        raise HTTPException(404, "Share not found or expired")
+    if share["owner_user_id"] != user_id:
+        raise HTTPException(403, "Not your share")
+
+    snap = share["snapshot"]
+    if isinstance(snap, str):
+        snap = json.loads(snap)
+
+    # Build message text
+    lines = [f"{snap.get('emoji', '🍽')} <b>{snap['name']}</b>"]
+    meta = []
+    if snap.get("category"):
+        meta.append(snap["category"])
+    if snap.get("servings"):
+        meta.append(f"🍽 {snap['servings']} порц.")
+    if snap.get("cook_time_minutes"):
+        meta.append(f"⏱ {snap['cook_time_minutes']} мин.")
+    if meta:
+        lines.append(" · ".join(meta))
+    for i in snap.get("ingredients", [])[:10]:
+        q = i.get("qty")
+        if q and q != 0:
+            q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
+            qty = f"{q_str} {i.get('unit') or ''}".strip()
+        else:
+            qty = ""
+        lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
+    if len(snap.get("ingredients", [])) > 10:
+        lines.append(f"  … и ещё {len(snap['ingredients']) - 10}")
+    lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
+    message_text = "\n".join(lines)
+
+    bot_username = await _get_bot_username()
+    mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+
+    from aiogram.types import (
+        InlineQueryResultArticle, InputTextMessageContent,
+        InlineKeyboardMarkup as IKM, InlineKeyboardButton as IKB,
+    )
+
+    result = InlineQueryResultArticle(
+        id=str(share["id"]),
+        title=snap["name"],
+        description="Рецепт из ПОЛЯНЫ",
+        input_message_content=InputTextMessageContent(
+            message_text=message_text, parse_mode="HTML"
+        ),
+        reply_markup=IKM(inline_keyboard=[
+            [IKB(text="💾 Сохранить себе", callback_data=f"rs:{token}")],
+            [IKB(text="🌿 Открыть в ПОЛЯНЕ", url=mini_app_url)],
+        ]),
+    )
+
+    try:
+        prepared = await bot.save_prepared_inline_message(
+            user_id=user_id,
+            result=result,
+            allow_user_chats=True,
+            allow_group_chats=True,
+            allow_bot_chats=False,
+            allow_channel_chats=False,
+        )
+        return {"prepared_message_id": prepared.id}
+    except Exception as e:
+        log.warning("save_prepared_inline_message failed: %s", e)
+        raise HTTPException(502, f"Telegram API error: {e}")
+
+
 @app.get("/api/events/{event_id}/share-link")
 async def get_share_link(event_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)):
     row = await db.fetchrow("SELECT id, name, event_date, telegram_user_id FROM events WHERE id=$1", event_id)
@@ -3292,20 +3371,19 @@ async def handle_share_recipe(callback: CallbackQuery):
             token, recipe_id, callback.from_user.id, json.dumps(snapshot)
         )
 
+    bot_username = await _get_bot_username()
+    share_screen_url = f"https://t.me/{bot_username}?startapp=share_{token}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="📤 Выбрать чат",
-            switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
-                query=f"share:{token}",
-                allow_user_chats=True,
-                allow_group_chats=True,
-                allow_bot_chats=False,
-                allow_channel_chats=False,
-            ),
+            text="📤 Поделиться рецептом",
+            web_app=WebAppInfo(url=share_screen_url),
         )
     ]])
 
-    await callback.message.answer("Нажмите кнопку, чтобы выбрать чат для отправки:", reply_markup=kb)
+    await callback.message.answer(
+        "Откроется ПОЛЯНА — нажмите «Выбрать чат и отправить»:", reply_markup=kb
+    )
     await callback.answer()
 
 
@@ -3425,15 +3503,21 @@ async def handle_inline_query(inline_query: InlineQuery):
             [InlineKeyboardButton(text="💾 Сохранить себе", callback_data=f"rs:{token}")],
         ])
 
+        bot_username = await _get_bot_username()
+        mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+
         await inline_query.answer([
             InlineQueryResultArticle(
                 id=str(share["id"]),
-                title=snap["name"],
-                description="Рецепт из ПОЛЯНЫ",
+                title=f"{snap['name']} — нажмите, чтобы отправить",
+                description="Рецепт из ПОЛЯНЫ · нажмите на карточку",
                 input_message_content=InputTextMessageContent(message_text=text, parse_mode="HTML"),
-                reply_markup=kb,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💾 Сохранить себе", callback_data=f"rs:{token}")],
+                    [InlineKeyboardButton(text="🌿 Открыть в ПОЛЯНЕ", url=mini_app_url)],
+                ]),
             )
-        ], cache_time=300, is_personal=True)
+        ], cache_time=0, is_personal=True)
         return
 
     # Bare query or empty — show user's latest recipes
