@@ -2933,16 +2933,13 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     )
     recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
     add_url = f"{FRONTEND_URL}?screen=add_to_event&recipe_id={recipe['id']}"
-    share_text = f"{recipe['emoji']} {recipe['name']} — рецепт из ПОЛЯНЫ 🌿"
-    share_link = f"https://t.me/{await _get_bot_username()}?start=recipe_{recipe['id']}"
-    share_url = f"https://t.me/share/url?url={share_link}&text={share_text}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
             InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
         ],
         [
-            InlineKeyboardButton(text="📤 Поделиться", url=share_url),
+            InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_recipe_{recipe['id']}"),
         ],
     ])
     if status_msg:
@@ -2950,6 +2947,64 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     else:
         await message.answer(body, reply_markup=kb)
 
+
+
+# ── Share recipe callback ────────────────────────────────────────────────────
+
+async def _format_recipe_for_share(recipe_id: int) -> str:
+    """Fetch recipe from DB and format as shareable text."""
+    if pool is None:
+        return ""
+    async with pool.acquire() as db:
+        rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        if not rec:
+            return ""
+        ings = await db.fetch(
+            "SELECT name, qty, unit FROM ingredients WHERE recipe_id=$1 ORDER BY id", recipe_id
+        )
+        steps = await db.fetch(
+            "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id
+        )
+    lines = [f"{rec['emoji'] or '🍽'} <b>{rec['name']}</b>"]
+    meta = []
+    if rec.get('category'):
+        meta.append(rec['category'])
+    if rec.get('servings'):
+        meta.append(f"🍽 {rec['servings']} порц.")
+    if rec.get('cook_time_minutes'):
+        meta.append(f"⏱ {rec['cook_time_minutes']} мин.")
+    if meta:
+        lines.append(" · ".join(meta))
+    if ings:
+        lines.append(f"\n🥄 <b>Ингредиенты ({len(ings)}):</b>")
+        for ing in ings:
+            qty = f"{fmtIngQty(ing['qty'])} {ing['unit'] or ''}".strip() if ing['qty'] else ""
+            lines.append(f"  • {ing['name']}" + (f" — {qty}" if qty else ""))
+    if steps:
+        lines.append(f"\n📋 <b>Приготовление:</b>")
+        for s in steps:
+            lines.append(f"  {s['step_number']}. {s['text']}")
+    lines.append(f"\n🌿 Рецепт из ПОЛЯНЫ")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data.startswith("share_recipe_"))
+async def handle_share_recipe(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    try:
+        recipe_id = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    text = await _format_recipe_for_share(recipe_id)
+    if not text:
+        await callback.answer("Рецепт не найден", show_alert=True)
+        return
+    # Send the full recipe text to the user so they can forward it
+    await callback.message.answer(text)
+    await callback.answer()
 
 async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
     msg = str(err)
@@ -3151,28 +3206,29 @@ _albums: dict[str, list[str]] = {}
 
 # ── Split Photo Handler ────────────────────────────────────────────────────
 @dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
-async def handle_photo_for_split(message: Message, db=Depends(get_db)):
+async def handle_photo_for_split(message: Message):
     """Handle photo - check if it's for split receipt."""
     if not SPLIT_AVAILABLE:
         return  # Let other handlers process
 
-    # Check if there's an active split in this chat
-    event = await db.fetchrow(
-        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
-        message.chat.id
-    )
-    if not event:
-        return  # Not a split context, let other handlers process
+    async with pool.acquire() as db:
+        # Check if there's an active split in this chat
+        event = await db.fetchrow(
+            "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
+        if not event:
+            return  # Not a split context, let other handlers process
 
-    # Get photo bytes
-    photo = message.photo[-1]
-    file = await message.bot.get_file(photo.file_id)
-    photo_bytes = await message.bot.download_file(file.file_path)
+        # Get photo bytes
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        photo_bytes = await message.bot.download_file(file.file_path)
 
-    # Process receipt
-    msg, is_free = await handle_receipt_photo(
-        db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
-    )
+        # Process receipt
+        msg, is_free = await handle_receipt_photo(
+            db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
+        )
 
     await message.answer(msg, reply_markup=split_event_keyboard(event['id']))
 
