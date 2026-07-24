@@ -80,17 +80,16 @@ async def fetch_fns_receipt(fn: str, i: str, fp: str, t: str) -> dict | None:
 
 
 def format_receipt_items(items: list) -> str:
-    """Format receipt items for display. Prices are in rubles (from Vision)."""
+    """Format receipt items for display."""
     lines = []
     for item in items:
         name = item.get('name', 'Товар')
-        price = float(item.get('price', 0) or 0)
-        qty = float(item.get('quantity', 1) or 1)
-        if qty != 1:
-            s = float(item.get('sum', price * qty) or price * qty)
-            lines.append(f"  {name} — {qty:g} × {price:.0f}₽ = {s:.0f}₽")
-        else:
-            lines.append(f"  {name} — {price:.0f}₽")
+        price = item.get('price', 0)
+        qty = item.get('quantity', 1)
+        if isinstance(price, (int, float)) and price > 100:
+            # Price in kopecks
+            price = price / 100
+        lines.append(f"  {name} — {price:.0f}₽")
     return '\n'.join(lines)
 
 
@@ -251,122 +250,59 @@ async def calculate_and_notify(db, event_id: int, bot) -> str:
 QR_SCAN_PRICE = 0      # Free
 PHOTO_PARSE_PRICE = 1000  # 10₽ in kopecks
 
-async def handle_receipt_photo(db, user_id: int, image_bytes: bytes, event_id: int, bot) -> tuple[str, bool, int | None]:
+async def handle_receipt_photo(db, user_id: int, image_bytes: bytes, event_id: int, bot) -> tuple[str, bool]:
     """
-    Handle receipt photo. Tries QR (free metadata) first, then Vision for items (paid).
-    Returns (message_text, is_free, receipt_id_or_None).
-
-    Flow without FNS API:
-      - QR found → parse sum/date/store metadata (free)
-      - Then ALWAYS run Vision for item lines, debiting PHOTO_PARSE_PRICE from balance.
-      - If balance too low → show QR metadata (sum only) for free, no items.
-      - If no QR → run Vision for the whole receipt (paid) — needs balance.
+    Handle receipt photo.
+    Returns (message_text, is_free).
     """
-    from routes.balance import _get_balance, _debit
-    from llm import _llm_parse_receipt
-
-    qr_meta = None
+    # Try QR first (free)
     qr_data = await scan_qr_from_image(image_bytes)
+
     if qr_data:
-        qr_meta = parse_fns_qr(qr_data)  # {fn, i, fp, t, s} or None
+        # Parse FNS QR
+        fns_params = parse_fns_qr(qr_data)
+        if fns_params:
+            # Fetch from FNS API (free)
+            receipt = await fetch_fns_receipt(**fns_params)
+            if receipt:
+                # Save receipt
+                await add_receipt_to_split(db, event_id, user_id, receipt, source='qr')
 
+                # Format response
+                items_text = format_receipt_items(receipt.get('items', []))
+                total = receipt.get('totalSum', 0) / 100
+                store = receipt.get('user', 'Магазин')
+
+                msg = (
+                    f"✅ Чек распознан (QR — бесплатно)\n\n"
+                    f"🏪 {store}\n"
+                    f"💰 Итого: {total:.0f}₽\n\n"
+                    f"{items_text}\n\n"
+                    f"Подтвердить?"
+                )
+                return msg, True
+
+    # QR not found or invalid — offer photo parsing (paid)
+    # Check balance
+    from main import _get_balance, _debit
     balance = await _get_balance(db, user_id)
-    can_afford_vision = balance >= PHOTO_PARSE_PRICE
 
-    # Case A: no QR and no balance → dead end
-    if not qr_meta and not can_afford_vision:
+    if balance < PHOTO_PARSE_PRICE:
         return (
-            f"📷 QR-код не виден.\n\n"
-            f"Для распознавания позиций по фото нужно {PHOTO_PARSE_PRICE // 100}₽.\n"
+            f"📷 QR не распознан.\n\n"
+            f"Для распознавания по фото нужно {PHOTO_PARSE_PRICE // 100}₽.\n"
             f"Твой баланс: {balance // 100}₽\n\n"
-            f"Пополнить: /balance  (либо пришли фото чека с QR-кодом — это бесплатно)",
-            False, None
+            f"Пополнить баланс: /balance",
+            False
         )
 
-    # Run Vision for item lines (if affordable)
-    vision_data = None
-    if can_afford_vision:
-        try:
-            vision_data = await _llm_parse_receipt(image_bytes)
-        except ValueError as e:
-            # Vision failed — degrade gracefully
-            if not qr_meta:
-                return (f"❌ {e}", False, None)
-            # else: fall through, show QR metadata only
-            vision_data = None
-
-    # Debit balance ONLY if Vision actually produced items
-    debited = False
-    if vision_data and vision_data.get('items'):
-        new_bal, txn_id = await _debit(
-            db, user_id, PHOTO_PARSE_PRICE, "receipt_vision",
-            meta={"event_id": event_id, "store": vision_data.get('store', '')[:60]}
-        )
-        if new_bal is not None:
-            debited = True
-        else:
-            # Race: balance dropped between check and debit — show what we got, no charge
-            vision_data = None
-
-    # Build the receipt record. Prefer Vision for items; QR for canonical sum/store.
-    receipt_data = {}
-    if vision_data:
-        receipt_data = vision_data  # {store, total, items} in rubles
-        # QR sum is authoritative (from fiscal register) — override Vision total
-        if qr_meta and qr_meta.get('s'):
-            try:
-                qr_sum = round(float(qr_meta['s']) / 100, 2)  # s is kopecks
-                if qr_sum > 0:
-                    receipt_data['total'] = qr_sum
-                    receipt_data['_qr_verified'] = True
-            except (ValueError, TypeError):
-                pass
-    elif qr_meta:
-        # QR only — sum without item breakdown
-        try:
-            total = round(float(qr_meta.get('s', 0)) / 100, 2)
-        except (ValueError, TypeError):
-            total = 0.0
-        receipt_data = {
-            'store': 'Магазин (по QR)',
-            'total': total,
-            'items': [],  # no breakdown
-            '_qr_only': True,
-        }
-
-    if not receipt_data:
-        return ("❌ Не удалось распознать чек. Попробуй другое фото.", False, None)
-
-    # add_receipt_to_split expects total in kopecks (it divides by 100) — convert
-    save_data = {
-        'store': receipt_data.get('store', 'Магазин'),
-        'total': round(receipt_data.get('total', 0) * 100),  # rub → kopecks for storage
-        'items': receipt_data.get('items', []),
-    }
-    source = 'vision' if debited else ('qr' if qr_meta else 'vision')
-    receipt_id = await add_receipt_to_split(db, event_id, user_id, save_data, source=source)
-
-    # Format the response message
-    store = receipt_data.get('store', 'Магазин')
-    total = receipt_data.get('total', 0)
-    items = receipt_data.get('items', [])
-
-    lines = [f"✅ Чек распознан\n", f"🏪 {store}", f"💰 Итого: {total:.0f}₽"]
-
-    if receipt_data.get('_qr_verified'):
-        lines.append("   (сумма подтверждена QR-кодом ФН)")
-    if items:
-        lines.append("")
-        lines.append(format_receipt_items(items))
-    elif receipt_data.get('_qr_only'):
-        lines.append("\n<i>Состав позиций недоступен (только QR). "
-                     f"Для позиций нужно {PHOTO_PARSE_PRICE // 100}₽ на балансе.</i>")
-
-    if debited:
-        lines.append(f"\n💳 Списано {PHOTO_PARSE_PRICE // 100}₽ с баланса")
-
-    lines.append("\n✅ Подтвердить или ❌ Отменить?")
-    return ("\n".join(lines), not debited, receipt_id)
+    return (
+        f"📷 QR не распознан.\n\n"
+        f"Распознать по фото? Стоимость: {PHOTO_PARSE_PRICE // 100}₽\n"
+        f"Твой баланс: {balance // 100}₽\n\n"
+        f"[✅ Распознать за {PHOTO_PARSE_PRICE // 100}₽]",
+        False
+    )
 
 
 # ─── Inline Keyboards ───────────────────────────────────────────────────────
