@@ -2993,6 +2993,23 @@ async def _format_recipe_for_share(recipe_id: int) -> str:
     return "\n".join(lines)
 
 
+async def _get_share_contacts(user_id: int) -> list[dict]:
+    """Get unique users who interacted with this user through events."""
+    if pool is None:
+        return []
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            """SELECT DISTINCT c.telegram_user_id, c.first_name, c.username
+               FROM collaborators c
+               JOIN events e ON e.id = c.event_id
+               WHERE e.telegram_user_id = $1 AND c.telegram_user_id != $1
+               ORDER BY c.first_name NULLS LAST
+               LIMIT 20""",
+            user_id,
+        )
+    return [dict(r) for r in rows]
+
+
 @dp.callback_query(F.data.startswith("share_recipe_"))
 async def handle_share_recipe(callback: CallbackQuery):
     if not callback.from_user:
@@ -3003,13 +3020,175 @@ async def handle_share_recipe(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer("Ошибка", show_alert=True)
         return
+
+    contacts = await _get_share_contacts(callback.from_user.id)
+
+    if not contacts:
+        # No contacts — send recipe text for manual forwarding
+        text = await _format_recipe_for_share(recipe_id)
+        if not text:
+            await callback.answer("Рецепт не найден", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📤 Поделиться ссылкой",
+                url=f"https://t.me/share/url?url=https://t.me/{await _get_bot_username()}?start=recipe_{recipe_id}&text={text[:100]}")
+        ]])
+        await callback.message.answer(
+            "👤 У вас пока нет контактов для пересылки.\n"
+            "Поделитесь рецептом вручную или попросите друга присоединиться к событию.",
+            reply_markup=kb,
+        )
+        await callback.answer()
+        return
+
+    # Show contact picker
+    buttons = []
+    for c in contacts[:8]:  # max 8 contacts (Telegram limit: 8 buttons per row)
+        name = c['first_name'] or c['username'] or str(c['telegram_user_id'])
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 {name}",
+            callback_data=f"share_to:{recipe_id}:{c['telegram_user_id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="share_cancel")])
+
+    await callback.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "share_cancel")
+async def handle_share_cancel(callback: CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
+
+
+@dp.callback_query(F.data.startswith("share_to:"))
+async def handle_share_to_contact(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    try:
+        parts = callback.data.split(":")
+        recipe_id = int(parts[1])
+        contact_id = int(parts[2])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    # Format the recipe
     text = await _format_recipe_for_share(recipe_id)
     if not text:
         await callback.answer("Рецепт не найден", show_alert=True)
         return
-    # Send the full recipe text to the user so they can forward it
-    await callback.message.answer(text)
+
+    # Send to the contact with "Save" button
+    save_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💾 Сохранить рецепт",
+            callback_data=f"save_shared:{recipe_id}:{callback.from_user.id}"
+        )
+    ]])
+
+    try:
+        await bot.send_message(
+            chat_id=contact_id,
+            text=f"🌿 <b>Рецепт от {callback.from_user.first_name or 'друга'}:</b>\n\n{text}",
+            reply_markup=save_kb,
+        )
+        await callback.answer("✅ Рецепт отправлен!")
+        # Update the button text to show sent status
+        await callback.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Отправлено", callback_data="noop")
+            ]])
+        )
+    except Exception as e:
+        log.warning("Failed to share recipe to %s: %s", contact_id, e)
+        await callback.answer("❌ Не удалось отправить. Возможно, пользователь не начинал диалог с ботом.", show_alert=True)
+
+
+@dp.callback_query(F.data == "noop")
+async def handle_noop(callback: CallbackQuery):
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("save_shared:"))
+async def handle_save_shared_recipe(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    try:
+        parts = callback.data.split(":")
+        recipe_id = int(parts[1])
+        from_user_id = int(parts[2])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
+        return
+
+    recipient_id = callback.from_user.id
+
+    # Check if already saved
+    if pool is None:
+        await callback.answer("БД недоступна", show_alert=True)
+        return
+
+    async with pool.acquire() as db:
+        existing = await db.fetchval(
+            "SELECT id FROM recipes WHERE user_id=$1 AND name=(SELECT name FROM recipes WHERE id=$2)",
+            recipient_id, recipe_id,
+        )
+        if existing:
+            await callback.answer("ℹ️ Рецепт уже в вашей библиотеке", show_alert=True)
+            return
+
+        # Copy recipe
+        orig = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        if not orig:
+            await callback.answer("Рецепт не найден", show_alert=True)
+            return
+
+        new_rec = await db.fetchrow(
+            """INSERT INTO recipes
+                (user_id, name, name_original, emoji, source_url, source_type,
+                 original_language, servings, cook_time_minutes, category, source_photo_file_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               RETURNING id""",
+            recipient_id,
+            orig['name'], orig['name_original'], orig['emoji'],
+            orig['source_url'], 'shared', orig['original_language'],
+            orig['servings'], orig['cook_time_minutes'], orig['category'],
+            orig['source_photo_file_id'],
+        )
+        new_id = new_rec['id']
+
+        # Copy ingredients
+        ings = await db.fetch(
+            "SELECT name, qty, unit, category, sort_order FROM ingredients WHERE recipe_id=$1", recipe_id
+        )
+        for ing in ings:
+            await db.execute(
+                """INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order)
+                   VALUES ($1,$2,$3,$4,$5,$6)""",
+                new_id, ing['name'], ing['qty'], ing['unit'], ing['category'], ing['sort_order'],
+            )
+
+        # Copy steps
+        steps = await db.fetch(
+            "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1", recipe_id
+        )
+        for s in steps:
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                new_id, s['step_number'], s['text'],
+            )
+
+    await callback.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Сохранено в библиотеку!", callback_data="noop")
+        ]])
+    )
+    await callback.answer("✅ Рецепт сохранён в вашей библиотеке!")
 
 async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
     msg = str(err)
