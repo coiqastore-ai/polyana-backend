@@ -3150,13 +3150,25 @@ async def handle_share_recipe(callback: CallbackQuery):
         return
 
     async with pool.acquire() as db:
+        # Build full snapshot with ingredients and steps
+        rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        if not rec:
+            await callback.answer("Рецепт не найден", show_alert=True)
+            return
+        ings = await db.fetch("SELECT name, qty, unit FROM ingredients WHERE recipe_id=$1 ORDER BY id", recipe_id)
+        steps = await db.fetch("SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id)
+        snapshot = {
+            "name": rec["name"], "emoji": rec["emoji"] or "🍽",
+            "category": rec.get("category"), "servings": rec.get("servings"),
+            "cook_time_minutes": rec.get("cook_time_minutes"),
+            "ingredients": [{"name": i["name"], "qty": i.get("qty"), "unit": i.get("unit")} for i in ings],
+            "steps": [{"step_number": s["step_number"], "text": s["text"]} for s in steps],
+        }
         token = secrets.token_urlsafe(16)
         share = await db.fetchrow(
             "INSERT INTO recipe_shares (token, source_recipe_id, owner_user_id, snapshot) "
-            "VALUES ($1, $2, $3, (SELECT row_to_json(r)::jsonb FROM "
-            "(SELECT name, emoji, category, servings, cook_time_minutes FROM recipes WHERE id=$2) r)) "
-            "RETURNING id",
-            token, recipe_id, callback.from_user.id
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            token, recipe_id, callback.from_user.id, json.dumps(snapshot)
         )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
