@@ -3205,7 +3205,7 @@ _albums: dict[str, list[str]] = {}
 
 
 # ── Split Photo Handler ────────────────────────────────────────────────────
-@dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
+@dp.message(F.photo & F.chat.type.in_({"group", "supergroup"}))
 async def handle_photo_for_split(message: Message):
     """Handle photo - check if it's for split receipt."""
     if not SPLIT_AVAILABLE:
@@ -3234,7 +3234,11 @@ async def handle_photo_for_split(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
+    log.info("Photo received: user=%s chat=%s media_group=%s",
+             message.from_user.id if message.from_user else "?",
+             message.chat.id, message.media_group_id)
     if not message.from_user or pool is None:
+        log.warning("Photo skipped: user=%s pool=%s", message.from_user.id if message.from_user else "?", pool is not None)
         return
 
     mgid = message.media_group_id
