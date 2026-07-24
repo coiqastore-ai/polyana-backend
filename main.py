@@ -3056,6 +3056,127 @@ dp = Dispatcher()
 
 # ── Bot helpers ───────────────────────────────────────────────────────────────
 
+# Text recipe buffering — debounce consecutive text messages
+_text_buffers: dict[int, dict] = {}
+_TEXT_DEBOUNCE_SEC = 3.5
+
+
+async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
+    msg = str(err)
+    if isinstance(err, ValueError):
+        await status_msg.edit_text(f"🤷 {msg}")
+    elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
+        await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
+    elif "429" in msg or "rate-limit" in msg.lower() or "temporarily" in msg.lower():
+        await status_msg.edit_text("⏳ Сервис распознавания перегружен. Попробуй через минуту.")
+    else:
+        log.error("parse error (%s): %s", hint, err)
+        await status_msg.edit_text("❌ Не получилось разобрать. Попробуй ещё раз или пришли текст/ссылку.")
+
+
+async def _flush_text_buffer(user_id: int):
+    try:
+        await asyncio.sleep(_TEXT_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        return
+    buf = _text_buffers.pop(user_id, None)
+    if not buf:
+        return
+    combined = "\n".join(buf["parts"]).strip()
+    status = buf["status_msg"]
+    try:
+        recipe = await parse_and_save_recipe(user_id, text=combined)
+        await _reply_recipe_saved(status, recipe, status_msg=status)
+    except ValueError:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        await _reply_parse_error(status, e, "рецепт")
+
+
+async def _send_referral(msg: Message, uid: int):
+    async with pool.acquire() as db:
+        invited = await db.fetchval(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
+        earned = await db.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", uid) or 0
+        pending = await db.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", uid) or 0
+    username = await _get_bot_username()
+    link = f"https://t.me/{username}?start=ref_{uid}" if username else "(ссылка недоступна)"
+    text = (
+        "💰 <b>Партнёрская программа</b>\n\n"
+        f"Приглашай друзей и получай <b>{REFERRAL_PERCENT}%</b> с их трат в боте — "
+        "бонусом на баланс (начисляется через 24 часа).\n\n"
+        f"🔗 Твоя ссылка:\n{link}\n\n"
+        f"👥 Приглашено: <b>{invited}</b>\n"
+        f"✅ Заработано: <b>{int(earned/100)} ₽</b>\n"
+        f"⏳ Ждёт зачисления: <b>{int(pending/100)} ₽</b>"
+    )
+    kb = None
+    if username:
+        share_url = f"https://t.me/share/url?url={link}&text=Попробуй%20ПОЛЯНУ%20%F0%9F%8C%BF"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)
+        ]])
+    await msg.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("add"))
+async def cmd_add(message: Message):
+    await message.answer(
+        "📥 <b>Добавление рецепта</b>\n\n"
+        "Пришлите мне:\n"
+        "• 🔗 Ссылку на любой сайт с рецептом\n"
+        "• 📝 Текст рецепта\n"
+        "• 📸 Фото рецепта (из книги, экрана)\n"
+        "• 🎙 Голосовое сообщение\n\n"
+        "<i>Рецепт сохранится в вашу личную библиотеку.</i>"
+    )
+
+
+@dp.message(Command("ref"))
+async def cmd_ref(message: Message):
+    if not message.from_user or pool is None:
+        return
+    await _send_referral(message, message.from_user.id)
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    await message.answer(
+        "📄 <b>Правила и документы</b>\n\n"
+        "• Пользовательское соглашение\n"
+        "• Политика конфиденциальности\n"
+        "• Условия партнёрской программы\n\n"
+        "Документы готовятся и будут опубликованы здесь до старта приёма оплат. "
+        "Оплачивая услуги бота, вы соглашаетесь с ними.\n\n"
+        "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
+        "тратятся внутри бота и не выводятся.</i>"
+    )
+
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    if message.from_user:
+        await message.answer(f"Твой chat_id: <code>{message.from_user.id}</code>")
+
+
+@dp.message(Command("opbalance"))
+async def cmd_opbalance(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_CHAT_ID:
+        return
+    remaining = await _openrouter_remaining_usd()
+    if remaining is not None:
+        await message.answer(f"💵 OpenRouter баланс: ${remaining:.2f}")
+    else:
+        await message.answer("❌ Не удалось получить баланс")
+
+
+# ── Bot helpers ───────────────────────────────────────────────────────────────
+
 async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     """Send/edit recipe-saved confirmation with Open + AddToEvent buttons."""
     ct = recipe.get("cook_time_minutes")
@@ -3215,6 +3336,8 @@ async def handle_shared_recipe_save(callback: CallbackQuery):
             return
 
         snap = share["snapshot"]
+        if isinstance(snap, str):
+            snap = json.loads(snap)
 
         # Create recipe from snapshot
         new_rec = await db.fetchrow(
@@ -3273,6 +3396,8 @@ async def handle_inline_query(inline_query: InlineQuery):
             return
 
         snap = share["snapshot"]
+        if isinstance(snap, str):
+            snap = json.loads(snap)
         lines = [f"{snap.get('emoji', '🍽')} <b>{snap['name']}</b>"]
         meta = []
         if snap.get("category"):
