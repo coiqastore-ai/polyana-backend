@@ -3029,9 +3029,10 @@ async def handle_share_recipe(callback: CallbackQuery):
         if not text:
             await callback.answer("Рецепт не найден", show_alert=True)
             return
+        bot_username = await _get_bot_username()
+        share_url = f"https://t.me/share/url?url=https://t.me/{bot_username}?start=recipe_{recipe_id}"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться ссылкой",
-                url=f"https://t.me/share/url?url=https://t.me/{await _get_bot_username()}?start=recipe_{recipe_id}&text={text[:100]}")
+            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)
         ]])
         await callback.message.answer(
             "👤 У вас пока нет контактов для пересылки.\n"
