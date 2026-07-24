@@ -1,4 +1,4 @@
-import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64
+import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib
 import httpx
 import invite
 from datetime import datetime, timedelta, timezone
@@ -16,10 +16,27 @@ from aiogram.types import (
     ReplyKeyboardRemove, WebAppInfo,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile, LabeledPrice,
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    SwitchInlineQueryChosenChat,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+
+# ── Split Expenses Module ─────────────────────────────────────────────────
+try:
+    from split_module import (
+        scan_qr_from_image, parse_fns_qr, fetch_fns_receipt,
+        format_receipt_items, create_split_event, add_participant,
+        add_receipt_to_split, set_contribution, calculate_and_notify,
+        handle_receipt_photo, split_main_keyboard, split_event_keyboard,
+        split_confirm_keyboard, split_pricing_keyboard, split_help_text,
+        PHOTO_PARSE_PRICE
+    )
+    SPLIT_AVAILABLE = True
+except ImportError:
+    SPLIT_AVAILABLE = False
+    log.warning("split_module not found — split features disabled")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("polyana")
@@ -31,6 +48,8 @@ FRONTEND_URL = ENV("FRONTEND_URL", "")
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
+OPENROUTER_PROXY_URL = ENV("OPENROUTER_PROXY_URL", "")
+OPENROUTER_PROXY_SECRET = ENV("OPENROUTER_PROXY_SECRET", "")
 YOOKASSA_SHOP_ID = ENV("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = ENV("YOOKASSA_SECRET_KEY", "")
 # 54-ФЗ receipt: VAT code (1 = без НДС for ИП на УСН/патенте). Set to "" to skip receipts.
@@ -538,6 +557,26 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_event_recipes_rec  ON event_recipes(recipe_id);
             CREATE INDEX IF NOT EXISTS idx_ingredients_rec    ON ingredients(recipe_id);
             CREATE INDEX IF NOT EXISTS idx_shopping_event     ON shopping_items(event_id);
+
+            -- Recipe shares: snapshot sent via inline with save button
+            CREATE TABLE IF NOT EXISTS recipe_shares (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                token             TEXT UNIQUE NOT NULL,
+                source_recipe_id  INT NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+                owner_user_id     BIGINT NOT NULL,
+                snapshot          JSONB NOT NULL,
+                created_at        TIMESTAMPTZ DEFAULT NOW(),
+                revoked_at        TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_shares_token ON recipe_shares(token);
+
+            CREATE TABLE IF NOT EXISTS recipe_share_saves (
+                share_id          UUID NOT NULL REFERENCES recipe_shares(id),
+                recipient_user_id BIGINT NOT NULL,
+                created_recipe_id INT NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+                saved_at          TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(share_id, recipient_user_id)
+            );
         """)
 
         # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
@@ -623,9 +662,11 @@ def _get_or_client():
         if not OPENROUTER_KEY:
             raise RuntimeError("OPENROUTER_API_KEY не задан в env")
         from openai import AsyncOpenAI
+        _base = OPENROUTER_PROXY_URL.rstrip("/") + "/api/v1" if OPENROUTER_PROXY_URL else "https://openrouter.ai/api/v1"
         _or_client = AsyncOpenAI(
             api_key=OPENROUTER_KEY,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=_base,
+            default_headers={"X-Proxy-Secret": OPENROUTER_PROXY_SECRET} if OPENROUTER_PROXY_SECRET else {},
         )
     return _or_client
 
@@ -2027,6 +2068,123 @@ async def delete_recipe_from_library(
     await db.execute("DELETE FROM recipes WHERE id=$1", recipe_id)
 
 
+# ── Recipe share (inline prepared message) ────────────────────────────────────
+
+@app.post("/api/recipes/{recipe_id}/prepare-share")
+async def prepare_recipe_share(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Create a prepared inline message for sharing a recipe."""
+    rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+    if not rec:
+        raise HTTPException(404, "Recipe not found")
+    if rec["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    # Fetch ingredients and steps for snapshot
+    ings = await db.fetch(
+        "SELECT name, qty, unit FROM ingredients WHERE recipe_id=$1 ORDER BY id", recipe_id
+    )
+    steps = await db.fetch(
+        "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id
+    )
+
+    snapshot = {
+        "name": rec["name"],
+        "emoji": rec["emoji"] or "🍽",
+        "category": rec.get("category"),
+        "servings": rec.get("servings"),
+        "cook_time_minutes": rec.get("cook_time_minutes"),
+        "ingredients": [{"name": i["name"], "qty": i.get("qty"), "unit": i.get("unit")} for i in ings],
+        "steps": [{"step_number": s["step_number"], "text": s["text"]} for s in steps],
+    }
+
+    # Build share text
+    lines = [f"{snapshot['emoji']} <b>{snapshot['name']}</b>"]
+    meta = []
+    if snapshot.get("category"):
+        meta.append(snapshot["category"])
+    if snapshot.get("servings"):
+        meta.append(f"🍽 {snapshot['servings']} порц.")
+    if snapshot.get("cook_time_minutes"):
+        meta.append(f"⏱ {snapshot['cook_time_minutes']} мин.")
+    if meta:
+        lines.append(" · ".join(meta))
+    if ings:
+        lines.append(f"\n🥄 Ингредиенты ({len(ings)}):")
+        for i in ings:
+            q = i.get("qty")
+            if q and q != 0:
+                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
+                qty = f"{q_str} {i.get('unit') or ''}".strip()
+            else:
+                qty = ""
+            lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
+    if steps:
+        lines.append(f"\n📋 Приготовление:")
+        for s in steps:
+            lines.append(f"  {s['step_number']}. {s['text']}")
+    lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
+    message_text = "\n".join(lines)
+
+    # Create share record with token
+    token = secrets.token_urlsafe(16)
+    share = await db.fetchrow(
+        "INSERT INTO recipe_shares (token, source_recipe_id, owner_user_id, snapshot) "
+        "VALUES ($1, $2, $3, $4) RETURNING id",
+        token, recipe_id, user_id, json.dumps(snapshot)
+    )
+
+    callback_data = f"rs:{token}"
+    if len(callback_data.encode("utf-8")) > 64:
+        raise HTTPException(500, "Share token too long")
+
+    bot_username = await _get_bot_username()
+    mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+
+    from aiogram.types import (
+        InlineQueryResultArticle, InputTextMessageContent,
+        InlineKeyboardMarkup, InlineKeyboardButton,
+    )
+
+    result = InlineQueryResultArticle(
+        id=str(share["id"]),
+        title=snapshot["name"],
+        description="Рецепт из ПОЛЯНЫ",
+        input_message_content=InputTextMessageContent(
+            message_text=message_text, parse_mode="HTML"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💾 Сохранить себе", callback_data=callback_data)],
+            [InlineKeyboardButton(text="🌿 Открыть в ПОЛЯНЕ", url=mini_app_url)],
+        ]),
+    )
+
+    try:
+        prepared = await bot.save_prepared_inline_message(
+            user_id=user_id,
+            result=result,
+            allow_user_chats=True,
+            allow_group_chats=True,
+            allow_bot_chats=False,
+            allow_channel_chats=False,
+        )
+        return {
+            "prepared_message_id": prepared.id,
+            "share_id": str(share["id"]),
+        }
+    except Exception as e:
+        log.warning("save_prepared_inline_message failed: %s", e)
+        # Fallback: return the inline result for manual use
+        return {
+            "prepared_message_id": None,
+            "share_id": str(share["id"]),
+            "fallback": True,
+        }
+
+
 # ── Share link & join ─────────────────────────────────────────────────────────
 
 @app.get("/api/events/{event_id}/share-link")
@@ -2704,23 +2862,32 @@ async def _alert_admin(text: str) -> None:
 _low_balance_alerted = False
 
 
+_last_403_ts = 0.0
+
 async def _openrouter_remaining_usd() -> float | None:
     """Remaining OpenRouter credit in USD, or None if unavailable."""
+    global _last_403_ts
     if not OPENROUTER_KEY:
+        return None
+    if _last_403_ts and (time.time() - _last_403_ts) < 3600:
         return None
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                "https://openrouter.ai/api/v1/credits",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-            )
+            _credits_url = (OPENROUTER_PROXY_URL.rstrip("/") + "/api/v1/credits") if OPENROUTER_PROXY_URL else "https://openrouter.ai/api/v1/credits"
+            _h = {"Authorization": f"Bearer {OPENROUTER_KEY}"}
+            if OPENROUTER_PROXY_SECRET:
+                _h["X-Proxy-Secret"] = OPENROUTER_PROXY_SECRET
+            r = await client.get(_credits_url, headers=_h)
+        if r.status_code == 403:
+            log.warning("OpenRouter credits: 403 from server IP, will retry in 1h")
+            _last_403_ts = time.time()
+            return None
         d = (r.json() or {}).get("data") or {}
+        _last_403_ts = 0.0
         return float(d.get("total_credits", 0)) - float(d.get("total_usage", 0))
     except Exception:
         log.exception("openrouter credits check failed")
         return None
-
-
 async def _openrouter_balance_loop():
     """Alert admin once when OpenRouter credit drops below threshold; reset on recovery."""
     global _low_balance_alerted
@@ -2905,178 +3072,288 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     )
     recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
     add_url = f"{FRONTEND_URL}?screen=add_to_event&recipe_id={recipe['id']}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
-        InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
+            InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
+        ],
+        [
+            InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_recipe_{recipe['id']}"),
+        ],
+    ])
     if status_msg:
         await status_msg.edit_text(body, reply_markup=kb)
     else:
         await message.answer(body, reply_markup=kb)
 
 
-async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
-    msg = str(err)
-    if isinstance(err, ValueError):
-        # User-facing ValueError: show the message directly, it's already human-readable
-        await status_msg.edit_text(f"🤷 {msg}")
-    elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
-        await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
-    elif "429" in msg or "rate-limit" in msg.lower() or "temporarily" in msg.lower():
-        await status_msg.edit_text("⏳ Сервис распознавания перегружен. Попробуй через минуту.")
-    else:
-        log.error("parse error (%s): %s", hint, err)
-        await status_msg.edit_text("❌ Не получилось разобрать. Попробуй ещё раз или пришли текст/ссылку.")
 
+# ── Share recipe callback ────────────────────────────────────────────────────
 
-# ── /add command ──────────────────────────────────────────────────────────────
-
-@dp.message(Command("add"))
-async def cmd_add(message: Message):
-    await message.answer(
-        "📥 <b>Добавление рецепта</b>\n\n"
-        "Пришлите мне:\n"
-        "• 🔗 Ссылку на любой сайт с рецептом\n"
-        "• 📝 Текст рецепта\n"
-        "• 📸 Фото рецепта (из книги, экрана)\n"
-        "• 🎙 Голосовое сообщение\n\n"
-        "<i>Рецепт сохранится в вашу личную библиотеку.</i>"
-    )
-
-
-async def _send_referral(msg: Message, uid: int):
+async def _format_recipe_for_share(recipe_id: int) -> str:
+    """Fetch recipe from DB and format as shareable text."""
+    if pool is None:
+        return ""
     async with pool.acquire() as db:
-        invited = await db.fetchval(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
-        earned = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", uid) or 0
-        pending = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", uid) or 0
-    username = await _get_bot_username()
-    link = f"https://t.me/{username}?start=ref_{uid}" if username else "(ссылка недоступна)"
-    text = (
-        "💰 <b>Партнёрская программа</b>\n\n"
-        f"Приглашай друзей и получай <b>{REFERRAL_PERCENT}%</b> с их трат в боте — "
-        "бонусом на баланс (начисляется через 24 часа).\n\n"
-        f"🔗 Твоя ссылка:\n{link}\n\n"
-        f"👥 Приглашено: <b>{invited}</b>\n"
-        f"✅ Заработано: <b>{int(earned/100)} ₽</b>\n"
-        f"⏳ Ждёт зачисления: <b>{int(pending/100)} ₽</b>"
-    )
-    kb = None
-    if username:
-        share = f"https://t.me/share/url?url={link}&text=Попробуй%20ПОЛЯНУ%20%F0%9F%8C%BF"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)
-        ]])
-    await msg.answer(text, reply_markup=kb)
+        rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        if not rec:
+            return ""
+        ings = await db.fetch(
+            "SELECT name, qty, unit FROM ingredients WHERE recipe_id=$1 ORDER BY id", recipe_id
+        )
+        steps = await db.fetch(
+            "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number", recipe_id
+        )
+    lines = [f"{rec['emoji'] or '🍽'} {rec['name']}"]
+    meta = []
+    if rec.get('category'):
+        meta.append(rec['category'])
+    if rec.get('servings'):
+        meta.append(f"🍽 {rec['servings']} порц.")
+    if rec.get('cook_time_minutes'):
+        meta.append(f"⏱ {rec['cook_time_minutes']} мин.")
+    if meta:
+        lines.append(" · ".join(meta))
+    if ings:
+        lines.append(f"\n🥄 Ингредиенты ({len(ings)}):")
+        for ing in ings:
+            q = ing['qty']
+            if q and q != 0:
+                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip('0').rstrip('.')
+                qty = f"{q_str} {ing['unit'] or ''}".strip()
+            else:
+                qty = ''
+            lines.append(f"  • {ing['name']}" + (f" — {qty}" if qty else ""))
+    if steps:
+        lines.append(f"\n📋 Приготовление:")
+        for s in steps:
+            lines.append(f"  {s['step_number']}. {s['text']}")
+    lines.append(f"\n🌿 Рецепт из ПОЛЯНЫ")
+    return "\n".join(lines)
 
 
-@dp.message(Command("ref"))
-async def cmd_ref(message: Message):
-    if not message.from_user or pool is None:
+@dp.callback_query(F.data.startswith("share_recipe_"))
+async def handle_share_recipe(callback: CallbackQuery):
+    """Share recipe from chat — opens contact picker via inline."""
+    if not callback.from_user:
+        await callback.answer()
         return
-    await _send_referral(message, message.from_user.id)
-
-
-@dp.message(Command("terms"))
-async def cmd_terms(message: Message):
-    await message.answer(
-        "📄 <b>Правила и документы</b>\n\n"
-        "• Пользовательское соглашение\n"
-        "• Политика конфиденциальности\n"
-        "• Условия партнёрской программы\n\n"
-        "Документы готовятся и будут опубликованы здесь до старта приёма оплат. "
-        "Оплачивая услуги бота, вы соглашаетесь с ними.\n\n"
-        "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
-        "тратятся внутри бота и не выводятся.</i>"
-    )
-
-
-@dp.message(Command("myid"))
-async def cmd_myid(message: Message):
-    if message.from_user:
-        await message.answer(f"Твой chat_id: <code>{message.from_user.id}</code>")
-
-
-@dp.message(Command("opbalance"))
-async def cmd_opbalance(message: Message):
-    """Admin-only: check remaining OpenRouter credit on demand."""
-    if not message.from_user or message.from_user.id != ADMIN_CHAT_ID:
-        return
-    rem = await _openrouter_remaining_usd()
-    if rem is None:
-        await message.answer("Не удалось получить остаток OpenRouter.")
-    else:
-        await message.answer(f"💳 OpenRouter остаток: <b>${rem:.2f}</b>")
-
-
-# ── Text recipe buffering ─────────────────────────────────────────────────────
-# A long recipe pasted into Telegram is auto-split into multiple messages
-# (>4096 chars), or a user may send it in parts. We debounce: accumulate
-# consecutive text messages for a few seconds, then parse them as one recipe.
-
-_text_buffers: dict[int, dict] = {}
-_TEXT_DEBOUNCE_SEC = 3.5
-
-
-async def _flush_text_buffer(user_id: int):
     try:
-        await asyncio.sleep(_TEXT_DEBOUNCE_SEC)
-    except asyncio.CancelledError:
-        return   # a new part arrived; a fresh task will handle the flush
-    buf = _text_buffers.pop(user_id, None)
-    if not buf:
-        return
-    combined = "\n".join(buf["parts"]).strip()
-    status = buf["status_msg"]
-    try:
-        recipe = await parse_and_save_recipe(user_id, text=combined)
-        await _reply_recipe_saved(status, recipe, status_msg=status)
-    except ValueError:
-        try:
-            await status.delete()   # silently drop non-recipe text
-        except Exception:
-            pass
-    except Exception as e:
-        await _reply_parse_error(status, e, "рецепт")
-
-
-# ── Text / URL handler ────────────────────────────────────────────────────────
-
-@dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
-async def handle_text_message(message: Message, state: FSMContext):
-    if not message.from_user or pool is None:
-        return
-    text = message.text or ""
-    url_match = _URL_RE.search(text)
-
-    if url_match:
-        url = url_match.group(0).rstrip(".,)")   # strip trailing punctuation
-        status = await message.reply("⏳ Читаю рецепт по ссылке...")
-        try:
-            recipe = await parse_and_save_recipe(message.from_user.id, url=url)
-            await _reply_recipe_saved(message, recipe, status)
-        except Exception as e:
-            await _reply_parse_error(status, e, "рецепт")
+        recipe_id = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка", show_alert=True)
         return
 
-    # Plain text — only try if it's long enough to be a recipe (skip greetings/commands)
-    if len(text) < 30:
-        return   # too short, silently ignore
+    # Create share token
+    if pool is None:
+        await callback.answer("Сервис запускается", show_alert=True)
+        return
 
-    # Buffer it: a recipe split across several messages gets combined before parsing
-    uid = message.from_user.id
-    buf = _text_buffers.get(uid)
-    if buf:
-        buf["parts"].append(text)
-        if buf.get("task"):
-            buf["task"].cancel()
-    else:
-        status = await message.reply("⏳ Собираю рецепт…")
-        buf = {"parts": [text], "status_msg": status, "task": None}
-        _text_buffers[uid] = buf
-    buf["task"] = asyncio.create_task(_flush_text_buffer(uid))
+    async with pool.acquire() as db:
+        token = secrets.token_urlsafe(16)
+        share = await db.fetchrow(
+            "INSERT INTO recipe_shares (token, source_recipe_id, owner_user_id, snapshot) "
+            "VALUES ($1, $2, $3, (SELECT row_to_json(r)::jsonb FROM "
+            "(SELECT name, emoji, category, servings, cook_time_minutes FROM recipes WHERE id=$2) r)) "
+            "RETURNING id",
+            token, recipe_id, callback.from_user.id
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📤 Выбрать чат",
+            switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+                query=f"share:{token}",
+                allow_user_chats=True,
+                allow_group_chats=True,
+                allow_bot_chats=False,
+                allow_channel_chats=False,
+            ),
+        )
+    ]])
+
+    await callback.message.answer("Нажмите кнопку, чтобы выбрать чат для отправки:", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("rs:"))
+async def handle_shared_recipe_save(callback: CallbackQuery):
+    """Save a shared recipe to the recipient's library."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+
+    token = callback.data.removeprefix("rs:")
+
+    async with pool.acquire() as db:
+        share = await db.fetchrow(
+            "SELECT * FROM recipe_shares WHERE token=$1 AND revoked_at IS NULL", token
+        )
+        if not share:
+            await callback.answer("Рецепт больше недоступен", show_alert=True)
+            return
+
+        # Check if already saved
+        already = await db.fetchval(
+            "SELECT 1 FROM recipe_share_saves WHERE share_id=$1 AND recipient_user_id=$2",
+            share["id"], callback.from_user.id
+        )
+        if already:
+            await callback.answer("Уже сохранено в вашей библиотеке!", show_alert=True)
+            return
+
+        snap = share["snapshot"]
+
+        # Create recipe from snapshot
+        new_rec = await db.fetchrow(
+            "INSERT INTO recipes (user_id, name, emoji, source_type, servings, cook_time_minutes, category) "
+            "VALUES ($1, $2, $3, 'shared', $4, $5, $6) RETURNING id",
+            callback.from_user.id, snap["name"], snap.get("emoji", "🍽"),
+            snap.get("servings", 4), snap.get("cook_time_minutes"), snap.get("category")
+        )
+
+        # Copy ingredients
+        for i in snap.get("ingredients", []):
+            await db.execute(
+                "INSERT INTO ingredients (recipe_id, name, qty, unit) VALUES ($1,$2,$3,$4)",
+                new_rec["id"], i["name"], i.get("qty"), i.get("unit")
+            )
+
+        # Copy steps
+        for s in snap.get("steps", []):
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                new_rec["id"], s["step_number"], s["text"]
+            )
+
+        # Record the save
+        await db.execute(
+            "INSERT INTO recipe_share_saves (share_id, recipient_user_id, created_recipe_id) VALUES ($1,$2,$3)",
+            share["id"], callback.from_user.id, new_rec["id"]
+        )
+
+    await callback.answer("Рецепт сохранён в ПОЛЯНУ 🌿", show_alert=True)
+
+
+# ── Inline mode: share recipes from any chat ─────────────────────────────────
+
+@dp.inline_query()
+async def handle_inline_query(inline_query: InlineQuery):
+    """@reciptesbot — show recipes to share. Handles both bare queries and share:token."""
+    if pool is None:
+        await inline_query.answer([], cache_time=30)
+        return
+
+    user_id = inline_query.from_user.id if inline_query.from_user else 0
+    query = (inline_query.query or "").strip()
+
+    # share:token — triggered by switch_inline_query_chosen_chat
+    if query.startswith("share:"):
+        token = query.removeprefix("share:")
+        async with pool.acquire() as db:
+            share = await db.fetchrow(
+                "SELECT rs.*, r.name, r.emoji, r.category, r.servings, r.cook_time_minutes "
+                "FROM recipe_shares rs JOIN recipes r ON r.id = rs.source_recipe_id "
+                "WHERE rs.token=$1 AND rs.revoked_at IS NULL", token
+            )
+        if not share:
+            await inline_query.answer([], cache_time=30)
+            return
+
+        snap = share["snapshot"]
+        lines = [f"{snap.get('emoji', '🍽')} <b>{snap['name']}</b>"]
+        meta = []
+        if snap.get("category"):
+            meta.append(snap["category"])
+        if snap.get("servings"):
+            meta.append(f"🍽 {snap['servings']} порц.")
+        if snap.get("cook_time_minutes"):
+            meta.append(f"⏱ {snap['cook_time_minutes']} мин.")
+        if meta:
+            lines.append(" · ".join(meta))
+        for i in snap.get("ingredients", []):
+            q = i.get("qty")
+            if q and q != 0:
+                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
+                qty = f"{q_str} {i.get('unit') or ''}".strip()
+            else:
+                qty = ""
+            lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
+        for s in snap.get("steps", []):
+            lines.append(f"  {s['step_number']}. {s['text']}")
+        lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
+        text = "\n".join(lines)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💾 Сохранить себе", callback_data=f"rs:{token}")],
+        ])
+
+        await inline_query.answer([
+            InlineQueryResultArticle(
+                id=str(share["id"]),
+                title=snap["name"],
+                description="Рецепт из ПОЛЯНЫ",
+                input_message_content=InputTextMessageContent(message_text=text, parse_mode="HTML"),
+                reply_markup=kb,
+            )
+        ], cache_time=300, is_personal=True)
+        return
+
+    # Bare query or empty — show user's latest recipes
+    async with pool.acquire() as db:
+        if query:
+            rows = await db.fetch(
+                "SELECT id, name, emoji, category, servings, cook_time_minutes "
+                "FROM recipes WHERE user_id=$1 AND name ILIKE $2 ORDER BY name LIMIT 50",
+                user_id, f"%{query}%"
+            )
+        else:
+            rows = await db.fetch(
+                "SELECT id, name, emoji, category, servings, cook_time_minutes "
+                "FROM recipes WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",
+                user_id
+            )
+
+    results = []
+    for row in rows:
+        recipe_id = row["id"]
+        emoji = row["emoji"] or "🍽"
+        name = row["name"]
+        cat = f"[{row['category']}] " if row.get("category") else ""
+        serv = f"🍽 {row['servings']} порц. " if row.get("servings") else ""
+        ct = f"⏱ {row['cook_time_minutes']} мин" if row.get("cook_time_minutes") else ""
+        desc = f"{cat}{serv}{ct}".strip() or "Рецепт из Поляны"
+
+        text = await _format_recipe_for_share(recipe_id)
+        if not text:
+            continue
+
+        # Create share token for this recipe
+        async with pool.acquire() as db:
+            token = secrets.token_urlsafe(16)
+            share_rec = await db.fetchrow(
+                "INSERT INTO recipe_shares (token, source_recipe_id, owner_user_id, snapshot) "
+                "VALUES ($1, $2, $3, (SELECT row_to_json(r)::jsonb FROM "
+                "(SELECT name, emoji, category, servings, cook_time_minutes FROM recipes WHERE id=$2) r)) "
+                "RETURNING id",
+                token, recipe_id, user_id
+            )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💾 Сохранить", callback_data=f"rs:{token}")],
+        ])
+
+        results.append(
+            InlineQueryResultArticle(
+                id=str(recipe_id),
+                title=f"{emoji} {name}",
+                description=desc,
+                input_message_content=InputTextMessageContent(message_text=text),
+                reply_markup=kb,
+            )
+        )
+
+    await inline_query.answer(results, cache_time=300, is_personal=True)
 
 
 # ── Photo handler ─────────────────────────────────────────────────────────────
@@ -3112,9 +3389,42 @@ async def _process_photo_album(message: Message, file_ids: list[str]):
 _albums: dict[str, list[str]] = {}
 
 
+
+# ── Split Photo Handler ────────────────────────────────────────────────────
+@dp.message(F.photo & F.chat.type.in_({"group", "supergroup"}))
+async def handle_photo_for_split(message: Message):
+    """Handle photo - check if it's for split receipt."""
+    if not SPLIT_AVAILABLE:
+        return  # Let other handlers process
+
+    async with pool.acquire() as db:
+        # Check if there's an active split in this chat
+        event = await db.fetchrow(
+            "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+            message.chat.id
+        )
+        if not event:
+            return  # Not a split context, let other handlers process
+
+        # Get photo bytes
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        photo_bytes = await message.bot.download_file(file.file_path)
+
+        # Process receipt
+        msg, is_free = await handle_receipt_photo(
+            db, message.from_user.id, photo_bytes.read(), event['id'], message.bot
+        )
+
+    await message.answer(msg, reply_markup=split_event_keyboard(event['id']))
+
 @dp.message(F.photo)
 async def handle_photo_message(message: Message):
+    log.info("Photo received: user=%s chat=%s media_group=%s",
+             message.from_user.id if message.from_user else "?",
+             message.chat.id, message.media_group_id)
     if not message.from_user or pool is None:
+        log.warning("Photo skipped: user=%s pool=%s", message.from_user.id if message.from_user else "?", pool is not None)
         return
 
     mgid = message.media_group_id
@@ -3216,6 +3526,43 @@ async def voice_edit(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ── Text / URL handler ────────────────────────────────────────────────────────
+
+@dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
+async def handle_text_message(message: Message, state: FSMContext):
+    if not message.from_user or pool is None:
+        return
+    text = message.text or ""
+    url_match = _URL_RE.search(text)
+
+    if url_match:
+        url = url_match.group(0).rstrip(".,)")   # strip trailing punctuation
+        status = await message.reply("⏳ Читаю рецепт по ссылке...")
+        try:
+            recipe = await parse_and_save_recipe(message.from_user.id, url=url)
+            await _reply_recipe_saved(message, recipe, status)
+        except Exception as e:
+            await _reply_parse_error(status, e, "рецепт")
+        return
+
+    # Plain text — only try if it's long enough to be a recipe (skip greetings/commands)
+    if len(text) < 30:
+        return   # too short, silently ignore
+
+    # Buffer it: a recipe split across several messages gets combined before parsing
+    uid = message.from_user.id
+    buf = _text_buffers.get(uid)
+    if buf:
+        buf["parts"].append(text)
+        if buf.get("task"):
+            buf["task"].cancel()
+    else:
+        status = await message.reply("⏳ Собираю рецепт…")
+        buf = {"parts": [text], "status_msg": status, "task": None}
+        _text_buffers[uid] = buf
+    buf["task"] = asyncio.create_task(_flush_text_buffer(uid))
+
+
 @dp.message(VoiceStates.editing, F.text)
 async def voice_edited_text(message: Message, state: FSMContext):
     if not message.from_user or pool is None:
@@ -3284,6 +3631,231 @@ async def on_successful_payment(message: Message):
 
 # ── /start command ────────────────────────────────────────────────────────────
 
+
+# ── Split Command ──────────────────────────────────────────────────────────
+@dp.message(Command("split"))
+async def cmd_split(message: Message, db=Depends(get_db)):
+    """Main split command."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        # Create new split event
+        title = args[1].strip()
+        event_id = await create_split_event(db, message.chat.id, title, message.from_user.id)
+        await message.answer(
+            f"✅ Делёж «{title}» создан!\n\n"
+            f"Добавь участников командой /split_add @username\n"
+            f"Или отправь фото чека для сканирования.",
+            reply_markup=split_event_keyboard(event_id)
+        )
+    else:
+        # Show main menu
+        await message.answer(
+            "💰 Делёж расходов\n\n"
+            "Сканируй QR-код на чеке — бесплатно\n\n"
+            "Создай новый делёж или выбери существующий:",
+            reply_markup=split_main_keyboard()
+        )
+
+
+@dp.message(Command("split_add"))
+async def cmd_split_add(message: Message, db=Depends(get_db)):
+    """Add participant to split event."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /split_add @username или /split_add user_id")
+        return
+
+    # Get active split event for this chat
+    event = await db.fetchrow(
+        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа. Создай: /split Название")
+        return
+
+    # Parse participant
+    target = args[1]
+    if target.startswith('@'):
+        # Username - need to resolve
+        await message.answer(f"Добавь @{target[1:]} в чат, затем он сможет присоединиться командой /split_join")
+    else:
+        # User ID
+        try:
+            user_id = int(target)
+            await add_participant(db, event['id'], user_id, f"User {user_id}")
+            await message.answer(f"✅ Участник добавлен!")
+        except ValueError:
+            await message.answer("Неверный формат. Используй @username или user_id")
+
+
+@dp.message(Command("split_join"))
+async def cmd_split_join(message: Message, db=Depends(get_db)):
+    """Join active split event."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    event = await db.fetchrow(
+        "SELECT id, title FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа в этом чате.")
+        return
+
+    added = await add_participant(db, event['id'], message.from_user.id, message.from_user.first_name)
+    if added:
+        await message.answer(
+            f"✅ Ты присоединился к «{event['title']}»!\n\n"
+            f"Отправь фото чека для сканирования."
+        )
+    else:
+        await message.answer("Ты уже в этом дележе.")
+
+
+@dp.message(Command("split_done"))
+async def cmd_split_done(message: Message, db=Depends(get_db)):
+    """Calculate and send debts."""
+    if not SPLIT_AVAILABLE:
+        await message.answer("Модуль «Делёж» пока не подключён.")
+        return
+
+    event = await db.fetchrow(
+        "SELECT id FROM split_events WHERE chat_id = $1 AND status = 'active' ORDER BY id DESC LIMIT 1",
+        message.chat.id
+    )
+    if not event:
+        await message.answer("Нет активного дележа.")
+        return
+
+    summary = await calculate_and_notify(db, event['id'], message.bot)
+    await message.answer(summary)
+
+    # Close event
+    await db.execute(
+        "UPDATE split_events SET status = 'closed' WHERE id = $1",
+        event['id']
+    )
+
+
+# ── Split Callbacks ────────────────────────────────────────────────────────
+@dp.callback_query(F.data == "split_new")
+async def cb_split_new(callback: CallbackQuery):
+    """Prompt for new split event name."""
+    await callback.message.answer("Введи название дележа:\n\nПример: /split Шашлык на даче")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_list")
+async def cb_split_list(callback: CallbackQuery, db=Depends(get_db)):
+    """List user's split events."""
+    events = await db.fetch(
+        "SELECT id, title, total, status FROM split_events WHERE organizer_id = $1 ORDER BY id DESC LIMIT 5",
+        callback.from_user.id
+    )
+    if not events:
+        await callback.message.answer("У тебя пока нет дележей.\nСоздай: /split Название")
+    else:
+        lines = ["📋 Твои дележи:\n"]
+        for e in events:
+            status = "🟢" if e['status'] == 'active' else "⚫"
+            lines.append(f"{status} {e['title']} — {e['total']:.0f}₽")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_help")
+async def cb_split_help(callback: CallbackQuery):
+    """Show help."""
+    await callback.message.answer(split_help_text(), reply_markup=split_pricing_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_premium")
+async def cb_split_premium(callback: CallbackQuery):
+    """Show premium features."""
+    from split_module import split_premium_text
+    await callback.message.answer(split_premium_text(), parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "split_back")
+async def cb_split_back(callback: CallbackQuery):
+    """Back to main menu."""
+    await callback.message.edit_text(
+        "💰 Делёж расходов\n\n"
+        "Создай новый делёж или выбери существующий:",
+        reply_markup=split_main_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_add_"))
+async def cb_split_add(callback: CallbackQuery):
+    """Prompt for receipt photo."""
+    event_id = int(callback.data.split("_")[2])
+    await callback.message.answer(
+        "📸 Отправь фото чека\n\n"
+        "🆓 QR-код на чеке — бесплатно\n"
+        "💰 Фото без QR — 10₽",
+        reply_markup=split_event_keyboard(event_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_members_"))
+async def cb_split_members(callback: CallbackQuery, db=Depends(get_db)):
+    """Show event members."""
+    event_id = int(callback.data.split("_")[2])
+    participants = await db.fetch(
+        "SELECT display_name, contributed, is_organizer FROM split_participants WHERE event_id = $1",
+        event_id
+    )
+    if not participants:
+        await callback.message.answer("Пока нет участников.")
+    else:
+        lines = ["👥 Участники:\n"]
+        for p in participants:
+            role = "👑" if p['is_organizer'] else "👤"
+            lines.append(f"{role} {p['display_name']} — вложил {p['contributed']:.0f}₽")
+        await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_contribute_"))
+async def cb_split_contribute(callback: CallbackQuery):
+    """Prompt for contribution amount."""
+    event_id = int(callback.data.split("_")[2])
+    await callback.message.answer(
+        "💰 Введи сумму своего вклада:\n\n"
+        "Пример: 500"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("split_done_"))
+async def cb_split_done(callback: CallbackQuery, db=Depends(get_db)):
+    """Calculate and notify."""
+    event_id = int(callback.data.split("_")[2])
+    summary = await calculate_and_notify(db, event_id, callback.message.bot)
+    await callback.message.answer(summary)
+
+    # Close event
+    await db.execute(
+        "UPDATE split_events SET status = 'closed' WHERE id = $1",
+        event_id
+    )
+    await callback.answer()
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not message.from_user:
@@ -3291,6 +3863,74 @@ async def cmd_start(message: Message):
     user = message.from_user
     text = message.text or ""
     arg = text.split(maxsplit=1)[1] if " " in text else None
+
+    # Deep link: save_recipe_{id} — save a shared recipe to user's library
+    if arg and arg.startswith("save_recipe_") and pool is not None:
+        try:
+            source_id = int(arg.split("_", 2)[2])
+        except (ValueError, IndexError):
+            await message.answer("❌ Некорректная ссылка.")
+            return
+
+        async with pool.acquire() as db:
+            src = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", source_id)
+            if not src:
+                await message.answer("❌ Рецепт не найден.")
+                return
+
+            existing = await db.fetchrow(
+                "SELECT id FROM recipes WHERE user_id=$1 AND name=$2",
+                user.id, src["name"]
+            )
+            if existing:
+                await message.answer(f"📚 Рецепт «{src['name']}» уже есть в вашей библиотеке.")
+                return
+
+            new_rec = await db.fetchrow(
+                "INSERT INTO recipes (user_id, name, name_original, emoji, source_url, "
+                "source_type, original_language, servings, cook_time_minutes, category, tags, notes) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+                user.id, src["name"], src.get("name_original"), src.get("emoji"),
+                src.get("source_url"), "shared", src.get("original_language"),
+                src.get("servings", 4), src.get("cook_time_minutes"), src.get("category"),
+                src.get("tags", []), src.get("notes")
+            )
+
+            ings = await db.fetch(
+                "SELECT name, qty, unit, category, sort_order FROM ingredients WHERE recipe_id=$1 ORDER BY id",
+                source_id
+            )
+            for ing in ings:
+                await db.execute(
+                    "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) "
+                    "VALUES ($1,$2,$3,$4,$5,$6)",
+                    new_rec["id"], ing["name"], ing.get("qty"), ing.get("unit"),
+                    ing.get("category"), ing.get("sort_order", 0)
+                )
+
+            steps = await db.fetch(
+                "SELECT step_number, text FROM recipe_steps WHERE recipe_id=$1 ORDER BY step_number",
+                source_id
+            )
+            for step in steps:
+                await db.execute(
+                    "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                    new_rec["id"], step["step_number"], step["text"]
+                )
+
+        ings_count = len(ings) if ings else 0
+        await message.answer(
+            f"✅ <b>Рецепт сохранён!</b>\n\n"
+            f"{src.get('emoji', '🍽')} <b>{src['name']}</b>\n"
+            f"🥕 {ings_count} ингредиентов · 📋 {len(steps) if steps else 0} шагов",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📖 Открыть",
+                    web_app=WebAppInfo(url=f"{FRONTEND_URL}?screen=recipe&id={new_rec['id']}")
+                ),
+            ]])
+        )
+        return
 
     # Analytics: top-of-funnel + attribution source (ref_<id> / event_<id> / organic)
     await track(user.id, "user_start", src_payload=(arg or "organic"))
@@ -3414,6 +4054,7 @@ async def run_bot():
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="add", description="Добавить рецепт в библиотеку"),
+                BotCommand(command="split", description="Делёж расходов"),
                 BotCommand(command="ref", description="Партнёрская программа"),
                 BotCommand(command="terms", description="Правила и документы"),
             ],
