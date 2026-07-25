@@ -112,8 +112,6 @@ class TestDocumentTypes:
 
 class TestOnboardingConfig:
     def test_onboarding_version_is_string(self):
-        # Import just the constant — need to handle asyncpg import
-        # Read from file instead of importing main
         with open("main.py", encoding="utf-8") as f:
             content = f.read()
         assert 'ONBOARDING_VERSION = "1.0"' in content
@@ -122,17 +120,31 @@ class TestOnboardingConfig:
         with open("main.py", encoding="utf-8") as f:
             content = f.read()
         assert "_ONBOARDING_SCREENS" in content
-        # Check all screen keys exist
         assert '"text"' in content
         assert '"buttons"' in content
+
+    def test_onboarding_has_6_screens(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        # 4 tutorial + 1 legal + 1 completed = 6
+        assert "_ONB_STEPS_TUTORIAL = 4" in content
+        assert "_ONB_STEP_LEGAL = 4" in content
+        assert "_ONB_STEP_COMPLETED = 5" in content
 
     def test_onboarding_states_defined(self):
         with open("main.py", encoding="utf-8") as f:
             content = f.read()
         assert "class OnboardingStates(StatesGroup):" in content
-        assert "welcome = State()" in content
         assert "legal_pending = State()" in content
         assert "completed = State()" in content
+
+    def test_tutorial_screens_have_step_labels(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "Шаг 1 из 4" in content
+        assert "Шаг 2 из 4" in content
+        assert "Шаг 3 из 4" in content
+        assert "Шаг 4 из 4" in content
 
 
 # ── Consent Service Tests (sync, mocking asyncpg) ────────────────────────────
@@ -411,6 +423,9 @@ class TestAnalyticsEventNames:
         "legal_documents_opened", "terms_accepted", "personal_data_consent_accepted",
         "ai_consent_shown", "ai_consent_accepted", "ai_consent_declined",
         "consent_revoked", "account_deletion_requested", "account_deleted",
+        "welcome_screen_viewed", "onboarding_tutorial_chosen", "onboarding_skip_chosen",
+        "welcome_how_to_add_viewed", "welcome_example_viewed",
+        "welcome_ai_functions_viewed", "welcome_get_points_viewed",
     ]
 
     def test_event_names_are_snake_case(self):
@@ -418,6 +433,154 @@ class TestAnalyticsEventNames:
             assert isinstance(event, str)
             assert len(event) > 0
             assert "_" in event
+
+
+# ── Feature Flags Tests ──────────────────────────────────────────────────────
+
+class TestFeatureFlags:
+    def test_feature_flags_defined(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        for flag in ["FEATURE_RECIPE_IMPORT_IMAGE", "FEATURE_RECIPE_IMPORT_VOICE",
+                      "FEATURE_RECIPE_IMPORT_URL", "FEATURE_AI_RECIPE_GENERATION",
+                      "FEATURE_AI_IMAGE_GENERATION", "FEATURE_EVENTS",
+                      "FEATURE_SHOPPING_LIST", "FEATURE_EXPENSE_SPLIT",
+                      "FEATURE_RECEIPT_RECOGNITION", "FEATURE_REFERRALS",
+                      "FEATURE_PAYMENTS", "WELCOME_POINTS"]:
+            assert flag in content
+
+    def test_free_features_list(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "FREE_FEATURES" in content
+        assert '"icon"' in content
+        assert '"title"' in content
+
+    def test_ai_features_list(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "AI_FEATURES" in content
+
+    def test_feature_flags_use_env(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert 'ENV("FEATURE_RECIPE_IMPORT_IMAGE"' in content
+        assert 'ENV("FEATURE_EVENTS"' in content
+        assert 'ENV("WELCOME_POINTS"' in content
+
+
+# ── WelcomeService Tests ─────────────────────────────────────────────────────
+
+class TestWelcomeService:
+    def test_welcome_service_exists(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "class WelcomeService:" in content
+
+    def test_build_new_user_welcome_defined(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "def build_new_user_welcome(" in content
+        assert "def build_returning_user_dashboard(" in content
+        assert "def build_referral_welcome(" in content
+        assert "def build_recipe_share_welcome(" in content
+        assert "def build_channel_welcome(" in content
+
+    def test_sub_screen_builders_defined(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "def build_how_to_add_recipe(" in content
+        assert "def build_example(" in content
+        assert "def build_ai_functions(" in content
+        assert "def build_get_points(" in content
+
+    def test_welcome_text_contains_key_sections(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "Бесплатно в ПОЛЯНЕ" in content
+        assert "AI-баллы используются только для функций с ИИ" in content
+        assert "Обязательной подписки нет" in content
+
+    def test_referral_welcome_shows_referrer(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "пригласил вас в ПОЛЯНУ" in content
+
+    def test_recipe_share_welcome_shows_title(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "поделился с вами рецептом" in content
+
+    def test_html_escape_function(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "def _esc(" in content
+        assert "_html_mod.escape" in content
+
+
+# ── Welcome Keyboard Tests ───────────────────────────────────────────────────
+
+class TestWelcomeKeyboard:
+    def test_welcome_keyboard_defined(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert "def _welcome_keyboard():" in content
+        assert "def _returning_user_keyboard():" in content
+
+    def test_welcome_keyboard_has_required_buttons(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert 'callback_data="ws_how_to_add"' in content
+        assert 'callback_data="ws_example"' in content
+        assert 'callback_data="ws_ai_functions"' in content
+        assert 'callback_data="ws_get_points"' in content
+        assert 'callback_data="ws_help"' in content
+        assert 'callback_data="ob_start_tutorial"' in content
+        assert 'callback_data="ob_start_skip_to_legal"' in content
+
+    def test_returning_keyboard_has_required_buttons(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert 'callback_data="ws_how_to_add"' in content
+        assert 'callback_data="ws_ai_functions"' in content
+        assert 'callback_data="ws_get_points"' in content
+        assert 'callback_data="show_documents"' in content
+        assert 'callback_data="ws_help"' in content
+
+
+# ── Sub-Screen Callback Tests ────────────────────────────────────────────────
+
+class TestSubScreenCallbacks:
+    def test_all_sub_screen_handlers_exist(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        for handler in ["cb_ws_how_to_add", "cb_ws_example", "cb_ws_send_hint",
+                         "cb_ws_ai_functions", "cb_ws_get_points", "cb_ws_help",
+                         "cb_ws_back", "cb_ob_start_tutorial", "cb_ob_start_skip_to_legal"]:
+            assert f"async def {handler}" in content
+
+    def test_ws_back_returns_to_welcome(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert 'F.data == "ws_back"' in content
+        assert "WelcomeService.build_new_user_welcome" in content
+        assert "WelcomeService.build_returning_user_dashboard" in content
+
+
+# ── Public Callbacks Tests ───────────────────────────────────────────────────
+
+class TestPublicCallbacks:
+    def test_welcome_callbacks_are_public(self):
+        with open("main.py", encoding="utf-8") as f:
+            content = f.read()
+        assert '"ws_how_to_add"' in content
+        assert '"ws_example"' in content
+        assert '"ws_ai_functions"' in content
+        assert '"ws_get_points"' in content
+        assert '"ws_help"' in content
+        assert '"ws_back"' in content
+        assert '"ob_start_tutorial"' in content
+        assert '"ob_start_skip_to_legal"' in content
 
 
 if __name__ == "__main__":

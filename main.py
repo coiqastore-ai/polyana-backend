@@ -101,6 +101,47 @@ DELETED_ACCOUNT_RETENTION_DAYS = int(ENV("DELETED_ACCOUNT_RETENTION_DAYS", "30")
 # Onboarding config
 ONBOARDING_VERSION = "1.0"
 
+# Feature flags — controls what's shown in welcome/onboarding
+FEATURE_RECIPE_IMPORT_IMAGE = ENV("FEATURE_RECIPE_IMPORT_IMAGE", "true").lower() == "true"
+FEATURE_RECIPE_IMPORT_VOICE = ENV("FEATURE_RECIPE_IMPORT_VOICE", "true").lower() == "true"
+FEATURE_RECIPE_IMPORT_URL = ENV("FEATURE_RECIPE_IMPORT_URL", "true").lower() == "true"
+FEATURE_AI_RECIPE_GENERATION = ENV("FEATURE_AI_RECIPE_GENERATION", "true").lower() == "true"
+FEATURE_AI_IMAGE_GENERATION = ENV("FEATURE_AI_IMAGE_GENERATION", "true").lower() == "true"
+FEATURE_EVENTS = ENV("FEATURE_EVENTS", "true").lower() == "true"
+FEATURE_SHOPPING_LIST = ENV("FEATURE_SHOPPING_LIST", "true").lower() == "true"
+FEATURE_EXPENSE_SPLIT = ENV("FEATURE_EXPENSE_SPLIT", "true").lower() == "true"
+FEATURE_RECEIPT_RECOGNITION = ENV("FEATURE_RECEIPT_RECOGNITION", "true").lower() == "true"
+FEATURE_REFERRALS = ENV("FEATURE_REFERRALS", "true").lower() == "true"
+FEATURE_PAYMENTS = ENV("FEATURE_PAYMENTS", "true").lower() == "true"
+WELCOME_POINTS = int(ENV("WELCOME_POINTS", "0"))
+
+# Feature lists for welcome screen (flag, icon, title)
+FREE_FEATURES = [
+    {"flag": True, "icon": "📚", "title": "хранение и поиск рецептов"},
+    {"flag": True, "icon": "✏️", "title": "редактирование и избранное"},
+    {"flag": True, "icon": "🍽", "title": "пересчёт ингредиентов на нужное число порций"},
+    {"flag": True, "icon": "📤", "title": "отправка рецептов друзьям"},
+    {"flag": True, "icon": "💾", "title": "сохранение рецептов друзей"},
+    {"flag": FEATURE_EVENTS, "icon": "🎉", "title": "создание меню для событий"},
+    {"flag": FEATURE_SHOPPING_LIST, "icon": "🛒", "title": "единый список покупок"},
+    {"flag": FEATURE_EXPENSE_SPLIT, "icon": "💰", "title": "распределение покупок и расчёт расходов"},
+]
+
+AI_FEATURES = [
+    {"flag": FEATURE_RECIPE_IMPORT_IMAGE, "icon": "✨", "title": "распознавание фото, голоса и сложных ссылок"},
+    {"flag": FEATURE_AI_RECIPE_GENERATION, "icon": "🍲", "title": "создание нового рецепта по вашему описанию"},
+    {"flag": FEATURE_AI_IMAGE_GENERATION, "icon": "🖼", "title": "создание изображения блюда"},
+    {"flag": True, "icon": "💡", "title": "умные рекомендации и подбор меню"},
+    {"flag": FEATURE_RECEIPT_RECOGNITION, "icon": "🧾", "title": "распознавание чеков"},
+]
+
+# ── HTML escape helper ────────────────────────────────────────────────────────
+import html as _html_mod
+
+def _esc(text: str) -> str:
+    """Escape text for Telegram HTML parse_mode."""
+    return _html_mod.escape(str(text)) if text else ""
+
 
 # ── Wallet Service ────────────────────────────────────────────────────────────
 
@@ -1006,6 +1047,222 @@ class LegalConsentService:
         if not await LegalConsentService.has_current_acceptance(db, user_id, LegalConsentService.AI_TYPE):
             raise ValueError(f"consent_required:{LegalConsentService.AI_TYPE}")
         return True
+
+
+# ── Welcome Service ───────────────────────────────────────────────────────────
+
+class WelcomeService:
+    """Centralized text building for start screens and onboarding."""
+
+    @staticmethod
+    def _features_text(features: list) -> str:
+        """Build a feature list from config, excluding disabled flags."""
+        lines = []
+        for f in features:
+            if f["flag"]:
+                lines.append(f"{f['icon']} {f['title']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def build_new_user_welcome(first_name: str, source: str = "organic",
+                                referrer_name: str = None,
+                                welcome_points: int = 0) -> str:
+        name = _esc(first_name) if first_name else ""
+        ref_line = ""
+        if source == "referral" and referrer_name:
+            ref_line = f"\nВы присоединились по приглашению {_esc(referrer_name)}."
+
+        free_list = WelcomeService._features_text(FREE_FEATURES)
+        ai_list = WelcomeService._features_text(AI_FEATURES)
+
+        points_block = ""
+        if welcome_points > 0:
+            points_block = f"\n🎁 На старте вам доступно: <b>{welcome_points} AI-баллов</b>\n"
+
+        return (
+            f"🌿 <b>Добро пожаловать в ПОЛЯНУ, {name}!</b>\n\n"
+            f"ПОЛЯНА — это ваша личная библиотека рецептов и помощник\n"
+            f"для домашних ужинов, праздников и встреч с друзьями.\n\n"
+            f"<b>Просто отправьте в этот чат рецепт:</b>\n"
+            f"📷 фотографией или скриншотом\n"
+            f"🔗 ссылкой на сайт\n"
+            f"📝 обычным текстом\n"
+            f"🎙 голосовым сообщением\n"
+            f"📩 пересланным сообщением\n\n"
+            f"Бот распознает рецепт, аккуратно оформит его\n"
+            f"и сохранит в вашей библиотеке.\n\n"
+            f"<b>Бесплатно в ПОЛЯНЕ:</b>\n{free_list}\n\n"
+            f"<b>AI-баллы используются только для функций с ИИ:</b>\n{ai_list}\n"
+            f"{points_block}"
+            f"<b>Обязательной подписки нет.</b>\n"
+            f"Пополняйте AI-баланс только тогда, когда нужен ИИ.\n"
+            f"Баллы также можно получать бесплатно за приглашение друзей.\n\n"
+            f"Отправьте первый рецепт прямо в этот чат\n"
+            f"или откройте свою ПОЛЯНУ 👇"
+            f"{ref_line}"
+        )
+
+    @staticmethod
+    def build_returning_user_dashboard(first_name: str, recipes_count: int,
+                                        events_count: int, total_points: int,
+                                        events_enabled: bool = True) -> str:
+        name = _esc(first_name) if first_name else ""
+        events_line = ""
+        if events_enabled:
+            events_line = f"Активных событий: <b>{events_count}</b>\n"
+        return (
+            f"🌿 <b>ПОЛЯНА</b>\n\n"
+            f"Рецептов в библиотеке: <b>{recipes_count}</b>\n"
+            f"{events_line}"
+            f"AI-баланс: <b>{total_points}</b>\n\n"
+            f"Отправьте сюда новый рецепт\n"
+            f"или откройте библиотеку."
+        )
+
+    @staticmethod
+    def build_referral_welcome(first_name: str, referrer_name: str,
+                                welcome_points: int = 0) -> str:
+        name = _esc(first_name) if first_name else ""
+        ref = _esc(referrer_name) if referrer_name else "друг"
+
+        free_list = WelcomeService._features_text(FREE_FEATURES)
+        ai_list = WelcomeService._features_text(AI_FEATURES)
+
+        points_block = ""
+        if welcome_points > 0:
+            points_block = f"\n🎁 На старте вам доступно: <b>{welcome_points} AI-баллов</b>\n"
+
+        return (
+            f"🌿 <b>{ref} пригласил вас в ПОЛЯНУ</b>\n\n"
+            f"Это личная библиотека рецептов прямо в Telegram.\n\n"
+            f"<b>Просто отправьте в этот чат рецепт:</b>\n"
+            f"📷 фотографией или скриншотом\n"
+            f"🔗 ссылкой на сайт\n"
+            f"📝 обычным текстом\n"
+            f"🎙 голосовым сообщением\n"
+            f"📩 пересланным сообщением\n\n"
+            f"Бот распознает рецепт, аккуратно оформит его\n"
+            f"и сохранит в вашей библиотеке.\n\n"
+            f"<b>Бесплатно в ПОЛЯНЕ:</b>\n{free_list}\n\n"
+            f"<b>AI-баллы используются только для функций с ИИ:</b>\n{ai_list}\n"
+            f"{points_block}"
+            f"<b>Обязательной подписки нет.</b>\n"
+            f"Пополняйте AI-баланс только тогда, когда нужен ИИ.\n"
+            f"Баллы также можно получать бесплатно за приглашение друзей.\n\n"
+            f"Вы присоединились по приглашению {ref}.\n"
+            f"Отправьте первый рецепт прямо в этот чат\n"
+            f"или откройте свою ПОЛЯНУ 👇"
+        )
+
+    @staticmethod
+    def build_recipe_share_welcome(first_name: str, sender_name: str,
+                                    recipe_title: str) -> str:
+        sender = _esc(sender_name) if sender_name else "друг"
+        title = _esc(recipe_title) if recipe_title else "рецепт"
+
+        free_list = WelcomeService._features_text(FREE_FEATURES)
+
+        return (
+            f"🍲 <b>{sender} поделился с вами рецептом</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            f"Сохраните его в личную библиотеку ПОЛЯНЫ,\n"
+            f"чтобы рецепт не потерялся.\n\n"
+            f"В ПОЛЯНЕ можно бесплатно:\n{free_list}\n\n"
+            f"ИИ помогает распознавать фотографии, голосовые сообщения,\n"
+            f"придумывать новые блюда и создавать изображения.\n"
+            f"Эти действия оплачиваются AI-баллами.\n\n"
+            f"Обязательной подписки нет."
+        )
+
+    @staticmethod
+    def build_channel_welcome(first_name: str) -> str:
+        return (
+            f"🌿 <b>Сохраните рецепт из канала в ПОЛЯНУ</b>\n\n"
+            f"ПОЛЯНА — личная библиотека рецептов в Telegram.\n\n"
+            f"Сохранённый рецепт можно:\n"
+            f"— быстро найти\n"
+            f"— изменить\n"
+            f"— пересчитать на нужное количество порций\n"
+            f"— добавить в меню\n"
+            f"— превратить в список покупок\n"
+            f"— отправить друзьям\n\n"
+            f"Основная библиотека и обычные инструменты бесплатны.\n"
+            f"AI-баллы нужны только для распознавания и генерации."
+        )
+
+    @staticmethod
+    def build_how_to_add_recipe() -> str:
+        return (
+            f"📎 <b>Как сохранить рецепт</b>\n\n"
+            f"Просто отправьте его в этот чат.\n\n"
+            f"Подойдут:\n"
+            f"— фотография страницы из книги\n"
+            f"— скриншот из Instagram или другого приложения\n"
+            f"— ссылка на сайт\n"
+            f"— скопированный текст\n"
+            f"— голосовое сообщение\n"
+            f"— пересланный рецепт из другого Telegram-канала или чата\n\n"
+            f"Выбирать специальный режим не нужно.\n"
+            f"ПОЛЯНА сама определит, что вы отправили.\n\n"
+            f"Попробуйте прямо сейчас 👇"
+        )
+
+    @staticmethod
+    def build_example() -> str:
+        return (
+            f"<b>Например, вы увидели рецепт в социальной сети.</b>\n\n"
+            f"Делаете скриншот и отправляете его боту.\n\n"
+            f"ПОЛЯНА создаёт аккуратную карточку:\n\n"
+            f"🍝 Паста с курицей\n"
+            f"⏱ 35 минут\n"
+            f"🍽 4 порции\n\n"
+            f"Ингредиенты:\n"
+            f"— куриное филе — 500 г\n"
+            f"— паста — 300 г\n"
+            f"— сливки — 200 мл\n\n"
+            f"После этого рецепт можно:\n"
+            f"— открыть в библиотеке\n"
+            f"— изменить\n"
+            f"— пересчитать на другое количество порций\n"
+            f"— добавить в меню\n"
+            f"— отправить другу"
+        )
+
+    @staticmethod
+    def build_ai_functions(total_points: int) -> str:
+        return (
+            f"✨ <b>Что делает ИИ в ПОЛЯНЕ</b>\n\n"
+            f"AI-баллы расходуются только на функции,\n"
+            f"для которых требуется работа искусственного интеллекта.\n\n"
+            f"За баллы можно:\n\n"
+            f"📷 распознать рецепт по фото или скриншоту\n"
+            f"🎙 разобрать голосовое сообщение\n"
+            f"🔗 обработать сложную страницу сайта\n"
+            f"🍲 придумать рецепт по вашим пожеланиям\n"
+            f"🖼 создать изображение блюда\n"
+            f"💡 получить рекомендации из вашей библиотеки\n"
+            f"🎉 составить меню для события\n"
+            f"🧾 распознать чек\n\n"
+            f"Обычные функции библиотеки, событий,\n"
+            f"списков покупок и расчёта расходов остаются бесплатными.\n\n"
+            f"Ваш баланс: <b>{total_points} AI-баллов</b>"
+        )
+
+    @staticmethod
+    def build_get_points(invited_count: int, bonus_points: int,
+                          pending_bonus_points: int) -> str:
+        return (
+            f"🎁 <b>Пользуйтесь ИИ бесплатно</b>\n\n"
+            f"Приглашайте друзей в ПОЛЯНУ и получайте\n"
+            f"<b>10% от их пополнений AI-баллами</b>.\n\n"
+            f"Баллы можно тратить внутри ПОЛЯНЫ:\n"
+            f"на распознавание рецептов, генерацию блюд,\n"
+            f"изображения и другие AI-функции.\n\n"
+            f"Баллы нельзя вывести или обменять на деньги.\n\n"
+            f"Приглашено друзей: <b>{invited_count}</b>\n"
+            f"Доступно бонусных баллов: <b>{bonus_points}</b>\n"
+            f"Ожидают начисления: <b>{pending_bonus_points}</b>"
+        )
 
 
 pool = None
@@ -4482,7 +4739,10 @@ class AiConsentStates(StatesGroup):
 
 # Handlers that do NOT require any consent
 _PUBLIC_CALLBACKS = {
-    "show_terms", "show_ref", "show_documents",
+    "show_terms", "show_ref", "show_documents", "show_back",
+    "ws_how_to_add", "ws_example", "ws_send_hint", "ws_ai_functions",
+    "ws_get_points", "ws_help", "ws_back",
+    "ob_start_tutorial", "ob_start_skip_to_legal",
 }
 _PUBLIC_COMMANDS = {"start", "terms", "privacy", "documents", "help", "delete_me"}
 
@@ -4551,13 +4811,12 @@ class LegalConsentMiddleware:
 
 
 async def _start_onboarding_for_user(event, user_id: int):
-    """Send the first onboarding screen to a user who hasn't completed onboarding."""
+    """Send the welcome screen to a user who hasn't completed onboarding."""
     async with pool.acquire() as db:
         user = await UserService.get_user(db, user_id)
     if not user:
         return
-    step = user["onboarding_step"] or 0
-    source = user["acquisition_source"] or "organic"
+    source = user.get("acquisition_source") or "organic"
     referrer_name = None
     if source == "referral" and user.get("referrer_user_id"):
         async with pool.acquire() as db:
@@ -4567,7 +4826,24 @@ async def _start_onboarding_for_user(event, user_id: int):
         if ref_user:
             referrer_name = ref_user["first_name"]
 
-    await _send_onboarding_step(event, user_id, step, source, referrer_name)
+    # Build welcome text based on source
+    first_name = user.get("first_name") or ""
+    if source == "referral" and referrer_name:
+        text = WelcomeService.build_referral_welcome(first_name, referrer_name, WELCOME_POINTS)
+    else:
+        text = WelcomeService.build_new_user_welcome(first_name, source, referrer_name, WELCOME_POINTS)
+
+    kb = _welcome_keyboard()
+    if hasattr(event, 'message') and event.message:
+        try:
+            await event.message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    if hasattr(event, 'message') and event.message:
+        await event.message.answer(text, reply_markup=kb)
+    elif hasattr(event, 'text'):
+        await event.answer(text, reply_markup=kb)
 
 
 async def _show_consent_prompt(event, user_id: int, consent_type: str):
@@ -4595,79 +4871,67 @@ async def _show_consent_prompt(event, user_id: int, consent_type: str):
 
 # Onboarding screen texts
 _ONBOARDING_SCREENS = [
-    # Screen 0: Welcome
+    # Screen 0: Step 1/4 — Send a recipe
     {
         "text": (
-            "🌿 <b>Добро пожаловать в ПОЛЯНУ</b>\n\n"
-            "Это ваша личная библиотека рецептов прямо в Telegram.\n\n"
-            "Отправьте боту рецепт — ПОЛЯНА аккуратно сохранит его, "
-            "чтобы он больше не потерялся."
-        ),
-        "buttons": [["👋 Понятно, дальше"]],
-        "skip": True,
-    },
-    # Screen 1: How to save
-    {
-        "text": (
-            "📥 <b>Сохраняйте рецепты откуда угодно</b>\n\n"
-            "Можно отправить:\n"
+            "📥 <b>Шаг 1 из 4. Отправьте рецепт</b>\n\n"
+            "Ничего специально заполнять не нужно.\n\n"
+            "Отправьте боту:\n"
             "📷 фото или скриншот\n"
-            "🔗 ссылку на сайт\n"
-            "📝 обычный текст\n"
-            "🎙 голосовое сообщение\n"
-            "📩 пересланное сообщение\n\n"
-            "Бот распознает рецепт и добавит его в библиотеку."
+            "🔗 ссылку\n"
+            "📝 текст\n"
+            "🎙 голосовое сообщение\n\n"
+            "ПОЛЯНА сама определит формат и начнёт обработку."
         ),
         "buttons": [["Дальше"]],
         "skip": True,
     },
-    # Screen 2: Library
+    # Screen 1: Step 2/4 — Recipe saved to library
     {
         "text": (
-            "📚 <b>Всё хранится в одном месте</b>\n\n"
-            "В библиотеке можно:\n"
-            "— искать рецепты\n"
-            "— редактировать\n"
-            "— менять количество порций\n"
-            "— добавлять в избранное\n"
-            "— делиться с друзьями\n"
-            "— сохранять рецепты друзей"
+            "📚 <b>Шаг 2 из 4. Рецепт сохранится в библиотеке</b>\n\n"
+            "Бот выделит:\n\n"
+            "— название\n"
+            "— ингредиенты\n"
+            "— количество порций\n"
+            "— время приготовления\n"
+            "— пошаговую инструкцию\n\n"
+            "После сохранения рецепт можно открыть,\n"
+            "исправить или отправить другу."
         ),
         "buttons": [["Дальше"]],
         "skip": True,
     },
-    # Screen 3: Planning
+    # Screen 2: Step 3/4 — Use accumulated recipes
     {
         "text": (
-            "🍽 <b>Планируйте ужины и встречи</b>\n\n"
-            "Из сохранённых рецептов можно собрать меню, "
-            "пересчитать ингредиенты и получить единый список покупок.\n\n"
-            "Для совместных событий можно распределить покупки "
-            "и посчитать расходы."
+            "🍽 <b>Шаг 3 из 4. Используйте накопленные рецепты</b>\n\n"
+            "Когда в библиотеке появятся любимые блюда, вы сможете:\n\n"
+            "— быстро находить их\n"
+            "— пересчитывать ингредиенты\n"
+            "— составлять меню для гостей\n"
+            "— получать единый список покупок\n"
+            "— распределять покупки и расходы"
         ),
         "buttons": [["Дальше"]],
         "skip": True,
     },
-    # Screen 4: Free vs AI
+    # Screen 3: Step 4/4 — AI paid only when needed
     {
         "text": (
-            "✨ <b>Бесплатные функции и ИИ</b>\n\n"
-            "Бесплатно:\n"
-            "— библиотека\n"
-            "— поиск\n"
-            "— ручное редактирование\n"
-            "— обмен рецептами\n"
-            "— события\n"
-            "— списки покупок\n"
-            "— расчёт расходов\n\n"
-            "AI-баллы используются только там, где работает ИИ: "
-            "распознавание фото и голоса, генерация рецептов, "
-            "создание изображений и умные рекомендации."
+            "✨ <b>Шаг 4 из 4. ИИ оплачивается только когда нужен</b>\n\n"
+            "Основные функции ПОЛЯНЫ бесплатны.\n\n"
+            "AI-баллы используются для распознавания,\n"
+            "генерации рецептов, изображений и умных рекомендаций.\n\n"
+            "Обязательной подписки нет:\n"
+            "можно купить пакет баллов или получить их,\n"
+            "приглашая друзей.\n\n"
+            "Теперь отправьте первый рецепт прямо в этот чат."
         ),
-        "buttons": [["Продолжить"]],
+        "buttons": [["📎 Начать с рецепта"], ["🌿 Открыть библиотеку"]],
         "skip": False,
     },
-    # Screen 5: Legal pending
+    # Screen 4: Legal pending
     {
         "text": (
             "📋 <b>Документы</b>\n\n"
@@ -4677,7 +4941,7 @@ _ONBOARDING_SCREENS = [
         "buttons": [],  # dynamic
         "skip": False,
     },
-    # Screen 6: Completed
+    # Screen 5: Completed
     {
         "text": (
             "Всё готово 🌿\n\n"
@@ -4691,6 +4955,11 @@ _ONBOARDING_SCREENS = [
     },
 ]
 
+# Total onboarding steps: 0-3 (tutorial), 4 (legal), 5 (completed)
+_ONB_STEPS_TUTORIAL = 4  # indices 0..3
+_ONB_STEP_LEGAL = 4
+_ONB_STEP_COMPLETED = 5
+
 
 async def _send_onboarding_step(event, user_id: int, step: int,
                                  source: str = "organic", referrer_name: str = None):
@@ -4701,18 +4970,8 @@ async def _send_onboarding_step(event, user_id: int, step: int,
     screen = _ONBOARDING_SCREENS[step]
     text = screen["text"]
 
-    # Referral variant for welcome screen
-    if step == 0 and source == "referral" and referrer_name:
-        text = (
-            f"🌿 <b>{referrer_name} пригласил вас в ПОЛЯНУ</b>\n\n"
-            "Здесь можно сохранять рецепты из фотографий, ссылок, "
-            "текста и голосовых сообщений.\n\n"
-            "Рецепты будут храниться в вашей личной библиотеке "
-            "прямо в Telegram."
-        )
-
     # Legal pending screen — show acceptance status
-    if step == 5:
+    if step == _ONB_STEP_LEGAL:
         async with pool.acquire() as db:
             status = await LegalConsentService.get_user_acceptance_status(db, user_id)
         terms_ok = "✅" if status.get("terms", {}).get("accepted") else "⬜"
@@ -4722,7 +4981,7 @@ async def _send_onboarding_step(event, user_id: int, step: int,
 
     # Build keyboard
     buttons = []
-    if step == 5:
+    if step == _ONB_STEP_LEGAL:
         # Legal screen — dynamic buttons
         async with pool.acquire() as db:
             status = await LegalConsentService.get_user_acceptance_status(db, user_id)
@@ -4734,27 +4993,33 @@ async def _send_onboarding_step(event, user_id: int, step: int,
                                                   callback_data="ob_accept:personal_data_consent")])
         buttons.append([InlineKeyboardButton(text="📋 Открыть документы",
                                               callback_data="show_documents")])
-        # Check if both accepted
         all_ok = (status.get("terms", {}).get("accepted") and
                   status.get("personal_data_consent", {}).get("accepted"))
         if all_ok:
             buttons.append([InlineKeyboardButton(text="Продолжить",
-                                                  callback_data="ob_next:5")])
-    elif step == 6:
-        # Completed screen
+                                                  callback_data=f"ob_next:{step}")])
+    elif step == _ONB_STEP_COMPLETED:
         buttons.append([InlineKeyboardButton(text="📷 Отправить рецепт",
                                               callback_data="ob_action:send_recipe")])
         buttons.append([InlineKeyboardButton(text="📚 Открыть библиотеку",
                                               callback_data="ob_action:open_library")])
     else:
-        # Navigation buttons
+        # Tutorial screens 0-3
         nav_row = []
         if step > 0:
             nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ob_back:{step}"))
-        nav_row.append(InlineKeyboardButton(text=screen["buttons"][0][0],
-                                             callback_data=f"ob_next:{step}"))
-        buttons.append(nav_row)
-        if screen.get("skip") and step < 5:
+        # Step 3 has two action buttons instead of one "Дальше"
+        if step == _ONB_STEPS_TUTORIAL - 1:
+            nav_row.append(InlineKeyboardButton(text="📎 Начать с рецепта",
+                                                 callback_data="ob_action:start_with_recipe"))
+            buttons.append(nav_row)
+            buttons.append([InlineKeyboardButton(text="🌿 Открыть библиотеку",
+                                                  callback_data="ob_action:open_library")])
+        else:
+            nav_row.append(InlineKeyboardButton(text=screen["buttons"][0][0],
+                                                 callback_data=f"ob_next:{step}"))
+            buttons.append(nav_row)
+        if screen.get("skip"):
             buttons.append([InlineKeyboardButton(text="Пропустить знакомство",
                                                   callback_data="ob_skip")])
 
@@ -4770,6 +5035,7 @@ async def _send_onboarding_step(event, user_id: int, step: int,
     if hasattr(event, 'message') and event.message:
         await event.message.answer(text, reply_markup=kb)
     elif hasattr(event, 'text'):
+        await event.answer(text, reply_markup=kb)
         await event.answer(text, reply_markup=kb)
 
 
@@ -4821,8 +5087,8 @@ async def cb_ob_skip(callback: CallbackQuery):
     uid = callback.from_user.id
     # Skip to legal pending
     async with pool.acquire() as db:
-        await UserService.update_onboarding_step(db, uid, 5, "legal_pending")
-    await _send_onboarding_step(callback, uid, 5)
+        await UserService.update_onboarding_step(db, uid, _ONB_STEP_LEGAL, "legal_pending")
+    await _send_onboarding_step(callback, uid, _ONB_STEP_LEGAL)
     await callback.answer()
 
 
@@ -4841,8 +5107,8 @@ async def cb_ob_accept(callback: CallbackQuery):
                 "chat_id": callback.message.chat.id if callback.message else None,
             })
             # Update onboarding step to legal_pending to refresh screen
-            await UserService.update_onboarding_step(db, uid, 5)
-        await _send_onboarding_step(callback, uid, 5)
+            await UserService.update_onboarding_step(db, uid, _ONB_STEP_LEGAL)
+        await _send_onboarding_step(callback, uid, _ONB_STEP_LEGAL)
     except Exception as e:
         log.exception("consent accept failed: %s", e)
     await callback.answer()
@@ -4859,7 +5125,7 @@ async def cb_ob_action(callback: CallbackQuery):
     async with pool.acquire() as db:
         await UserService.complete_onboarding(db, uid)
     await callback.answer("✅")
-    if action == "send_recipe":
+    if action == "send_recipe" or action == "start_with_recipe":
         await callback.message.answer(
             "Отправьте мне рецепт — фото, ссылку, текст или голосовое сообщение.\n\n"
             "Пример: просто напишите название блюда и список ингредиентов.")
@@ -4880,6 +5146,225 @@ async def cb_onboarding_cancel(callback: CallbackQuery):
             await callback.message.edit_text("❌ Отменено.", reply_markup=None)
         except Exception:
             pass
+    await callback.answer()
+
+
+# ── Welcome sub-screen callbacks ──────────────────────────────────────────────
+
+@dp.callback_query(F.data == "ob_start_tutorial")
+async def cb_ob_start_tutorial(callback: CallbackQuery):
+    """User clicked 'Показать, как пользоваться' — start 4-screen onboarding."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, uid, 0)
+    await _send_onboarding_step(callback, uid, 0)
+    await callback.answer()
+    await track(uid, "onboarding_tutorial_chosen")
+
+
+@dp.callback_query(F.data == "ob_start_skip_to_legal")
+async def cb_ob_start_skip_to_legal(callback: CallbackQuery):
+    """User clicked 'Начать сразу' — skip tutorial, go to legal."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, uid, _ONB_STEP_LEGAL, "legal_pending")
+    await _send_onboarding_step(callback, uid, _ONB_STEP_LEGAL)
+    await callback.answer()
+    await track(uid, "onboarding_skip_chosen")
+
+
+@dp.callback_query(F.data == "ws_how_to_add")
+async def cb_ws_how_to_add(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    text = WelcomeService.build_how_to_add_recipe()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍲 Посмотреть пример", callback_data="ws_example")],
+        [InlineKeyboardButton(text="🌿 Открыть библиотеку",
+                              web_app=WebAppInfo(url=FRONTEND_URL))],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ws_back")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+    await track(callback.from_user.id, "welcome_how_to_add_viewed")
+
+
+@dp.callback_query(F.data == "ws_example")
+async def cb_ws_example(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    text = WelcomeService.build_example()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📎 Отправить свой рецепт",
+                              callback_data="ws_send_hint")],
+        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ",
+                              web_app=WebAppInfo(url=FRONTEND_URL))],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ws_back")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+    await track(callback.from_user.id, "welcome_example_viewed")
+
+
+@dp.callback_query(F.data == "ws_send_hint")
+async def cb_ws_send_hint(callback: CallbackQuery):
+    await callback.answer(
+        "Отправьте фото, ссылку, текст или голосовое сообщение следующим сообщением 👇",
+        show_alert=True)
+
+
+@dp.callback_query(F.data == "ws_ai_functions")
+async def cb_ws_ai_functions(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        wallet = await WalletService.get_balance(db, uid)
+    total = wallet.get("total_available_points", 0)
+    text = WelcomeService.build_ai_functions(total)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Получить баллы бесплатно",
+                              callback_data="ws_get_points")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ws_back")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+    await track(uid, "welcome_ai_functions_viewed")
+
+
+@dp.callback_query(F.data == "ws_get_points")
+async def cb_ws_get_points(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    if not FEATURE_REFERRALS:
+        await callback.answer("Реферальная программа временно недоступна", show_alert=True)
+        return
+    async with pool.acquire() as db:
+        dashboard = await ReferralService.get_dashboard(db, uid)
+    stats = dashboard.get("stats", {})
+    wallet = dashboard.get("balance", {})
+    text = WelcomeService.build_get_points(
+        stats.get("invited", 0),
+        wallet.get("bonus_points", 0),
+        wallet.get("pending_bonus_points", 0))
+    link = dashboard.get("referral_url", "")
+    buttons = []
+    if link:
+        buttons.append([InlineKeyboardButton(text="📨 Пригласить друга",
+                                              url=f"https://t.me/share/url?url={urllib.parse.quote(link, safe='')}&text={urllib.parse.quote('🌿 Попробуй ПОЛЯНУ — планировщик застолий с друзьями!', safe='')}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="ws_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+    await track(uid, "welcome_get_points_viewed")
+
+
+@dp.callback_query(F.data == "ws_help")
+async def cb_ws_help(callback: CallbackQuery):
+    if not callback.message:
+        await callback.answer()
+        return
+    text = (
+        "📚 <b>Как пользоваться ПОЛЯНОЙ</b>\n\n"
+        "<b>Добавление рецептов:</b>\n"
+        "• 📸 Фото или скриншот рецепта\n"
+        "• 🔗 Ссылка на сайт с рецептом\n"
+        "• 📝 Текст рецепта\n"
+        "• 🎙 Голосовое сообщение\n"
+        "• /add — добавление вручную\n\n"
+        "<b>Библиотека:</b>\n"
+        "Откройте ПОЛЯНу кнопкой внизу → вкладка «Рецепты»\n\n"
+        "<b>Команды:</b>\n"
+        "/start — главное меню\n"
+        "/add — добавить рецепт\n"
+        "/ref — партнёрская программа\n"
+        "/documents — юридические документы\n"
+        "/privacy — данные и конфиденциальность\n"
+        "/help — эта справка"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ws_back")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ws_back")
+async def cb_ws_back(callback: CallbackQuery):
+    """Return to welcome/dashboard screen."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        usr = await UserService.get_user(db, user_id=uid)
+    if not usr:
+        await callback.answer()
+        return
+
+    if usr["onboarding_status"] not in ("completed", "skipped"):
+        # New user — show welcome
+        source = usr.get("acquisition_source") or "organic"
+        referrer_name = None
+        if source == "referral" and usr.get("referrer_user_id"):
+            async with pool.acquire() as db:
+                ref_user = await db.fetchrow(
+                    "SELECT first_name FROM users WHERE telegram_user_id=$1",
+                    usr["referrer_user_id"])
+                if ref_user:
+                    referrer_name = ref_user["first_name"]
+        if source == "referral" and referrer_name:
+            text = WelcomeService.build_referral_welcome(
+                callback.from_user.first_name, referrer_name, WELCOME_POINTS)
+        else:
+            text = WelcomeService.build_new_user_welcome(
+                callback.from_user.first_name, source, referrer_name, WELCOME_POINTS)
+        kb = _welcome_keyboard()
+    else:
+        # Returning user — compact dashboard
+        async with pool.acquire() as db:
+            recipes_count = await db.fetchval(
+                "SELECT COUNT(*) FROM recipes WHERE user_id=$1", uid) or 0
+            events_count = 0
+            if FEATURE_EVENTS:
+                events_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM events WHERE telegram_user_id=$1", uid) or 0
+            wallet = await WalletService.get_balance(db, uid)
+        total = wallet.get("total_available_points", 0)
+        text = WelcomeService.build_returning_user_dashboard(
+            callback.from_user.first_name, recipes_count, events_count, total, FEATURE_EVENTS)
+        kb = _returning_user_keyboard()
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -6102,30 +6587,117 @@ async def cmd_start(message: Message):
     async with pool.acquire() as db:
         usr = await UserService.get_user(db, user.id)
     if usr and usr["onboarding_status"] not in ("completed", "skipped"):
-        await _start_onboarding_for_user(message, user.id)
+        # New user — send rich welcome screen
+        referrer_name = None
+        if acquisition_source == "referral" and source_token:
+            async with pool.acquire() as db:
+                ref_uid = await db.fetchval(
+                    "SELECT user_id FROM referral_codes WHERE code=$1",
+                    source_token.replace("ref_", ""))
+                if ref_uid:
+                    ref_user = await db.fetchrow(
+                        "SELECT first_name FROM users WHERE telegram_user_id=$1", ref_uid)
+                    if ref_user:
+                        referrer_name = ref_user["first_name"]
+
+        if acquisition_source == "referral" and referrer_name:
+            text = WelcomeService.build_referral_welcome(
+                user.first_name, referrer_name, WELCOME_POINTS)
+        elif acquisition_source == "recipe_share":
+            # Try to get recipe title from pending action
+            recipe_title = "рецепт"
+            async with pool.acquire() as db:
+                pending = await db.fetchrow(
+                    "SELECT payload FROM pending_onboarding_actions "
+                    "WHERE user_id=$1 AND action_type='save_recipe' AND completed_at IS NULL "
+                    "ORDER BY created_at DESC LIMIT 1", user.id)
+                if pending and pending.get("payload"):
+                    try:
+                        payload = json.loads(pending["payload"]) if isinstance(pending["payload"], str) else pending["payload"]
+                        recipe_title = payload.get("name", "рецепт")
+                    except Exception:
+                        pass
+            text = WelcomeService.build_recipe_share_welcome(
+                user.first_name, "Друг", recipe_title)
+        else:
+            text = WelcomeService.build_new_user_welcome(
+                user.first_name, acquisition_source, referrer_name, WELCOME_POINTS)
+
+        kb = _welcome_keyboard() if FRONTEND_URL else None
+        await message.answer(text, reply_markup=kb)
+        # Mark welcome shown
+        async with pool.acquire() as db:
+            await UserService.update_onboarding_step(db, user.id, 0, "in_progress")
+        await track(user.id, "welcome_screen_viewed",
+                     props={"source": acquisition_source})
         return
 
-    # Existing user — normal welcome
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
+    # Returning user — compact dashboard
+    async with pool.acquire() as db:
+        recipes_count = await db.fetchval(
+            "SELECT COUNT(*) FROM recipes WHERE user_id=$1", user.id) or 0
+        events_count = 0
+        if FEATURE_EVENTS:
+            events_count = await db.fetchval(
+                "SELECT COUNT(*) FROM events WHERE telegram_user_id=$1", user.id) or 0
+        wallet = await WalletService.get_balance(db, user.id)
+    total_points = wallet.get("total_available_points", 0)
+
+    text = WelcomeService.build_returning_user_dashboard(
+        user.first_name, recipes_count, events_count, total_points, FEATURE_EVENTS)
+    kb = _returning_user_keyboard() if FRONTEND_URL else None
+    await message.answer(text, reply_markup=kb)
+
+
+def _welcome_keyboard():
+    """Keyboard for new user welcome screen."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ",
+                              web_app=WebAppInfo(url=FRONTEND_URL))],
         [
-            InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
-            InlineKeyboardButton(text="📄 Документы", callback_data="show_documents"),
+            InlineKeyboardButton(text="📎 Как добавить рецепт",
+                                  callback_data="ws_how_to_add"),
+            InlineKeyboardButton(text="🍲 Посмотреть пример",
+                                  callback_data="ws_example"),
         ],
-    ]) if FRONTEND_URL else None
-    await message.answer(
-        f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
-        f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-        f"<b>Как добавить рецепт в библиотеку:</b>\n"
-        f"• 🔗 Пришли ссылку на рецепт\n"
-        f"• 📸 Фото рецепта из книги или экрана\n"
-        f"• 🎙 Голосовое сообщение\n"
-        f"• 📝 Текст рецепта\n"
-        f"• /add — явный режим добавления\n\n"
-        f"💰 /ref — партнёрская · 📄 /documents — документы\n\n"
-        f"Откройте ПОЛЯНу кнопкой ниже 👇",
-        reply_markup=kb,
-    )
+        [
+            InlineKeyboardButton(text="✨ AI-функции и баланс",
+                                  callback_data="ws_ai_functions"),
+            InlineKeyboardButton(text="🎁 Получить баллы",
+                                  callback_data="ws_get_points"),
+        ],
+        [
+            InlineKeyboardButton(text="📄 Документы",
+                                  callback_data="show_documents"),
+            InlineKeyboardButton(text="❓ Как всё работает",
+                                  callback_data="ws_help"),
+        ],
+        [InlineKeyboardButton(text="📖 Показать, как пользоваться",
+                              callback_data="ob_start_tutorial")],
+        [InlineKeyboardButton(text="▶️ Начать сразу",
+                              callback_data="ob_start_skip_to_legal")],
+    ])
+
+
+def _returning_user_keyboard():
+    """Keyboard for returning user dashboard."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ",
+                              web_app=WebAppInfo(url=FRONTEND_URL))],
+        [
+            InlineKeyboardButton(text="📎 Добавить рецепт",
+                                  callback_data="ws_how_to_add"),
+            InlineKeyboardButton(text="✨ AI-баланс",
+                                  callback_data="ws_ai_functions"),
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Пригласить друзей",
+                                  callback_data="ws_get_points"),
+            InlineKeyboardButton(text="📄 Документы",
+                                  callback_data="show_documents"),
+        ],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="ws_help")],
+    ])
 
 
 @dp.callback_query(F.data == "show_ref")
