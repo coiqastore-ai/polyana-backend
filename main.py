@@ -36,10 +36,12 @@ try:
     SPLIT_AVAILABLE = True
 except ImportError:
     SPLIT_AVAILABLE = False
-    log.warning("split_module not found — split features disabled")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("polyana")
+
+if not SPLIT_AVAILABLE:
+    log.warning("split_module not found — split features disabled")
 
 ENV = os.environ.get
 BOT_TOKEN = ENV("BOT_TOKEN", "")
