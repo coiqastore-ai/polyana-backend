@@ -7715,7 +7715,26 @@ async def cb_show_ref(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "show_terms")
 async def cb_show_terms(callback: CallbackQuery):
-    await cmd_terms(callback.message)
+    """Redirect to documents menu — show_terms is legacy, prefer show_documents."""
+    if not callback.message:
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", callback_data="legal_doc:terms")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="legal_doc:privacy_policy")],
+        [InlineKeyboardButton(text="✅ Согласие на обработку данных", callback_data="legal_doc:personal_data_consent")],
+        [InlineKeyboardButton(text="🤖 Использование ИИ", callback_data="legal_doc:ai_processing_consent")],
+        [InlineKeyboardButton(text="🎁 Правила бонусной программы", callback_data="legal_doc:referral_terms")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="show_back")],
+    ])
+    try:
+        await callback.message.edit_text(
+            "📄 <b>Документы ПОЛЯНЫ</b>\n\n"
+            "Здесь можно ознакомиться с условиями использования сервиса, "
+            "обработкой данных и правилами бонусной программы.",
+            reply_markup=kb)
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -7791,25 +7810,49 @@ async def cb_legal_doc(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "show_back")
 async def cb_show_back(callback: CallbackQuery):
-    if not callback.from_user:
+    if not callback.from_user or pool is None:
         await callback.answer()
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
-        [
-            InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
-            InlineKeyboardButton(text="📄 Документы", callback_data="show_documents"),
-        ],
-    ]) if FRONTEND_URL else None
-    if callback.message:
-        try:
-            await callback.message.edit_text(
-                f"🌿 <b>Привет, {callback.from_user.first_name}!</b>\n\n"
-                f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-                f"Откройте ПОЛЯНу кнопкой ниже 👇",
-                reply_markup=kb)
-        except Exception:
-            pass
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        usr = await UserService.get_user(db, user_id=uid)
+    if not usr:
+        await callback.answer()
+        return
+
+    if usr["onboarding_status"] not in ("completed", "skipped"):
+        # New user — show welcome
+        source = usr.get("acquisition_source") or "organic"
+        referrer_name = None
+        if source == "referral" and usr.get("referrer_user_id"):
+            async with pool.acquire() as db:
+                ref_user = await db.fetchrow(
+                    "SELECT first_name FROM users WHERE telegram_user_id=$1",
+                    usr["referrer_user_id"])
+                if ref_user:
+                    referrer_name = ref_user["first_name"]
+        text = WelcomeService.build_new_user_welcome(
+            callback.from_user.first_name, source, referrer_name, WELCOME_POINTS)
+        kb = _welcome_keyboard()
+    else:
+        # Returning user — compact dashboard
+        async with pool.acquire() as db:
+            recipes_count = await db.fetchval(
+                "SELECT COUNT(*) FROM recipes WHERE user_id=$1", uid) or 0
+            events_count = 0
+            if FEATURE_EVENTS:
+                events_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM events WHERE telegram_user_id=$1", uid) or 0
+            wallet = await WalletService.get_balance(db, uid)
+        total = wallet.get("total_available_points", 0)
+        text = WelcomeService.build_returning_user_dashboard(
+            callback.from_user.first_name, recipes_count, events_count, total, FEATURE_EVENTS)
+        kb = _returning_user_keyboard()
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
     await callback.answer()
 
 
