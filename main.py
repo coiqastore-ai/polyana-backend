@@ -1,4 +1,4 @@
-import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib, string
+import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib, string, uuid
 import httpx
 import invite
 from datetime import datetime, timedelta, timezone
@@ -80,6 +80,26 @@ POINTS_PER_RUBLE = int(ENV("POINTS_PER_RUBLE", "1"))
 # Legacy aliases (for backward compat with existing code)
 REFERRAL_PERCENT = REFERRAL_REWARD_PERCENT_BP // 100  # 10
 REFERRAL_HOLD_HOURS = REFERRAL_HOLD_DAYS * 24
+
+# Legal document config
+LEGAL_OPERATOR_FULL_NAME = ENV("LEGAL_OPERATOR_FULL_NAME", "")
+LEGAL_OPERATOR_SHORT_NAME = ENV("LEGAL_OPERATOR_SHORT_NAME", "")
+LEGAL_OPERATOR_STATUS = ENV("LEGAL_OPERATOR_STATUS", "")  # ИП / ООО / Самозанятый
+LEGAL_INN = ENV("LEGAL_INN", "")
+LEGAL_OGRN_OR_OGRNIP = ENV("LEGAL_OGRN_OR_OGRNIP", "")
+LEGAL_LEGAL_ADDRESS = ENV("LEGAL_LEGAL_ADDRESS", "")
+LEGAL_CONTACT_EMAIL = ENV("LEGAL_CONTACT_EMAIL", "")
+LEGAL_PRIVACY_EMAIL = ENV("LEGAL_PRIVACY_EMAIL", "")
+LEGAL_SUPPORT_TELEGRAM = ENV("LEGAL_SUPPORT_TELEGRAM", "@chigra89")
+
+# Data retention config
+TEMP_FILE_RETENTION_HOURS = int(ENV("TEMP_FILE_RETENTION_HOURS", "24"))
+RAW_IMPORT_RETENTION_DAYS = int(ENV("RAW_IMPORT_RETENTION_DAYS", "30"))
+AI_LOG_RETENTION_DAYS = int(ENV("AI_LOG_RETENTION_DAYS", "90"))
+DELETED_ACCOUNT_RETENTION_DAYS = int(ENV("DELETED_ACCOUNT_RETENTION_DAYS", "30"))
+
+# Onboarding config
+ONBOARDING_VERSION = "1.0"
 
 
 # ── Wallet Service ────────────────────────────────────────────────────────────
@@ -756,6 +776,238 @@ def _anonymize_name(first_name: str | None, username: str | None) -> str:
         return f"{first_name[0]}{first_name[1:]}"
     return "Пользователь ПОЛЯНЫ"
 
+
+# ── User Service ──────────────────────────────────────────────────────────────
+
+class UserService:
+    """Manages user records — creation, onboarding state, first-value tracking."""
+
+    @staticmethod
+    async def get_or_create_user(db, telegram_user, acquisition_source="organic",
+                                  source_token=None, referrer_user_id=None) -> dict:
+        """Get existing user or create new one. Returns user dict."""
+        uid = telegram_user.id
+        row = await db.fetchrow("SELECT * FROM users WHERE telegram_user_id=$1", uid)
+        if row:
+            # Update profile fields on each /start
+            await db.execute(
+                "UPDATE users SET first_name=$2, last_name=$3, username=$4, "
+                "language_code=$5, updated_at=NOW() WHERE telegram_user_id=$1",
+                uid, telegram_user.first_name, telegram_user.last_name,
+                telegram_user.username, getattr(telegram_user, 'language_code', None),
+            )
+            return dict(row)
+        # New user
+        await db.execute(
+            "INSERT INTO users (telegram_user_id, first_name, last_name, username, "
+            "language_code, acquisition_source, acquisition_source_token, referrer_user_id, "
+            "onboarding_status, onboarding_version) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'not_started',$9)",
+            uid, telegram_user.first_name, telegram_user.last_name,
+            telegram_user.username, getattr(telegram_user, 'language_code', None),
+            acquisition_source, source_token, referrer_user_id, ONBOARDING_VERSION,
+        )
+        return dict(await db.fetchrow("SELECT * FROM users WHERE telegram_user_id=$1", uid))
+
+    @staticmethod
+    async def get_user(db, user_id: int):
+        return await db.fetchrow("SELECT * FROM users WHERE telegram_user_id=$1", user_id)
+
+    @staticmethod
+    async def update_onboarding_step(db, user_id: int, step: int, status: str = None):
+        if status:
+            await db.execute(
+                "UPDATE users SET onboarding_step=$2, onboarding_status=$3, updated_at=NOW() "
+                "WHERE telegram_user_id=$1", user_id, step, status)
+        else:
+            await db.execute(
+                "UPDATE users SET onboarding_step=$2, updated_at=NOW() "
+                "WHERE telegram_user_id=$1", user_id, step)
+
+    @staticmethod
+    async def complete_onboarding(db, user_id: int):
+        await db.execute(
+            "UPDATE users SET onboarding_status='completed', "
+            "onboarding_completed_at=NOW(), updated_at=NOW() "
+            "WHERE telegram_user_id=$1", user_id)
+
+    @staticmethod
+    async def set_first_value_action(db, user_id: int, action: str):
+        await db.execute(
+            "UPDATE users SET first_value_action=$2, first_value_at=NOW(), updated_at=NOW() "
+            "WHERE telegram_user_id=$1 AND first_value_action IS NULL",
+            user_id, action)
+
+    @staticmethod
+    async def delete_user(db, user_id: int):
+        """Anonymize user data. Financial records preserved in ledger."""
+        await db.execute(
+            "UPDATE users SET first_name='Удалён', last_name=NULL, username=NULL, "
+            "language_code=NULL, updated_at=NOW() WHERE telegram_user_id=$1", user_id)
+        # Anonymize recipes (keep them but remove owner association for non-financial)
+        # Delete personal data: events owned, shopping items, collaborators
+        await db.execute("DELETE FROM shopping_items WHERE event_id IN "
+                         "(SELECT id FROM events WHERE telegram_user_id=$1)", user_id)
+        await db.execute("DELETE FROM event_recipes WHERE event_id IN "
+                         "(SELECT id FROM events WHERE telegram_user_id=$1)", user_id)
+        await db.execute("DELETE FROM collaborators WHERE telegram_user_id=$1", user_id)
+        await db.execute("DELETE FROM events WHERE telegram_user_id=$1", user_id)
+        await db.execute("DELETE FROM recipes WHERE user_id=$1", user_id)
+        # Revoke all legal acceptances
+        await db.execute(
+            "UPDATE user_legal_acceptances SET revoked_at=NOW(), action='revoked' "
+            "WHERE user_id=$1 AND action='accepted'", user_id)
+
+
+# ── Legal Consent Service ────────────────────────────────────────────────────
+
+# In-memory cache for consent checks: {(user_id, doc_type): (has_consent, timestamp)}
+_consent_cache: dict[tuple[int, str], tuple[bool, float]] = {}
+_CONSENT_CACHE_TTL = 300  # 5 minutes
+
+
+class LegalConsentService:
+    """Manages legal document acceptances and consent gates."""
+
+    REQUIRED_TYPES = ("terms", "personal_data_consent")
+    AI_TYPE = "ai_processing_consent"
+    ALL_TYPES = ("terms", "privacy_policy", "personal_data_consent",
+                 "ai_processing_consent", "referral_terms")
+
+    @staticmethod
+    async def get_active_document(db, document_type: str):
+        """Get the currently active document of a given type."""
+        return await db.fetchrow(
+            "SELECT * FROM legal_documents WHERE document_type=$1 AND is_active=TRUE "
+            "ORDER BY published_at DESC LIMIT 1", document_type)
+
+    @staticmethod
+    async def get_user_acceptance_status(db, user_id: int) -> dict:
+        """Return {doc_type: {accepted, revoked, version, accepted_at}} for all types."""
+        rows = await db.fetch(
+            "SELECT la.document_type, la.document_version, la.action, la.accepted_at, "
+            "la.revoked_at, ld.content_hash "
+            "FROM user_legal_acceptances la "
+            "JOIN legal_documents ld ON ld.id = la.document_id "
+            "WHERE la.user_id=$1 ORDER BY la.accepted_at DESC", user_id)
+        result = {}
+        for r in rows:
+            dt = r["document_type"]
+            if dt not in result:
+                result[dt] = {
+                    "accepted": False, "revoked": False,
+                    "version": None, "accepted_at": None, "content_hash": None,
+                }
+            if r["action"] == "accepted" and not result[dt]["accepted"]:
+                result[dt]["accepted"] = True
+                result[dt]["version"] = r["document_version"]
+                result[dt]["accepted_at"] = r["accepted_at"]
+                result[dt]["content_hash"] = r["content_hash"]
+            if r["action"] == "revoked":
+                result[dt]["revoked"] = True
+                result[dt]["accepted"] = False
+        return result
+
+    @staticmethod
+    async def has_current_acceptance(db, user_id: int, document_type: str) -> bool:
+        """Check if user has an active (accepted, not revoked) acceptance for a document type."""
+        cache_key = (user_id, document_type)
+        cached = _consent_cache.get(cache_key)
+        if cached and (time.time() - cached[1]) < _CONSENT_CACHE_TTL:
+            return cached[0]
+
+        row = await db.fetchrow(
+            "SELECT la.id FROM user_legal_acceptances la "
+            "JOIN legal_documents ld ON ld.id = la.document_id "
+            "WHERE la.user_id=$1 AND la.document_type=$2 AND la.action='accepted' "
+            "AND la.revoked_at IS NULL "
+            "AND ld.is_active=TRUE "
+            "ORDER BY la.accepted_at DESC LIMIT 1", user_id, document_type)
+        has_it = row is not None
+        _consent_cache[cache_key] = (has_it, time.time())
+        return has_it
+
+    @staticmethod
+    async def accept_document(db, user_id: int, document_type: str, version: str,
+                               context: dict = None) -> dict:
+        """Accept a specific document version. Idempotent. Returns acceptance record."""
+        import hashlib
+        doc = await db.fetchrow(
+            "SELECT * FROM legal_documents WHERE document_type=$1 AND version=$2 AND is_active=TRUE",
+            document_type, version)
+        if not doc:
+            raise ValueError(f"Document {document_type} v{version} not found or not active")
+
+        # Check for existing acceptance of this document
+        existing = await db.fetchrow(
+            "SELECT id FROM user_legal_acceptances "
+            "WHERE user_id=$1 AND document_id=$2 AND action='accepted' AND revoked_at IS NULL",
+            user_id, doc["id"])
+        if existing:
+            return {"id": str(existing["id"]), "already_accepted": True}
+
+        now = datetime.now(timezone.utc)
+        acceptance_id = str(uuid.uuid4())
+        source = (context or {}).get("source", "telegram_bot")
+        msg_id = (context or {}).get("message_id")
+        chat_id = (context or {}).get("chat_id")
+        session_id = (context or {}).get("session_id")
+
+        await db.execute(
+            "INSERT INTO user_legal_acceptances "
+            "(id, user_id, document_id, document_type, document_version, content_hash, "
+            "action, source, telegram_message_id, telegram_chat_id, mini_app_session_id, accepted_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,'accepted',$7,$8,$9,$10,$11)",
+            uuid.UUID(acceptance_id), user_id, doc["id"], document_type, version,
+            doc["content_hash"], source, msg_id, chat_id, session_id, now)
+
+        # Invalidate cache
+        _consent_cache.pop((user_id, document_type), None)
+
+        # Track analytics
+        event_name = {
+            "terms": "terms_accepted",
+            "personal_data_consent": "personal_data_consent_accepted",
+            "ai_processing_consent": "ai_consent_accepted",
+        }.get(document_type, "legal_document_accepted")
+        asyncio.create_task(track(user_id, event_name, {
+            "document_type": document_type, "document_version": version,
+        }))
+
+        return {"id": acceptance_id, "already_accepted": False}
+
+    @staticmethod
+    async def revoke_document(db, user_id: int, document_type: str,
+                               context: dict = None) -> dict:
+        """Revoke acceptance for a document type."""
+        now = datetime.now(timezone.utc)
+        result = await db.execute(
+            "UPDATE user_legal_acceptances SET revoked_at=$2, action='revoked' "
+            "WHERE user_id=$1 AND document_type=$3 AND action='accepted' AND revoked_at IS NULL",
+            user_id, now, document_type)
+        _consent_cache.pop((user_id, document_type), None)
+
+        asyncio.create_task(track(user_id, "consent_revoked", {
+            "document_type": document_type,
+        }))
+        return {"revoked": True}
+
+    @staticmethod
+    async def require_basic_access(db, user_id: int) -> bool:
+        """Check basic consent. Raises ValueError if not accepted."""
+        for dt in LegalConsentService.REQUIRED_TYPES:
+            if not await LegalConsentService.has_current_acceptance(db, user_id, dt):
+                raise ValueError(f"consent_required:{dt}")
+        return True
+
+    @staticmethod
+    async def require_ai_access(db, user_id: int) -> bool:
+        """Check AI consent. Raises ValueError if not accepted."""
+        if not await LegalConsentService.has_current_acceptance(db, user_id, LegalConsentService.AI_TYPE):
+            raise ValueError(f"consent_required:{LegalConsentService.AI_TYPE}")
+        return True
+
+
 pool = None
 _db_ready = False
 _db_error: str | None = None
@@ -1349,6 +1601,78 @@ async def init_db():
                 saved_at          TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(share_id, recipient_user_id)
             );
+
+            -- ── Migration R: Users table ─────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_user_id    BIGINT PRIMARY KEY,
+                first_name          TEXT,
+                last_name           TEXT,
+                username            TEXT,
+                language_code       TEXT,
+                onboarding_status   VARCHAR(32) DEFAULT 'not_started',
+                onboarding_step     INT DEFAULT 0,
+                onboarding_version  VARCHAR(16),
+                onboarding_completed_at TIMESTAMPTZ,
+                first_value_action  VARCHAR(32),
+                first_value_at      TIMESTAMPTZ,
+                acquisition_source  VARCHAR(32) DEFAULT 'organic',
+                acquisition_source_token TEXT,
+                referrer_user_id    BIGINT,
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_onboarding ON users(onboarding_status);
+
+            -- ── Migration S: Legal documents ─────────────────────────────────
+            CREATE TABLE IF NOT EXISTS legal_documents (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                document_type       VARCHAR(64) NOT NULL,
+                version             VARCHAR(32) NOT NULL,
+                title               TEXT NOT NULL,
+                content             TEXT NOT NULL,
+                content_hash        VARCHAR(128) NOT NULL,
+                changelog           TEXT,
+                published_at        TIMESTAMPTZ NOT NULL,
+                effective_from      TIMESTAMPTZ NOT NULL,
+                is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+                requires_acceptance BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(document_type, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_legal_docs_type_active ON legal_documents(document_type, is_active);
+
+            -- ── Migration T: User legal acceptances ──────────────────────────
+            CREATE TABLE IF NOT EXISTS user_legal_acceptances (
+                id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id               BIGINT NOT NULL REFERENCES users(telegram_user_id),
+                document_id           UUID NOT NULL REFERENCES legal_documents(id),
+                document_type         VARCHAR(64) NOT NULL,
+                document_version      VARCHAR(32) NOT NULL,
+                content_hash          VARCHAR(128) NOT NULL,
+                action                VARCHAR(32) NOT NULL DEFAULT 'accepted',
+                source                VARCHAR(32) NOT NULL DEFAULT 'telegram_bot',
+                telegram_message_id   BIGINT,
+                telegram_chat_id      BIGINT,
+                mini_app_session_id   UUID,
+                accepted_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                revoked_at            TIMESTAMPTZ,
+                metadata              JSONB,
+                UNIQUE(user_id, document_id, action)
+            );
+            CREATE INDEX IF NOT EXISTS idx_acceptances_user ON user_legal_acceptances(user_id);
+
+            -- ── Migration U: Pending onboarding actions ──────────────────────
+            CREATE TABLE IF NOT EXISTS pending_onboarding_actions (
+                id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id       BIGINT NOT NULL REFERENCES users(telegram_user_id),
+                action_type   VARCHAR(32) NOT NULL,
+                token_hash    VARCHAR(128),
+                payload       JSONB,
+                expires_at    TIMESTAMPTZ NOT NULL,
+                completed_at  TIMESTAMPTZ,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_actions_user ON pending_onboarding_actions(user_id, completed_at);
         """)
 
         # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
@@ -1362,6 +1686,63 @@ async def init_db():
                 "UPDATE events SET share_token=$1 WHERE id=$2",
                 secrets.token_urlsafe(16), row["id"]
             )
+
+        # ── Backfill users from existing data ────────────────────────────────
+        await c.execute("""
+            INSERT INTO users (telegram_user_id, first_name, username, onboarding_status)
+            SELECT DISTINCT ON (r.user_id) r.user_id, NULL, NULL, 'completed'
+            FROM recipes r
+            WHERE r.user_id > 0
+            ON CONFLICT (telegram_user_id) DO NOTHING
+        """)
+        await c.execute("""
+            INSERT INTO users (telegram_user_id, first_name, username, onboarding_status)
+            SELECT DISTINCT ON (w.user_id) w.user_id, NULL, NULL, 'completed'
+            FROM wallets w
+            ON CONFLICT (telegram_user_id) DO NOTHING
+        """)
+        await c.execute("""
+            INSERT INTO users (telegram_user_id, first_name, username, onboarding_status)
+            SELECT DISTINCT ON (c.telegram_user_id) c.telegram_user_id, c.first_name, c.username, 'completed'
+            FROM collaborators c
+            ON CONFLICT (telegram_user_id) DO NOTHING
+        """)
+
+        # ── Seed legal documents ─────────────────────────────────────────────
+        import legal_docs
+        missing = legal_docs.check_legal_config()
+        if missing:
+            log.warning("Legal document configuration is incomplete. Missing: %s. "
+                        "Documents will use placeholder values.", ", ".join(missing))
+
+        for doc_type, doc_title in legal_docs.DOCUMENT_TYPES.items():
+            existing = await c.fetchrow(
+                "SELECT id FROM legal_documents WHERE document_type=$1 AND is_active=TRUE",
+                doc_type,
+            )
+            if existing:
+                continue
+            render_fn = {
+                "terms": legal_docs.render_terms,
+                "privacy_policy": legal_docs.render_privacy_policy,
+                "personal_data_consent": legal_docs.render_personal_data_consent,
+                "ai_processing_consent": legal_docs.render_ai_consent,
+                "referral_terms": legal_docs.render_referral_terms,
+            }.get(doc_type)
+            if not render_fn:
+                continue
+            content = render_fn("1.0")
+            c_hash = legal_docs.content_hash(content)
+            now = datetime.now(timezone.utc)
+            await c.execute(
+                "INSERT INTO legal_documents "
+                "(document_type, version, title, content, content_hash, published_at, "
+                "effective_from, is_active, requires_acceptance) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)",
+                doc_type, "1.0", doc_title, content, c_hash, now, now,
+                legal_docs.REQUIRES_ACCEPTANCE.get(doc_type, False),
+            )
+        log.info("Legal documents seeded ✓")
 
     _db_ready = True
     log.info("DB ready ✓  (recipes-as-library schema v3)")
@@ -1731,6 +2112,13 @@ async def parse_and_save_recipe(
     audio_bytes: bytes | None = None,
 ) -> dict:
     """Full pipeline: detect type → LLM parse → save to DB. Returns saved recipe dict."""
+    # AI consent check — must have consent before sending to OpenRouter
+    if pool is not None:
+        try:
+            async with pool.acquire() as db:
+                await LegalConsentService.require_ai_access(db, user_id)
+        except ValueError:
+            raise ValueError("ai_consent_required")
     parsed: dict | None = None
 
     if url:
@@ -2680,6 +3068,12 @@ async def update_recipe(
 async def normalize_recipe_ingredients(
     recipe_id: int, user_id: int = Depends(get_current_user), db=Depends(get_db)
 ):
+    # AI consent check
+    try:
+        await LegalConsentService.require_ai_access(db, user_id)
+    except ValueError:
+        raise HTTPException(403, "ai_consent_required")
+
     rec = await db.fetchrow("SELECT user_id FROM recipes WHERE id=$1", recipe_id)
     if not rec:
         raise HTTPException(404, "Recipe not found")
@@ -3916,11 +4310,578 @@ async def send_invite_to_chat(
     return {"ok": True}
 
 
+# ── Legal Documents API ───────────────────────────────────────────────────────
+
+@app.get("/api/legal/documents")
+async def list_legal_documents(user_id: int = Depends(get_current_user)):
+    """List all active legal documents."""
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            "SELECT document_type, version, title, published_at, requires_acceptance "
+            "FROM legal_documents WHERE is_active=TRUE ORDER BY document_type")
+    return [{"type": r["document_type"], "version": r["version"],
+             "title": r["title"], "published_at": r["published_at"].isoformat(),
+             "requires_acceptance": r["requires_acceptance"]} for r in rows]
+
+
+@app.get("/api/legal/documents/{document_type}")
+async def get_legal_document(document_type: str, user_id: int = Depends(get_current_user)):
+    """Get a specific legal document."""
+    import legal_docs
+    if document_type not in legal_docs.DOCUMENT_TYPES:
+        raise HTTPException(404, "Document type not found")
+    async with pool.acquire() as db:
+        doc = await LegalConsentService.get_active_document(db, document_type)
+    if not doc:
+        raise HTTPException(404, "No active document")
+    return {
+        "type": doc["document_type"], "version": doc["version"],
+        "title": doc["title"], "content": doc["content"],
+        "content_hash": doc["content_hash"],
+        "published_at": doc["published_at"].isoformat(),
+        "requires_acceptance": doc["requires_acceptance"],
+    }
+
+
+@app.get("/api/legal/status")
+async def get_legal_status(user_id: int = Depends(get_current_user)):
+    """Get user's legal acceptance status."""
+    async with pool.acquire() as db:
+        status = await LegalConsentService.get_user_acceptance_status(db, user_id)
+    return status
+
+
+@app.post("/api/legal/accept")
+async def accept_legal_document(body: dict, user_id: int = Depends(get_current_user)):
+    """Accept a legal document."""
+    doc_type = body.get("document_type", "")
+    version = body.get("document_version", "1.0")
+    if not doc_type:
+        raise HTTPException(400, "document_type required")
+    import legal_docs
+    if doc_type not in legal_docs.DOCUMENT_TYPES:
+        raise HTTPException(400, "Invalid document type")
+    try:
+        async with pool.acquire() as db:
+            result = await LegalConsentService.accept_document(
+                db, user_id, doc_type, version,
+                {"source": "mini_app", "session_id": body.get("session_id")})
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/legal/revoke")
+async def revoke_legal_document(body: dict, user_id: int = Depends(get_current_user)):
+    """Revoke legal consent."""
+    doc_type = body.get("document_type", "")
+    if not doc_type:
+        raise HTTPException(400, "document_type required")
+    async with pool.acquire() as db:
+        result = await LegalConsentService.revoke_document(db, user_id, doc_type)
+    return result
+
+
+# ── Onboarding API ────────────────────────────────────────────────────────────
+
+@app.get("/api/onboarding/status")
+async def get_onboarding_status(user_id: int = Depends(get_current_user)):
+    """Get onboarding status."""
+    async with pool.acquire() as db:
+        user = await UserService.get_user(db, user_id)
+    if not user:
+        return {"status": "not_started", "step": 0}
+    return {
+        "status": user["onboarding_status"],
+        "step": user["onboarding_step"],
+        "version": user["onboarding_version"],
+        "completed_at": user["onboarding_completed_at"].isoformat() if user["onboarding_completed_at"] else None,
+    }
+
+
+@app.post("/api/onboarding/step")
+async def advance_onboarding_step(body: dict, user_id: int = Depends(get_current_user)):
+    """Advance onboarding to next step."""
+    step = body.get("step", 0)
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, user_id, step, "in_progress")
+    return {"ok": True, "step": step}
+
+
+@app.post("/api/onboarding/skip")
+async def skip_onboarding(user_id: int = Depends(get_current_user)):
+    """Skip onboarding."""
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, user_id, 0, "skipped")
+        await UserService.complete_onboarding(db, user_id)
+    return {"ok": True}
+
+
+# ── Account API ───────────────────────────────────────────────────────────────
+
+@app.post("/api/account/delete-request")
+async def request_account_deletion(user_id: int = Depends(get_current_user)):
+    """Request account deletion (requires confirmation)."""
+    await asyncio.create_task(track(user_id, "account_deletion_requested"))
+    return {"ok": True, "message": "Use /delete_me in bot for full deletion flow"}
+
+
+@app.post("/api/account/export")
+async def export_account_data(user_id: int = Depends(get_current_user)):
+    """Export user data (GDPR/152-ФЗ compliance)."""
+    async with pool.acquire() as db:
+        user = await UserService.get_user(db, user_id)
+        recipes = await db.fetch("SELECT name, emoji, category, servings, cook_time_minutes "
+                                 "FROM recipes WHERE user_id=$1", user_id)
+        events = await db.fetch("SELECT name, event_date, location FROM events WHERE telegram_user_id=$1",
+                                user_id)
+        status = await LegalConsentService.get_user_acceptance_status(db, user_id)
+    return {
+        "user": {
+            "first_name": user["first_name"] if user else None,
+            "username": user["username"] if user else None,
+            "created_at": user["created_at"].isoformat() if user else None,
+            "acquisition_source": user["acquisition_source"] if user else None,
+        },
+        "recipes_count": len(recipes),
+        "events_count": len(events),
+        "legal_status": status,
+    }
+
+
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 # FSM states for voice recipe editing flow
 class VoiceStates(StatesGroup):
     editing = State()   # User is typing a corrected transcript
+
+
+# FSM states for onboarding flow
+class OnboardingStates(StatesGroup):
+    welcome = State()       # Screen 1: welcome
+    how_to_save = State()   # Screen 2: how to save recipes
+    library = State()       # Screen 3: library features
+    planning = State()      # Screen 4: events & shopping
+    free_vs_ai = State()    # Screen 5: free vs AI
+    legal_pending = State() # Legal acceptance screen
+    completed = State()     # Final screen
+
+
+# FSM states for account deletion flow
+class DeleteStates(StatesGroup):
+    confirm1 = State()  # First confirmation
+    confirm2 = State()  # Second confirmation ("Удалить навсегда")
+
+
+# FSM states for AI consent flow
+class AiConsentStates(StatesGroup):
+    pending = State()  # Waiting for AI consent decision
+
+
+# ── Consent Middleware ────────────────────────────────────────────────────────
+
+# Handlers that do NOT require any consent
+_PUBLIC_CALLBACKS = {
+    "show_terms", "show_ref", "show_documents",
+}
+_PUBLIC_COMMANDS = {"start", "terms", "privacy", "documents", "help", "delete_me"}
+
+# Callbacks that require basic consent
+_BASIC_CALLBACKS = set()  # filled dynamically for most menu actions
+
+# Handlers that require AI consent
+_AI_HANDLERS = set()  # checked at runtime
+
+
+class LegalConsentMiddleware:
+    """aiogram outer middleware that checks legal consent before handler execution."""
+
+    async def __call__(self, handler, event, data):
+        user_id = None
+        if hasattr(event, 'from_user') and event.from_user:
+            user_id = event.from_user.id
+        if not user_id or pool is None:
+            return await handler(event, data)
+
+        # Determine handler name
+        handler_name = ""
+        if hasattr(event, 'text') and event.text:
+            if event.text.startswith("/"):
+                handler_name = event.text.split()[0].lstrip("/").split("@")[0]
+        if hasattr(event, 'data') and event.data:
+            handler_name = event.data.split(":")[0] if ":" in event.data else event.data
+
+        # Public handlers — always allowed
+        if handler_name in _PUBLIC_COMMANDS or handler_name in _PUBLIC_CALLBACKS:
+            return await handler(event, data)
+
+        # Onboarding handlers — always allowed
+        if handler_name.startswith("ob_"):
+            return await handler(event, data)
+
+        # Delete account handlers — always allowed
+        if handler_name.startswith("del_"):
+            return await handler(event, data)
+
+        # Legal document view — always allowed
+        if handler_name.startswith("legal_doc"):
+            return await handler(event, data)
+
+        # Check if user exists and onboarding is completed
+        async with pool.acquire() as db:
+            user = await UserService.get_user(db, user_id)
+            if not user:
+                return await handler(event, data)
+            if user["onboarding_status"] not in ("completed", "skipped"):
+                # User hasn't finished onboarding — route to onboarding
+                # But only for non-onboarding handlers
+                if not handler_name.startswith("ob_"):
+                    await _start_onboarding_for_user(event, user_id)
+                    return
+
+            # Check basic consent for sensitive actions
+            try:
+                await LegalConsentService.require_basic_access(db, user_id)
+            except ValueError:
+                # Show consent prompt
+                await _show_consent_prompt(event, user_id, "basic")
+                return
+
+        return await handler(event, data)
+
+
+async def _start_onboarding_for_user(event, user_id: int):
+    """Send the first onboarding screen to a user who hasn't completed onboarding."""
+    async with pool.acquire() as db:
+        user = await UserService.get_user(db, user_id)
+    if not user:
+        return
+    step = user["onboarding_step"] or 0
+    source = user["acquisition_source"] or "organic"
+    referrer_name = None
+    if source == "referral" and user.get("referrer_user_id"):
+        async with pool.acquire() as db:
+            ref_user = await db.fetchrow(
+                "SELECT first_name FROM users WHERE telegram_user_id=$1",
+                user["referrer_user_id"])
+        if ref_user:
+            referrer_name = ref_user["first_name"]
+
+    await _send_onboarding_step(event, user_id, step, source, referrer_name)
+
+
+async def _show_consent_prompt(event, user_id: int, consent_type: str):
+    """Show consent acceptance prompt."""
+    if consent_type == "basic":
+        text = (
+            "Чтобы пользоваться ПОЛЯНОЙ, ознакомьтесь с документами.\n\n"
+            "Необходимо принять:\n"
+            "• Пользовательское соглашение\n"
+            "• Согласие на обработку персональных данных"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Открыть документы", callback_data="show_documents")],
+            [InlineKeyboardButton(text="✅ Принять соглашение", callback_data="ob_accept:terms")],
+            [InlineKeyboardButton(text="✅ Дать согласие на данные", callback_data="ob_accept:personal_data_consent")],
+        ])
+    else:
+        return
+
+    if hasattr(event, 'message') and event.message:
+        await event.message.answer(text, reply_markup=kb)
+    elif hasattr(event, 'text'):
+        await event.answer(text, reply_markup=kb)
+
+
+# Onboarding screen texts
+_ONBOARDING_SCREENS = [
+    # Screen 0: Welcome
+    {
+        "text": (
+            "🌿 <b>Добро пожаловать в ПОЛЯНУ</b>\n\n"
+            "Это ваша личная библиотека рецептов прямо в Telegram.\n\n"
+            "Отправьте боту рецепт — ПОЛЯНА аккуратно сохранит его, "
+            "чтобы он больше не потерялся."
+        ),
+        "buttons": [["👋 Понятно, дальше"]],
+        "skip": True,
+    },
+    # Screen 1: How to save
+    {
+        "text": (
+            "📥 <b>Сохраняйте рецепты откуда угодно</b>\n\n"
+            "Можно отправить:\n"
+            "📷 фото или скриншот\n"
+            "🔗 ссылку на сайт\n"
+            "📝 обычный текст\n"
+            "🎙 голосовое сообщение\n"
+            "📩 пересланное сообщение\n\n"
+            "Бот распознает рецепт и добавит его в библиотеку."
+        ),
+        "buttons": [["Дальше"]],
+        "skip": True,
+    },
+    # Screen 2: Library
+    {
+        "text": (
+            "📚 <b>Всё хранится в одном месте</b>\n\n"
+            "В библиотеке можно:\n"
+            "— искать рецепты\n"
+            "— редактировать\n"
+            "— менять количество порций\n"
+            "— добавлять в избранное\n"
+            "— делиться с друзьями\n"
+            "— сохранять рецепты друзей"
+        ),
+        "buttons": [["Дальше"]],
+        "skip": True,
+    },
+    # Screen 3: Planning
+    {
+        "text": (
+            "🍽 <b>Планируйте ужины и встречи</b>\n\n"
+            "Из сохранённых рецептов можно собрать меню, "
+            "пересчитать ингредиенты и получить единый список покупок.\n\n"
+            "Для совместных событий можно распределить покупки "
+            "и посчитать расходы."
+        ),
+        "buttons": [["Дальше"]],
+        "skip": True,
+    },
+    # Screen 4: Free vs AI
+    {
+        "text": (
+            "✨ <b>Бесплатные функции и ИИ</b>\n\n"
+            "Бесплатно:\n"
+            "— библиотека\n"
+            "— поиск\n"
+            "— ручное редактирование\n"
+            "— обмен рецептами\n"
+            "— события\n"
+            "— списки покупок\n"
+            "— расчёт расходов\n\n"
+            "AI-баллы используются только там, где работает ИИ: "
+            "распознавание фото и голоса, генерация рецептов, "
+            "создание изображений и умные рекомендации."
+        ),
+        "buttons": [["Продолжить"]],
+        "skip": False,
+    },
+    # Screen 5: Legal pending
+    {
+        "text": (
+            "📋 <b>Документы</b>\n\n"
+            "Чтобы пользоваться ПОЛЯНОЙ, ознакомьтесь с документами.\n\n"
+            "{status_text}"
+        ),
+        "buttons": [],  # dynamic
+        "skip": False,
+    },
+    # Screen 6: Completed
+    {
+        "text": (
+            "Всё готово 🌿\n\n"
+            "Отправьте сюда первый рецепт или откройте библиотеку."
+        ),
+        "buttons": [
+            ["📷 Отправить рецепт"],
+            ["📚 Открыть библиотеку"],
+        ],
+        "skip": False,
+    },
+]
+
+
+async def _send_onboarding_step(event, user_id: int, step: int,
+                                 source: str = "organic", referrer_name: str = None):
+    """Send or edit onboarding screen."""
+    if step >= len(_ONBOARDING_SCREENS):
+        step = 0
+
+    screen = _ONBOARDING_SCREENS[step]
+    text = screen["text"]
+
+    # Referral variant for welcome screen
+    if step == 0 and source == "referral" and referrer_name:
+        text = (
+            f"🌿 <b>{referrer_name} пригласил вас в ПОЛЯНУ</b>\n\n"
+            "Здесь можно сохранять рецепты из фотографий, ссылок, "
+            "текста и голосовых сообщений.\n\n"
+            "Рецепты будут храниться в вашей личной библиотеке "
+            "прямо в Telegram."
+        )
+
+    # Legal pending screen — show acceptance status
+    if step == 5:
+        async with pool.acquire() as db:
+            status = await LegalConsentService.get_user_acceptance_status(db, user_id)
+        terms_ok = "✅" if status.get("terms", {}).get("accepted") else "⬜"
+        pdn_ok = "✅" if status.get("personal_data_consent", {}).get("accepted") else "⬜"
+        status_text = f"{terms_ok} Пользовательское соглашение\n{pdn_ok} Обработка персональных данных"
+        text = text.replace("{status_text}", status_text)
+
+    # Build keyboard
+    buttons = []
+    if step == 5:
+        # Legal screen — dynamic buttons
+        async with pool.acquire() as db:
+            status = await LegalConsentService.get_user_acceptance_status(db, user_id)
+        if not status.get("terms", {}).get("accepted"):
+            buttons.append([InlineKeyboardButton(text="✅ Принять соглашение",
+                                                  callback_data="ob_accept:terms")])
+        if not status.get("personal_data_consent", {}).get("accepted"):
+            buttons.append([InlineKeyboardButton(text="✅ Дать согласие на данные",
+                                                  callback_data="ob_accept:personal_data_consent")])
+        buttons.append([InlineKeyboardButton(text="📋 Открыть документы",
+                                              callback_data="show_documents")])
+        # Check if both accepted
+        all_ok = (status.get("terms", {}).get("accepted") and
+                  status.get("personal_data_consent", {}).get("accepted"))
+        if all_ok:
+            buttons.append([InlineKeyboardButton(text="Продолжить",
+                                                  callback_data="ob_next:5")])
+    elif step == 6:
+        # Completed screen
+        buttons.append([InlineKeyboardButton(text="📷 Отправить рецепт",
+                                              callback_data="ob_action:send_recipe")])
+        buttons.append([InlineKeyboardButton(text="📚 Открыть библиотеку",
+                                              callback_data="ob_action:open_library")])
+    else:
+        # Navigation buttons
+        nav_row = []
+        if step > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"ob_back:{step}"))
+        nav_row.append(InlineKeyboardButton(text=screen["buttons"][0][0],
+                                             callback_data=f"ob_next:{step}"))
+        buttons.append(nav_row)
+        if screen.get("skip") and step < 5:
+            buttons.append([InlineKeyboardButton(text="Пропустить знакомство",
+                                                  callback_data="ob_skip")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    # Send or edit
+    if hasattr(event, 'message') and event.message and hasattr(event.message, 'edit_text'):
+        try:
+            await event.message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    if hasattr(event, 'message') and event.message:
+        await event.message.answer(text, reply_markup=kb)
+    elif hasattr(event, 'text'):
+        await event.answer(text, reply_markup=kb)
+
+
+# ── Onboarding Callback Handlers ─────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("ob_next:"))
+async def cb_ob_next(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    step = int(callback.data.split(":")[1]) + 1
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, uid, step)
+    source = "organic"
+    referrer_name = None
+    async with pool.acquire() as db:
+        user = await UserService.get_user(db, uid)
+        if user:
+            source = user.get("acquisition_source") or "organic"
+    # If completing onboarding (step >= len screens - 1 means going to final)
+    if step >= len(_ONBOARDING_SCREENS) - 1:
+        # Don't complete yet — user needs to take action on final screen
+        pass
+    await _send_onboarding_step(callback, uid, step, source, referrer_name)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ob_back:"))
+async def cb_ob_back(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    step = max(0, int(callback.data.split(":")[1]) - 1)
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, uid, step)
+        user = await UserService.get_user(db, uid)
+    source = user.get("acquisition_source") or "organic" if user else "organic"
+    await _send_onboarding_step(callback, uid, step, source)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ob_skip")
+async def cb_ob_skip(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    # Skip to legal pending
+    async with pool.acquire() as db:
+        await UserService.update_onboarding_step(db, uid, 5, "legal_pending")
+    await _send_onboarding_step(callback, uid, 5)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ob_accept:"))
+async def cb_ob_accept(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    doc_type = callback.data.split(":")[1]
+    uid = callback.from_user.id
+    try:
+        async with pool.acquire() as db:
+            await LegalConsentService.accept_document(db, uid, doc_type, "1.0", {
+                "source": "telegram_bot",
+                "message_id": callback.message.message_id if callback.message else None,
+                "chat_id": callback.message.chat.id if callback.message else None,
+            })
+            # Update onboarding step to legal_pending to refresh screen
+            await UserService.update_onboarding_step(db, uid, 5)
+        await _send_onboarding_step(callback, uid, 5)
+    except Exception as e:
+        log.exception("consent accept failed: %s", e)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ob_action:"))
+async def cb_ob_action(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    action = callback.data.split(":")[1]
+    uid = callback.from_user.id
+    # Complete onboarding
+    async with pool.acquire() as db:
+        await UserService.complete_onboarding(db, uid)
+    await callback.answer("✅")
+    if action == "send_recipe":
+        await callback.message.answer(
+            "Отправьте мне рецепт — фото, ссылку, текст или голосовое сообщение.\n\n"
+            "Пример: просто напишите название блюда и список ингредиентов.")
+    elif action == "open_library":
+        FR = FRONTEND_URL or ""
+        if FR:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📚 Открыть библиотеку",
+                                      web_app=WebAppInfo(url=FR))
+            ]])
+            await callback.message.answer("Откройте библиотеку в мини-приложении 👇", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "onboarding_cancel")
+async def cb_onboarding_cancel(callback: CallbackQuery):
+    if callback.message:
+        try:
+            await callback.message.edit_text("❌ Отменено.", reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer()
+
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -3935,7 +4896,19 @@ _TEXT_DEBOUNCE_SEC = 3.5
 
 async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецепт"):
     msg = str(err)
-    if isinstance(err, ValueError):
+    if "ai_consent_required" in msg:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Разрешить и продолжить", callback_data="ob_accept:ai_processing_consent")],
+            [InlineKeyboardButton(text="📋 Подробнее", callback_data="legal_doc:ai_processing_consent")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="onboarding_cancel")],
+        ])
+        await status_msg.edit_text(
+            "🤖 <b>Для этой функции используется внешний ИИ.</b>\n\n"
+            "В ИИ будет передано содержимое рецепта, изображения "
+            "или голосового сообщения без вашего Telegram ID.\n\n"
+            "Подробнее: /documents",
+            reply_markup=kb)
+    elif isinstance(err, ValueError):
         await status_msg.edit_text(f"🤷 {msg}")
     elif "not_a_recipe" in msg or "Не удалось распознать" in msg:
         await status_msg.edit_text(f"🤷 Не смог найти {hint} в этом контенте.\nПришли ссылку или команду /add")
@@ -4912,14 +5885,48 @@ async def cb_split_done(callback: CallbackQuery, db=Depends(get_db)):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    if not message.from_user:
+    if not message.from_user or pool is None:
         return
     user = message.from_user
     text = message.text or ""
     arg = text.split(maxsplit=1)[1] if " " in text else None
 
-    # Deep link: save_recipe_{id} — save a shared recipe to user's library
-    if arg and arg.startswith("save_recipe_") and pool is not None:
+    # Determine acquisition source
+    acquisition_source = "organic"
+    source_token = None
+    if arg:
+        if arg.startswith("ref_"):
+            acquisition_source = "referral"
+            source_token = arg
+        elif arg.startswith("event_"):
+            acquisition_source = "event_invite"
+            source_token = arg
+        elif arg.startswith("save_recipe_"):
+            acquisition_source = "recipe_share"
+            source_token = arg
+
+    # Ensure user record exists
+    async with pool.acquire() as db:
+        existing_user = await UserService.get_user(db, user.id)
+        if not existing_user:
+            referrer_user_id = None
+            if acquisition_source == "referral" and source_token:
+                code = source_token.replace("ref_", "")
+                referrer_user_id = await db.fetchval(
+                    "SELECT user_id FROM referral_codes WHERE code=$1", code)
+                if referrer_user_id == user.id:
+                    referrer_user_id = None
+            await UserService.get_or_create_user(
+                db, user, acquisition_source, source_token, referrer_user_id)
+        else:
+            await db.execute(
+                "UPDATE users SET first_name=$2, last_name=$3, username=$4, "
+                "language_code=$5, updated_at=NOW() WHERE telegram_user_id=$1",
+                user.id, user.first_name, user.last_name,
+                user.username, getattr(user, 'language_code', None))
+
+    # Deep link: save_recipe_{id}
+    if arg and arg.startswith("save_recipe_"):
         try:
             source_id = int(arg.split("_", 2)[2])
         except (ValueError, IndexError):
@@ -4927,7 +5934,19 @@ async def cmd_start(message: Message):
             return
 
         async with pool.acquire() as db:
-            src = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", source_id)
+            usr = await UserService.get_user(db, user.id)
+            if usr and usr["onboarding_status"] not in ("completed", "skipped"):
+                src = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", source_id)
+                if src:
+                    import hashlib as _hl
+                    token_hash = _hl.sha256(f"save_recipe_{source_id}".encode()).hexdigest()
+                    await db.execute(
+                        "INSERT INTO pending_onboarding_actions "
+                        "(user_id, action_type, token_hash, payload, expires_at) "
+                        "VALUES ($1,'save_recipe',$2,$3,NOW() + INTERVAL '24 hours')",
+                        user.id, token_hash, json.dumps({"recipe_id": source_id, "name": src["name"]}))
+            else:
+                src = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", source_id)
             if not src:
                 await message.answer("❌ Рецепт не найден.")
                 return
@@ -5028,33 +6047,35 @@ async def cmd_start(message: Message):
             await message.answer("Неверная ссылка.", reply_markup=ReplyKeyboardRemove())
             return
 
-        if pool is None:
-            await message.answer("Сервис запускается, попробуйте через минуту.", reply_markup=ReplyKeyboardRemove())
-            return
-
         async with pool.acquire() as db:
             event = await db.fetchrow("SELECT * FROM events WHERE id=$1", event_id)
-
         if not event:
             await message.answer("Событие не найдено или удалено.", reply_markup=ReplyKeyboardRemove())
             return
 
         async with pool.acquire() as db:
-            was_new = not await db.fetchval(
-                "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2", event_id, user.id
-            )
-            await db.execute(
-                """
-                INSERT INTO collaborators (event_id, telegram_user_id, first_name, username, role)
-                VALUES ($1,$2,$3,$4,'collaborator')
-                ON CONFLICT (event_id, telegram_user_id) DO UPDATE SET first_name=EXCLUDED.first_name
-                """,
-                event_id, user.id, user.first_name, user.username or "",
-            )
-        if was_new and event["telegram_user_id"] != user.id:
-            await track(user.id, "guest_joined",
-                        props={"event_id": event_id, "owner_id": event["telegram_user_id"], "via": "bot"},
-                        event_ref=event_id)
+            usr = await UserService.get_user(db, user.id)
+            if usr and usr["onboarding_status"] not in ("completed", "skipped"):
+                import hashlib as _hl
+                token_hash = _hl.sha256(f"event_{event_id}".encode()).hexdigest()
+                await db.execute(
+                    "INSERT INTO pending_onboarding_actions "
+                    "(user_id, action_type, token_hash, payload, expires_at) "
+                    "VALUES ($1,'join_event',$2,$3,NOW() + INTERVAL '24 hours')",
+                    user.id, token_hash, json.dumps({"event_id": event_id, "name": event["name"]}))
+            else:
+                was_new = not await db.fetchval(
+                    "SELECT 1 FROM collaborators WHERE event_id=$1 AND telegram_user_id=$2",
+                    event_id, user.id)
+                await db.execute(
+                    "INSERT INTO collaborators (event_id, telegram_user_id, first_name, username, role) "
+                    "VALUES ($1,$2,$3,$4,'collaborator') "
+                    "ON CONFLICT (event_id, telegram_user_id) DO UPDATE SET first_name=EXCLUDED.first_name",
+                    event_id, user.id, user.first_name, user.username or "")
+                if was_new and event["telegram_user_id"] != user.id:
+                    await track(user.id, "guest_joined",
+                                props={"event_id": event_id, "owner_id": event["telegram_user_id"], "via": "bot"},
+                                event_ref=event_id)
 
         ev_date = "дата не указана"
         if event["event_date"]:
@@ -5072,32 +6093,39 @@ async def cmd_start(message: Message):
 
         await message.answer(
             f"🎉 <b>{user.first_name}</b>, вас пригласили!\n\n"
-            f"<b>{event['name']}</b>\n"
-            f"📅 {ev_date}\n\n"
+            f"<b>{event['name']}</b>\n📅 {ev_date}\n\n"
             f"Нажмите кнопку, чтобы открыть ПОЛЯНУ:",
-            reply_markup=kb,
-        )
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
-            [
-                InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
-                InlineKeyboardButton(text="📄 Правила", callback_data="show_terms"),
-            ],
-        ]) if FRONTEND_URL else None
-        await message.answer(
-            f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
-            f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
-            f"<b>Как добавить рецепт в библиотеку:</b>\n"
-            f"• 🔗 Пришли ссылку на рецепт\n"
-            f"• 📸 Фото рецепта из книги или экрана\n"
-            f"• 🎙 Голосовое сообщение\n"
-            f"• 📝 Текст рецепта\n"
-            f"• /add — явный режим добавления\n\n"
-            f"💰 /ref — партнёрская программа · 📄 /terms — правила\n\n"
-            f"Откройте ПОЛЯНУ кнопкой ниже 👇",
-            reply_markup=kb,
-        )
+            reply_markup=kb)
+        return
+
+    # Check if user needs onboarding
+    async with pool.acquire() as db:
+        usr = await UserService.get_user(db, user.id)
+    if usr and usr["onboarding_status"] not in ("completed", "skipped"):
+        await _start_onboarding_for_user(message, user.id)
+        return
+
+    # Existing user — normal welcome
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
+        [
+            InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
+            InlineKeyboardButton(text="📄 Документы", callback_data="show_documents"),
+        ],
+    ]) if FRONTEND_URL else None
+    await message.answer(
+        f"🌿 <b>Привет, {user.first_name}!</b>\n\n"
+        f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
+        f"<b>Как добавить рецепт в библиотеку:</b>\n"
+        f"• 🔗 Пришли ссылку на рецепт\n"
+        f"• 📸 Фото рецепта из книги или экрана\n"
+        f"• 🎙 Голосовое сообщение\n"
+        f"• 📝 Текст рецепта\n"
+        f"• /add — явный режим добавления\n\n"
+        f"💰 /ref — партнёрская · 📄 /documents — документы\n\n"
+        f"Откройте ПОЛЯНу кнопкой ниже 👇",
+        reply_markup=kb,
+    )
 
 
 @dp.callback_query(F.data == "show_ref")
@@ -5113,8 +6141,271 @@ async def cb_show_terms(callback: CallbackQuery):
     await callback.answer()
 
 
+# ── /documents command and callbacks ──────────────────────────────────────────
+
+@dp.message(Command("documents"))
+async def cmd_documents(message: Message):
+    if not message.from_user or pool is None:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", callback_data="legal_doc:terms")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="legal_doc:privacy_policy")],
+        [InlineKeyboardButton(text="✅ Согласие на обработку данных", callback_data="legal_doc:personal_data_consent")],
+        [InlineKeyboardButton(text="🤖 Использование ИИ", callback_data="legal_doc:ai_processing_consent")],
+        [InlineKeyboardButton(text="🎁 Правила бонусной программы", callback_data="legal_doc:referral_terms")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="show_back")],
+    ])
+    await message.answer(
+        "📄 <b>Документы ПОЛЯНЫ</b>\n\n"
+        "Здесь можно ознакомиться с условиями использования сервиса, "
+        "обработкой данных и правилами бонусной программы.",
+        reply_markup=kb)
+
+
+@dp.callback_query(F.data == "show_documents")
+async def cb_show_documents(callback: CallbackQuery):
+    if not callback.message:
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", callback_data="legal_doc:terms")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="legal_doc:privacy_policy")],
+        [InlineKeyboardButton(text="✅ Согласие на обработку данных", callback_data="legal_doc:personal_data_consent")],
+        [InlineKeyboardButton(text="🤖 Использование ИИ", callback_data="legal_doc:ai_processing_consent")],
+        [InlineKeyboardButton(text="🎁 Правила бонусной программы", callback_data="legal_doc:referral_terms")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="show_back")],
+    ])
+    await callback.message.edit_text(
+        "📄 <b>Документы ПОЛЯНЫ</b>\n\n"
+        "Здесь можно ознакомиться с условиями использования сервиса, "
+        "обработкой данных и правилами бонусной программы.",
+        reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("legal_doc:"))
+async def cb_legal_doc(callback: CallbackQuery):
+    if not callback.from_user or not callback.message or pool is None:
+        await callback.answer()
+        return
+    doc_type = callback.data.split(":", 1)[1]
+    import legal_docs
+    doc_title = legal_docs.DOCUMENT_TYPES.get(doc_type, doc_type)
+    async with pool.acquire() as db:
+        doc = await LegalConsentService.get_active_document(db, doc_type)
+    if not doc:
+        await callback.answer("Документ не найден", show_alert=True)
+        return
+    # Show document content (truncate if too long for Telegram 4096 limit)
+    content = doc["content"]
+    if len(content) > 3800:
+        content = content[:3800] + "\n\n… (документ обрезан)"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К документам", callback_data="show_documents")],
+    ])
+    try:
+        await callback.message.edit_text(content, reply_markup=kb)
+    except Exception:
+        # If edit fails (too long), send as new message
+        await callback.message.answer(content, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "show_back")
+async def cb_show_back(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
+        [
+            InlineKeyboardButton(text="💰 Партнёрам", callback_data="show_ref"),
+            InlineKeyboardButton(text="📄 Документы", callback_data="show_documents"),
+        ],
+    ]) if FRONTEND_URL else None
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                f"🌿 <b>Привет, {callback.from_user.first_name}!</b>\n\n"
+                f"ПОЛЯНА — планировщик застолий с друзьями.\n\n"
+                f"Откройте ПОЛЯНу кнопкой ниже 👇",
+                reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
+
+
+# ── /privacy command ─────────────────────────────────────────────────────────
+
+@dp.message(Command("privacy"))
+async def cmd_privacy(message: Message):
+    if not message.from_user or pool is None:
+        return
+    uid = message.from_user.id
+    async with pool.acquire() as db:
+        status = await LegalConsentService.get_user_acceptance_status(db, uid)
+    terms_status = "✅ Принято" if status.get("terms", {}).get("accepted") else "⬜ Не принято"
+    pdn_status = "✅ Принято" if status.get("personal_data_consent", {}).get("accepted") else "⬜ Не принято"
+    ai_status = "✅ Принято" if status.get("ai_processing_consent", {}).get("accepted") else "⬜ Не принято"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", callback_data="legal_doc:terms")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="legal_doc:privacy_policy")],
+        [InlineKeyboardButton(text="🤖 Использование ИИ", callback_data="legal_doc:ai_processing_consent")],
+        [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="del_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="show_back")],
+    ])
+    await message.answer(
+        f"🔒 <b>Данные и конфиденциальность</b>\n\n"
+        f"Статус согласий:\n"
+        f"  Пользовательское соглашение: {terms_status}\n"
+        f"  Обработка персональных данных: {pdn_status}\n"
+        f"  Использование ИИ: {ai_status}\n\n"
+        f"Подробнее: /documents",
+        reply_markup=kb)
+
+
+# ── /help command ────────────────────────────────────────────────────────────
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "📚 <b>Как пользоваться ПОЛЯНОЙ</b>\n\n"
+        "<b>Добавление рецептов:</b>\n"
+        "• 📸 Фото или скриншот рецепта\n"
+        "• 🔗 Ссылка на сайт с рецептом\n"
+        "• 📝 Текст рецепта\n"
+        "• 🎙 Голосовое сообщение\n"
+        "• /add — добавление вручную\n\n"
+        "<b>Библиотека:</b>\n"
+        "Откройте ПОЛЯНу кнопкой внизу → вкладка «Рецепты»\n\n"
+        "<b>Совместные события:</b>\n"
+        "Создайте событие, пригласите друзей, составьте меню вместе\n\n"
+        "<b>Команды:</b>\n"
+        "/start — главное меню\n"
+        "/add — добавить рецепт\n"
+        "/ref — партнёрская программа\n"
+        "/documents — юридические документы\n"
+        "/privacy — данные и конфиденциальность\n"
+        "/help — эта справка"
+    )
+
+
+# ── /delete_me command ───────────────────────────────────────────────────────
+
+@dp.message(Command("delete_me"))
+async def cmd_delete_me(message: Message):
+    if not message.from_user or pool is None:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Нет, оставить аккаунт", callback_data="del_cancel")],
+        [InlineKeyboardButton(text="⚠️ Продолжить удаление", callback_data="del_confirm1")],
+    ])
+    await message.answer(
+        "🗑 <b>Удаление аккаунта</b>\n\n"
+        "Вы действительно хотите удалить аккаунт?\n\n"
+        "Будут удалены:\n"
+        "— ваша библиотека рецептов\n"
+        "— события\n"
+        "— списки покупок\n"
+        "— история использования\n"
+        "— доступный баланс в пределах правил сервиса\n\n"
+        "Финансовые записи могут сохраняться в обезличенном виде.",
+        reply_markup=kb)
+
+
+@dp.callback_query(F.data == "del_cancel")
+async def cb_del_cancel(callback: CallbackQuery):
+    if callback.message:
+        try:
+            await callback.message.edit_text("✅ Аккаунт сохранён.", reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "del_start")
+async def cb_del_start(callback: CallbackQuery):
+    """Entry point from privacy screen."""
+    if not callback.from_user:
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Нет, оставить аккаунт", callback_data="del_cancel")],
+        [InlineKeyboardButton(text="⚠️ Продолжить удаление", callback_data="del_confirm1")],
+    ])
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                "🗑 <b>Удаление аккаунта</b>\n\n"
+                "Вы действительно хотите удалить аккаунт?\n\n"
+                "Будут удалены:\n"
+                "— ваша библиотека рецептов\n"
+                "— события\n"
+                "— списки покупок\n"
+                "— история использования\n"
+                "— доступный баланс в пределах правил сервиса\n\n"
+                "Финансовые записи могут сохраняться в обезличенном виде.",
+                reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "del_confirm1")
+async def cb_del_confirm1(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Нет, оставить аккаунт", callback_data="del_cancel")],
+        [InlineKeyboardButton(text="🗑 Удалить навсегда", callback_data="del_execute")],
+    ])
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                "⚠️ <b>Подтвердите удаление</b>\n\n"
+                "Для удаления нажмите «Удалить навсегда».\n"
+                "Это действие необратимо.",
+                reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "del_execute")
+async def cb_del_execute(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    try:
+        async with pool.acquire() as db:
+            await UserService.delete_user(db, uid)
+        await asyncio.create_task(track(uid, "account_deleted"))
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "✅ <b>Аккаунт удалён</b>\n\n"
+                    "Ваши данные были удалены. Если захотите вернуться — "
+                    "просто отправьте /start.", reply_markup=None)
+            except Exception:
+                pass
+    except Exception as e:
+        log.exception("account deletion failed: %s", e)
+        if callback.message:
+            try:
+                await callback.message.edit_text("❌ Произошла ошибка при удалении. Попробуйте позже.")
+            except Exception:
+                pass
+    await callback.answer()
+
+
 async def run_bot():
     try:
+        # Register consent middleware
+        dp.message.middleware(LegalConsentMiddleware())
+        dp.callback_query.middleware(LegalConsentMiddleware())
+
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(text="ПОЛЯНА", web_app=WebAppInfo(url=FRONTEND_URL))
         )
@@ -5124,7 +6415,11 @@ async def run_bot():
                 BotCommand(command="add", description="Добавить рецепт в библиотеку"),
                 BotCommand(command="split", description="Делёж расходов"),
                 BotCommand(command="ref", description="Партнёрская программа"),
-                BotCommand(command="terms", description="Правила и документы"),
+                BotCommand(command="terms", description="Правила бонусной программы"),
+                BotCommand(command="documents", description="Юридические документы"),
+                BotCommand(command="privacy", description="Данные и конфиденциальность"),
+                BotCommand(command="help", description="Как пользоваться ПОЛЯНОЙ"),
+                BotCommand(command="delete_me", description="Удалить аккаунт"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
