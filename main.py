@@ -113,6 +113,11 @@ FEATURE_EXPENSE_SPLIT = ENV("FEATURE_EXPENSE_SPLIT", "true").lower() == "true"
 FEATURE_RECEIPT_RECOGNITION = ENV("FEATURE_RECEIPT_RECOGNITION", "true").lower() == "true"
 FEATURE_REFERRALS = ENV("FEATURE_REFERRALS", "true").lower() == "true"
 FEATURE_PAYMENTS = ENV("FEATURE_PAYMENTS", "true").lower() == "true"
+FEATURE_PAYMENTS_STARS = ENV("FEATURE_PAYMENTS_STARS", "true").lower() == "true"
+FEATURE_PAYMENTS_YOOKASSA_WEB = ENV("FEATURE_PAYMENTS_YOOKASSA_WEB", "true").lower() == "true"
+FEATURE_BALANCE = ENV("FEATURE_BALANCE", "true").lower() == "true"
+FEATURE_AI_BILLING = ENV("FEATURE_AI_BILLING", "true").lower() == "true"
+FEATURE_PAYMENT_RECONCILIATION = ENV("FEATURE_PAYMENT_RECONCILIATION", "true").lower() == "true"
 WELCOME_POINTS = int(ENV("WELCOME_POINTS", "0"))
 
 # Feature lists for welcome screen (flag, icon, title)
@@ -409,6 +414,242 @@ class WalletService:
                 pass
 
             return len(rows)
+
+    @staticmethod
+    async def get_available_balance(db, user_id: int) -> dict:
+        """Get available balance breakdown including reservations."""
+        row = await db.fetchrow("SELECT * FROM wallets WHERE user_id=$1", user_id)
+        if not row:
+            return {"paid": 0, "bonus": 0, "reserved": 0, "available": 0,
+                    "paid_debt": 0, "bonus_debt": 0, "pending": 0}
+        paid = row["paid_points"] or 0
+        bonus = row["bonus_points"] or 0
+        reserved = row["reserved_points"] or 0
+        return {
+            "paid": paid,
+            "bonus": bonus,
+            "reserved": reserved,
+            "available": max(0, paid + bonus - reserved),
+            "paid_debt": row["paid_debt_points"] or 0,
+            "bonus_debt": row["bonus_debt_points"] or 0,
+            "pending": row["pending_bonus_points"] or 0,
+        }
+
+    @staticmethod
+    async def reserve_for_ai(db, user_id: int, points: int,
+                              operation_type: str, operation_id) -> bool:
+        """Reserve points for an AI operation. Returns True if reserved."""
+        now = datetime.now(timezone.utc)
+        async with db.transaction():
+            row = await db.fetchrow(
+                "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", user_id)
+            if not row:
+                return False
+            paid = row["paid_points"] or 0
+            bonus = row["bonus_points"] or 0
+            reserved = row["reserved_points"] or 0
+            available = paid + bonus - reserved
+            if available < points:
+                return False
+            # Deduct from bonus first, then paid
+            bonus_deduct = min(bonus, points)
+            paid_deduct = points - bonus_deduct
+            await db.execute(
+                "UPDATE wallets SET "
+                "bonus_points = bonus_points - $2, "
+                "paid_points = paid_points - $3, "
+                "reserved_points = reserved_points + $4, "
+                "updated_at = NOW() "
+                "WHERE user_id = $1",
+                user_id, bonus_deduct, paid_deduct, points)
+            await db.execute(
+                "INSERT INTO wallet_reservations "
+                "(user_id, operation_type, operation_id, points, status, expires_at, created_at) "
+                "VALUES ($1,$2,$3,$4,'reserved',$5,$6)",
+                user_id, operation_type, str(operation_id), points,
+                now + timedelta(minutes=10), now)
+            # Ledger entries
+            if bonus_deduct > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                        "paid_balance_after, bonus_balance_after, reserved_balance_after, created_at) "
+                        "VALUES ($1,'bonus',$2,'ai_reservation',$3,$4,$5,$6,$7)",
+                        user_id, -bonus_deduct, f"reserve:{operation_id}",
+                        paid - paid_deduct, bonus - bonus_deduct, reserved + points, now)
+                except asyncpg.UniqueViolationError:
+                    pass
+            if paid_deduct > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                        "paid_balance_after, bonus_balance_after, reserved_balance_after, created_at) "
+                        "VALUES ($1,'paid',$2,'ai_reservation',$3,$4,$5,$6,$7)",
+                        user_id, -paid_deduct, f"reserve_paid:{operation_id}",
+                        paid - paid_deduct, bonus - bonus_deduct, reserved + points, now)
+                except asyncpg.UniqueViolationError:
+                    pass
+        return True
+
+    @staticmethod
+    async def commit_reservation(db, operation_id, actual_cost_usd: float = None) -> bool:
+        """Commit a reservation — points are consumed. Returns True if committed."""
+        now = datetime.now(timezone.utc)
+        async with db.transaction():
+            res = await db.fetchrow(
+                "SELECT * FROM wallet_reservations WHERE operation_id=$1 FOR UPDATE",
+                str(operation_id))
+            if not res or res["status"] != "reserved":
+                return False
+            await db.execute(
+                "UPDATE wallet_reservations SET status='committed', committed_at=$2 "
+                "WHERE operation_id=$1",
+                str(operation_id), now)
+            await db.execute(
+                "UPDATE wallets SET reserved_points = GREATEST(0, reserved_points - $2), "
+                "updated_at = NOW() WHERE user_id=$1",
+                res["user_id"], res["points"])
+        return True
+
+    @staticmethod
+    async def release_reservation(db, operation_id, reason: str = "error") -> bool:
+        """Release a reservation — points returned to available balance."""
+        now = datetime.now(timezone.utc)
+        async with db.transaction():
+            res = await db.fetchrow(
+                "SELECT * FROM wallet_reservations WHERE operation_id=$1 FOR UPDATE",
+                str(operation_id))
+            if not res or res["status"] != "reserved":
+                return False
+            points = res["points"]
+            await db.execute(
+                "UPDATE wallet_reservations SET status='released', released_at=$2 "
+                "WHERE operation_id=$1",
+                str(operation_id), now)
+            # Return points: bonus first, then paid (reverse of reserve)
+            row = await db.fetchrow(
+                "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", res["user_id"])
+            bonus = row["bonus_points"] or 0
+            bonus_restore = min(points, points)  # restore proportionally
+            paid_restore = points - bonus_restore
+            await db.execute(
+                "UPDATE wallets SET "
+                "bonus_points = bonus_points + $2, "
+                "paid_points = paid_points + $3, "
+                "reserved_points = GREATEST(0, reserved_points - $4), "
+                "updated_at = NOW() "
+                "WHERE user_id = $1",
+                res["user_id"], bonus_restore, paid_restore, points)
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                    "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
+                    "VALUES ($1,'bonus',$2,'ai_reservation_release',$3,$4,$5,$6,$7,$8)",
+                    res["user_id"], points, f"release:{operation_id}",
+                    (row["paid_points"] or 0) + paid_restore,
+                    (row["bonus_points"] or 0) + bonus_restore,
+                    max(0, (row["reserved_points"] or 0) - points),
+                    json.dumps({"reason": reason}), now)
+            except asyncpg.UniqueViolationError:
+                pass
+        return True
+
+    @staticmethod
+    async def credit_purchase(db, order) -> dict:
+        """Unified credit for any successful payment order.
+        Handles debt repayment, grant creation, and ledger entries.
+        Returns new balance dict."""
+        now = datetime.now(timezone.utc)
+        uid = order["user_id"]
+        total_pts = order["total_points"]
+        async with db.transaction():
+            row = await db.fetchrow(
+                "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid)
+            if not row:
+                await db.execute(
+                    "INSERT INTO wallets (user_id, paid_points) VALUES ($1,0) ON CONFLICT DO NOTHING", uid)
+                row = await db.fetchrow(
+                    "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid)
+            paid_debt = row["paid_debt_points"] or 0
+            # Repay debt first
+            debt_repay = min(paid_debt, total_pts)
+            remaining = total_pts - debt_repay
+            if debt_repay > 0:
+                await db.execute(
+                    "UPDATE wallets SET paid_debt_points = paid_debt_points - $2, updated_at=NOW() "
+                    "WHERE user_id=$1", uid, debt_repay)
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, metadata, created_at) "
+                        "VALUES ($1,'paid',$2,'debt_repayment',$3,$4,$5)",
+                        uid, -debt_repay, f"debt_repay:{order['id']}",
+                        json.dumps({"order_id": str(order["id"])}), now)
+                except asyncpg.UniqueViolationError:
+                    pass
+            # Credit remaining as paid_points
+            if remaining > 0:
+                await db.execute(
+                    "UPDATE wallets SET paid_points = paid_points + $2, updated_at=NOW() "
+                    "WHERE user_id=$1", uid, remaining)
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_grants "
+                        "(user_id, source_type, source_id, wallet_type, initial_points, "
+                        "remaining_points, status, created_at, metadata) "
+                        "VALUES ($1,$2,$3,'paid',$4,$5,'active',$6,$7)",
+                        uid, f"{order['provider']}_purchase", str(order["id"]),
+                        remaining, remaining, now,
+                        json.dumps({"order_id": str(order["id"]), "package": order.get("package_code", "")}))
+                except asyncpg.UniqueViolationError:
+                    pass
+                try:
+                    row2 = await db.fetchrow(
+                        "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1", uid)
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                        "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
+                        "VALUES ($1,'paid',$2,'purchase_credit',$3,$4,$5,$6,$7,$8)",
+                        uid, remaining, f"purchase:{order['id']}",
+                        row2["paid_points"], row2["bonus_points"], row2["reserved_points"],
+                        json.dumps({"order_id": str(order["id"]), "debt_repaid": debt_repay}), now)
+                except asyncpg.UniqueViolationError:
+                    pass
+            # Credit promo points as bonus
+            promo = order.get("promo_points", 0) or 0
+            if promo > 0:
+                await db.execute(
+                    "UPDATE wallets SET bonus_points = bonus_points + $2, updated_at=NOW() "
+                    "WHERE user_id=$1", uid, promo)
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_grants "
+                        "(user_id, source_type, source_id, wallet_type, initial_points, "
+                        "remaining_points, status, created_at, metadata) "
+                        "VALUES ($1,$2,$3,'bonus',$4,$5,'active',$6,$7)",
+                        uid, "promo_credit", str(order["id"]),
+                        promo, promo, now,
+                        json.dumps({"order_id": str(order["id"])}))
+                except asyncpg.UniqueViolationError:
+                    pass
+                try:
+                    row3 = await db.fetchrow(
+                        "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1", uid)
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                        "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
+                        "VALUES ($1,'bonus',$2,'promo_credit',$3,$4,$5,$6,$7,$8)",
+                        uid, promo, f"promo:{order['id']}",
+                        row3["paid_points"], row3["bonus_points"], row3["reserved_points"],
+                        json.dumps({"order_id": str(order["id"])}), now)
+                except asyncpg.UniqueViolationError:
+                    pass
+        return await WalletService.get_available_balance(db, uid)
 
 
 # ── Referral Service ──────────────────────────────────────────────────────────
@@ -1047,6 +1288,223 @@ class LegalConsentService:
         if not await LegalConsentService.has_current_acceptance(db, user_id, LegalConsentService.AI_TYPE):
             raise ValueError(f"consent_required:{LegalConsentService.AI_TYPE}")
         return True
+
+
+# ── AI Operation Catalog ─────────────────────────────────────────────────────
+
+AI_OPERATION_CATALOG = {
+    "recipe_text_parse": {
+        "title": "Распознавание текста рецепта",
+        "points": 5,
+        "model": "google/gemini-2.5-flash",
+        "fallback_model": None,
+        "enabled": True,
+    },
+    "recipe_url_parse": {
+        "title": "Разбор рецепта по ссылке",
+        "points": 5,
+        "model": "google/gemini-2.5-flash",
+        "fallback_model": None,
+        "enabled": True,
+    },
+    "recipe_image_parse": {
+        "title": "Распознавание рецепта по фото",
+        "points": 10,
+        "model": "google/gemini-2.5-flash",
+        "fallback_model": "qwen/qwen2.5-vl-72b-instruct",
+        "enabled": True,
+    },
+    "recipe_voice_parse": {
+        "title": "Разбор голосового сообщения",
+        "points": 10,
+        "model": "openai/whisper-large-v3",
+        "fallback_model": None,
+        "enabled": True,
+    },
+    "recipe_image_generate": {
+        "title": "Генерация изображения блюда",
+        "points": 20,
+        "model": "openai/gpt-5.4-image-2",
+        "fallback_model": None,
+        "enabled": FEATURE_AI_IMAGE_GENERATION,
+    },
+    "recipe_normalize": {
+        "title": "Нормализация ингредиентов",
+        "points": 3,
+        "model": "google/gemini-2.5-flash",
+        "fallback_model": None,
+        "enabled": True,
+    },
+}
+
+
+# ── Payment Service ──────────────────────────────────────────────────────────
+
+class PaymentService:
+    """Unified payment service for Stars and YooKassa."""
+
+    @staticmethod
+    async def get_available_packages(db, provider: str = None) -> list:
+        """Get active packages for a provider."""
+        now = datetime.now(timezone.utc)
+        if provider == "telegram_stars":
+            rows = await db.fetch(
+                "SELECT * FROM payment_packages WHERE active_for_stars=TRUE "
+                "AND (starts_at IS NULL OR starts_at <= $1) "
+                "AND (ends_at IS NULL OR ends_at > $1) "
+                "ORDER BY sort_order", now)
+        elif provider == "yookassa":
+            rows = await db.fetch(
+                "SELECT * FROM payment_packages WHERE active_for_yookassa=TRUE "
+                "AND (starts_at IS NULL OR starts_at <= $1) "
+                "AND (ends_at IS NULL OR ends_at > $1) "
+                "ORDER BY sort_order", now)
+        else:
+            rows = await db.fetch(
+                "SELECT * FROM payment_packages "
+                "WHERE (starts_at IS NULL OR starts_at <= $1) "
+                "AND (ends_at IS NULL OR ends_at > $1) "
+                "ORDER BY sort_order", now)
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    async def create_order(db, user_id: int, package_code: str, provider: str) -> dict:
+        """Create a payment order. Returns order dict."""
+        pkg = await db.fetchrow(
+            "SELECT * FROM payment_packages WHERE code=$1", package_code)
+        if not pkg:
+            raise ValueError("Пакет не найден")
+        if provider == "telegram_stars" and not pkg["active_for_stars"]:
+            raise ValueError("Пакет недоступен для Telegram Stars")
+        if provider == "yookassa" and not pkg["active_for_yookassa"]:
+            raise ValueError("Пакет недоступен для ЮKassa")
+        if provider == "telegram_stars":
+            currency = "XTR"
+            amount = pkg["stars_amount"]
+        elif provider == "yookassa":
+            currency = "RUB"
+            amount = pkg["rub_amount_minor"]
+        else:
+            raise ValueError("Неизвестный провайдер")
+        now = datetime.now(timezone.utc)
+        order_id = uuid.uuid4()
+        payload = f"po:{secrets.token_urlsafe(16)}"
+        idempotency_key = f"{provider}:{order_id}"
+        referral_base = pkg["base_points"]
+        try:
+            await db.execute(
+                "INSERT INTO payment_orders "
+                "(id, user_id, package_id, provider, status, currency, amount, "
+                "base_points, promo_points, total_points, referral_base_points, "
+                "invoice_payload, idempotency_key, created_at, expires_at) "
+                "VALUES ($1,$2,$3,$4,'created',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                order_id, user_id, pkg["id"], provider, currency, amount,
+                pkg["base_points"], pkg["promo_points"],
+                pkg["base_points"] + pkg["promo_points"],
+                referral_base, payload, idempotency_key, now,
+                now + timedelta(hours=1))
+        except asyncpg.UniqueViolationError:
+            raise ValueError("Заказ уже создан")
+        return {
+            "order_id": str(order_id),
+            "package_code": pkg["code"],
+            "title": pkg["title"],
+            "base_points": pkg["base_points"],
+            "promo_points": pkg["promo_points"],
+            "total_points": pkg["base_points"] + pkg["promo_points"],
+            "currency": currency,
+            "amount": amount,
+            "invoice_payload": payload,
+            "provider": provider,
+        }
+
+    @staticmethod
+    async def find_order_by_payload(db, payload: str):
+        """Find order by invoice payload."""
+        return await db.fetchrow(
+            "SELECT * FROM payment_orders WHERE invoice_payload=$1", payload)
+
+    @staticmethod
+    async def find_order_by_id(db, order_id):
+        """Find order by ID."""
+        return await db.fetchrow(
+            "SELECT * FROM payment_orders WHERE id=$1", uuid.UUID(order_id) if isinstance(order_id, str) else order_id)
+
+    @staticmethod
+    async def mark_order_paid(db, order_id, external_payment_id: str) -> bool:
+        """Mark order as paid. Returns True if this is the first time."""
+        now = datetime.now(timezone.utc)
+        result = await db.execute(
+            "UPDATE payment_orders SET status='succeeded', "
+            "external_payment_id=$2, paid_at=$3 "
+            "WHERE id=$1 AND status NOT IN ('succeeded','refunded','cancelled')",
+            order_id, external_payment_id, now)
+        return result.endswith("1")
+
+
+# ── AI Usage Billing Service ─────────────────────────────────────────────────
+
+class AIUsageBillingService:
+    """Manages AI operation pricing, reservation, and usage logging."""
+
+    @staticmethod
+    def get_operation_price(operation_type: str) -> int | None:
+        """Get price in points for an operation. Returns None if disabled."""
+        op = AI_OPERATION_CATALOG.get(operation_type)
+        if not op or not op.get("enabled"):
+            return None
+        return op["points"]
+
+    @staticmethod
+    async def check_balance(db, user_id: int, operation_type: str) -> tuple[bool, int, int]:
+        """Check if user has enough balance. Returns (ok, needed, available)."""
+        price = AIUsageBillingService.get_operation_price(operation_type)
+        if price is None:
+            return False, 0, 0
+        bal = await WalletService.get_available_balance(db, user_id)
+        return bal["available"] >= price, price, bal["available"]
+
+    @staticmethod
+    async def reserve_points(db, user_id: int, operation_type: str) -> tuple[bool, str | None]:
+        """Reserve points for an AI operation. Returns (success, operation_id)."""
+        price = AIUsageBillingService.get_operation_price(operation_type)
+        if price is None:
+            return False, None
+        operation_id = uuid.uuid4()
+        ok = await WalletService.reserve_for_ai(db, user_id, price, operation_type, operation_id)
+        return ok, str(operation_id) if ok else None
+
+    @staticmethod
+    async def commit_charge(db, operation_id: str, provider: str, model: str,
+                             input_tokens: int = None, output_tokens: int = None,
+                             provider_cost_usd: float = None, latency_ms: int = None,
+                             status: str = "success", error_code: str = None) -> bool:
+        """Commit a reservation after successful AI operation."""
+        ok = await WalletService.commit_reservation(db, operation_id)
+        if not ok:
+            return False
+        res = await db.fetchrow(
+            "SELECT * FROM wallet_reservations WHERE operation_id=$1", operation_id)
+        if not res:
+            return False
+        try:
+            await db.execute(
+                "INSERT INTO ai_usage_log "
+                "(user_id, operation_type, reservation_id, provider, model, "
+                "input_tokens, output_tokens, provider_cost_usd, latency_ms, "
+                "status, error_code, charged_points, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())",
+                res["user_id"], res["operation_type"], operation_id,
+                provider, model, input_tokens, output_tokens,
+                provider_cost_usd, latency_ms, status, error_code, res["points"])
+        except Exception:
+            log.exception("Failed to log AI usage")
+        return True
+
+    @staticmethod
+    async def release_reservation(db, operation_id: str, reason: str = "error") -> bool:
+        """Release reservation on error."""
+        return await WalletService.release_reservation(db, operation_id, reason)
 
 
 # ── Welcome Service ───────────────────────────────────────────────────────────
@@ -1930,6 +2388,122 @@ async def init_db():
                 created_at    TIMESTAMPTZ DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_pending_actions_user ON pending_onboarding_actions(user_id, completed_at);
+
+            -- ── Migration V: Payment system ────────────────────────────────────
+
+            -- Payment packages catalog
+            CREATE TABLE IF NOT EXISTS payment_packages (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                code                VARCHAR(64) NOT NULL UNIQUE,
+                title               TEXT NOT NULL,
+                description         TEXT,
+                base_points         BIGINT NOT NULL,
+                promo_points        BIGINT NOT NULL DEFAULT 0,
+                stars_amount        BIGINT,
+                rub_amount_minor    BIGINT,
+                active_for_stars    BOOLEAN NOT NULL DEFAULT FALSE,
+                active_for_yookassa BOOLEAN NOT NULL DEFAULT FALSE,
+                sort_order          INTEGER NOT NULL DEFAULT 0,
+                starts_at           TIMESTAMPTZ,
+                ends_at             TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            -- Payment orders
+            CREATE TABLE IF NOT EXISTS payment_orders (
+                id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id                 BIGINT NOT NULL,
+                package_id              UUID NOT NULL REFERENCES payment_packages(id),
+                provider                VARCHAR(32) NOT NULL,
+                status                  VARCHAR(32) NOT NULL DEFAULT 'created',
+                currency                VARCHAR(8) NOT NULL,
+                amount                  BIGINT NOT NULL,
+                base_points             BIGINT NOT NULL,
+                promo_points            BIGINT NOT NULL,
+                total_points            BIGINT NOT NULL,
+                referral_base_points    BIGINT NOT NULL,
+                external_payment_id     TEXT,
+                invoice_payload         TEXT UNIQUE NOT NULL,
+                idempotency_key         VARCHAR(64) NOT NULL UNIQUE,
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at              TIMESTAMPTZ,
+                paid_at                 TIMESTAMPTZ,
+                cancelled_at            TIMESTAMPTZ,
+                refunded_at             TIMESTAMPTZ,
+                metadata                JSONB
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_po_provider_ext
+                ON payment_orders(provider, external_payment_id) WHERE external_payment_id IS NOT NULL;
+
+            -- Wallet grants (lot tracking for FIFO consumption)
+            CREATE TABLE IF NOT EXISTS wallet_grants (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id             BIGINT NOT NULL,
+                source_type         VARCHAR(32) NOT NULL,
+                source_id           TEXT NOT NULL,
+                wallet_type         VARCHAR(16) NOT NULL,
+                initial_points      BIGINT NOT NULL,
+                remaining_points    BIGINT NOT NULL,
+                status              VARCHAR(32) NOT NULL DEFAULT 'active',
+                expires_at          TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reversed_at         TIMESTAMPTZ,
+                metadata            JSONB
+            );
+            CREATE INDEX IF NOT EXISTS idx_wg_user_status ON wallet_grants(user_id, status, wallet_type);
+
+            -- Wallet reservations (hold points during AI operations)
+            CREATE TABLE IF NOT EXISTS wallet_reservations (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id             BIGINT NOT NULL,
+                operation_type      VARCHAR(64) NOT NULL,
+                operation_id        UUID NOT NULL UNIQUE,
+                points              BIGINT NOT NULL,
+                status              VARCHAR(32) NOT NULL DEFAULT 'reserved',
+                expires_at          TIMESTAMPTZ NOT NULL,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                committed_at        TIMESTAMPTZ,
+                released_at         TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_wr_user_status ON wallet_reservations(user_id, status);
+
+            -- Add reserved_points and paid_debt_points to wallets
+            ALTER TABLE wallets ADD COLUMN IF NOT EXISTS reserved_points BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE wallets ADD COLUMN IF NOT EXISTS paid_debt_points BIGINT NOT NULL DEFAULT 0;
+
+            -- Add reserved_balance_after to wallet_ledger
+            ALTER TABLE wallet_ledger ADD COLUMN IF NOT EXISTS reserved_balance_after BIGINT;
+
+            -- AI usage log
+            CREATE TABLE IF NOT EXISTS ai_usage_log (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id             BIGINT NOT NULL,
+                operation_type      VARCHAR(64) NOT NULL,
+                reservation_id      UUID,
+                provider            VARCHAR(32) NOT NULL,
+                model               VARCHAR(128) NOT NULL,
+                input_tokens        INTEGER,
+                output_tokens       INTEGER,
+                provider_cost_usd   NUMERIC(12,6),
+                attempts            INTEGER DEFAULT 1,
+                fallback_used       BOOLEAN DEFAULT FALSE,
+                latency_ms          INTEGER,
+                status              VARCHAR(32) NOT NULL,
+                error_code          VARCHAR(64),
+                pricing_version     VARCHAR(16),
+                charged_points      BIGINT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_aiul_user ON ai_usage_log(user_id, created_at);
+
+            -- Seed default payment packages
+            INSERT INTO payment_packages (code, title, description, base_points, promo_points, stars_amount, rub_amount_minor, active_for_stars, active_for_yookassa, sort_order)
+            VALUES
+                ('points_100', 'Старт', '100 AI-баллов', 100, 0, 99, 9900, TRUE, TRUE, 1),
+                ('points_300', 'Оптимальный', '300 AI-баллов + 20 бонусных', 300, 20, 299, 29900, TRUE, TRUE, 2),
+                ('points_1000', 'Большой', '1000 AI-баллов + 100 бонусных', 1000, 100, 899, 89900, TRUE, TRUE, 3)
+            ON CONFLICT (code) DO NOTHING;
         """)
 
         # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
@@ -2000,6 +2574,55 @@ async def init_db():
                 legal_docs.REQUIRES_ACCEPTANCE.get(doc_type, False),
             )
         log.info("Legal documents seeded ✓")
+
+        # ── Migration: migrate legacy user_balance to new wallet system ──────
+        try:
+            legacy_users = await c.fetch(
+                "SELECT telegram_user_id, balance FROM user_balance WHERE balance > 0")
+            migrated = 0
+            for u in legacy_users:
+                uid = u["telegram_user_id"]
+                kopecks = u["balance"]
+                points = kopecks // max(1, POINTS_PER_RUBLE)
+                if points <= 0:
+                    continue
+                # Check if wallet already has points (from dual-write)
+                existing = await c.fetchrow(
+                    "SELECT paid_points FROM wallets WHERE user_id=$1", uid)
+                if existing and (existing["paid_points"] or 0) >= points:
+                    continue  # Already migrated
+                # Create or update wallet
+                await c.execute(
+                    "INSERT INTO wallets (user_id, paid_points) VALUES ($1, $2) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "paid_points = GREATEST(wallets.paid_points, $2), updated_at=NOW()",
+                    uid, points)
+                # Create grant
+                try:
+                    await c.execute(
+                        "INSERT INTO wallet_grants "
+                        "(user_id, source_type, source_id, wallet_type, initial_points, "
+                        "remaining_points, status, created_at, metadata) "
+                        "VALUES ($1,'migration','legacy_balance','paid',$2,$2,'active',NOW(),$3)",
+                        uid, points, json.dumps({"kopecks": kopecks}))
+                except asyncpg.UniqueViolationError:
+                    pass
+                # Create ledger entry
+                try:
+                    await c.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                        "paid_balance_after, metadata, created_at) "
+                        "VALUES ($1,'paid',$2,'manual_adjustment',$3,$4,$5,NOW())",
+                        uid, points, f"migration:{uid}",
+                        points, json.dumps({"source": "legacy_user_balance", "kopecks": kopecks}))
+                except asyncpg.UniqueViolationError:
+                    pass
+                migrated += 1
+            if migrated:
+                log.info("Migrated %d users from legacy user_balance", migrated)
+        except Exception as e:
+            log.warning("Legacy balance migration skipped: %s", e)
 
     _db_ready = True
     log.info("DB ready ✓  (recipes-as-library schema v3)")
@@ -2376,6 +2999,29 @@ async def parse_and_save_recipe(
                 await LegalConsentService.require_ai_access(db, user_id)
         except ValueError:
             raise ValueError("ai_consent_required")
+
+    # Determine operation type for billing
+    if pool is not None and FEATURE_AI_BILLING:
+        if image_bytes or image_file_id:
+            op_type = "recipe_image_parse"
+        elif audio_bytes:
+            op_type = "recipe_voice_parse"
+        elif url:
+            op_type = "recipe_url_parse"
+        else:
+            op_type = "recipe_text_parse"
+        async with pool.acquire() as db:
+            ok, needed, available = await AIUsageBillingService.check_balance(db, user_id, op_type)
+        if not ok:
+            raise ValueError(f"insufficient_balance:{needed}:{available}")
+        async with pool.acquire() as db:
+            reservation_ok, operation_id = await AIUsageBillingService.reserve_points(db, user_id, op_type)
+        if not reservation_ok:
+            raise ValueError("ai_reservation_failed")
+    else:
+        op_type = None
+        operation_id = None
+
     parsed: dict | None = None
 
     if url:
@@ -2426,9 +3072,22 @@ async def parse_and_save_recipe(
         parsed = await _llm_parse_text(text, source_type="manual")
 
     if not parsed:
+        # Release reservation on failure
+        if operation_id and pool is not None:
+            async with pool.acquire() as db:
+                await AIUsageBillingService.release_reservation(db, operation_id, "parse_failed")
         raise ValueError("Не удалось распознать рецепт в этом контенте")
 
-    return await _save_parsed_recipe(user_id, parsed)
+    result = await _save_parsed_recipe(user_id, parsed)
+
+    # Commit reservation on success
+    if operation_id and pool is not None:
+        async with pool.acquire() as db:
+            await AIUsageBillingService.commit_charge(
+                db, operation_id, provider="openrouter",
+                model=AI_OPERATION_CATALOG.get(op_type, {}).get("model", "unknown"))
+
+    return result
 
 
 async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
@@ -4249,16 +4908,76 @@ async def referral_info_legacy(user_id: int = Depends(get_current_user), db=Depe
 _TOPUP_AMOUNTS = {100, 200, 500, 1000}   # rubles (minimum top-up 100 ₽)
 
 
-# Top-up DISABLED: no paid feature currently consumes balance, so accepting money
-# would be money-in / nothing-out. Endpoints kept (410) so old clients fail cleanly.
 @app.post("/api/balance/topup")
 async def create_topup(body: dict, user_id: int = Depends(get_current_user)):
-    raise HTTPException(410, "Пополнение временно отключено")
+    """Create YooKassa payment for external site."""
+    if not FEATURE_PAYMENTS_YOOKASSA_WEB:
+        raise HTTPException(410, "ЮKassa оплата временно отключена")
+    package_code = body.get("package_code", "")
+    if not package_code:
+        raise HTTPException(400, "package_code required")
+    try:
+        async with pool.acquire() as db:
+            order = await PaymentService.create_order(db, user_id, package_code, "yookassa")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Create YooKassa payment
+    try:
+        import base64
+        auth = base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode()).decode()
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "Idempotence-Key": order["order_id"],
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "amount": {"value": str(order["amount"] / 100), "currency": "RUB"},
+                    "confirmation": {"type": "redirect", "return_url": f"{FRONTEND_URL}/topup/status"},
+                    "capture": True,
+                    "description": f"ПОЛЯНА — {order['title']} ({order['total_points']} AI-баллов)",
+                    "metadata": {"internal_order_id": order["order_id"], "package_code": package_code},
+                })
+        data = r.json()
+        if "confirmation" in data:
+            return {
+                "ok": True,
+                "confirmation_url": data["confirmation"]["confirmation_url"],
+                "order_id": order["order_id"],
+            }
+        else:
+            raise HTTPException(502, "Не удалось создать платёж")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("YooKassa payment creation failed")
+        raise HTTPException(502, f"Ошибка создания платежа: {type(e).__name__}")
 
 
 @app.post("/api/balance/topup-stars")
 async def create_topup_stars(body: dict, user_id: int = Depends(get_current_user)):
-    raise HTTPException(410, "Пополнение временно отключено")
+    """Create Telegram Stars invoice."""
+    if not FEATURE_PAYMENTS_STARS:
+        raise HTTPException(410, "Stars оплата временно отключена")
+    package_code = body.get("package_code", "")
+    if not package_code:
+        raise HTTPException(400, "package_code required")
+    try:
+        async with pool.acquire() as db:
+            order = await PaymentService.create_order(db, user_id, package_code, "telegram_stars")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "ok": True,
+        "invoice_payload": order["invoice_payload"],
+        "title": order["title"],
+        "description": f"{order['total_points']} AI-баллов",
+        "currency": "XTR",
+        "amount": order["amount"],
+        "order_id": order["order_id"],
+    }
 
 
 @app.post("/api/yookassa/webhook")
@@ -4428,6 +5147,69 @@ async def _openrouter_balance_loop():
                     _low_balance_alerted = False  # recovered → re-arm
         except Exception:
             log.exception("openrouter balance loop error")
+        await asyncio.sleep(1800)   # every 30 min
+
+
+async def _payment_reconciliation_loop():
+    """Reconcile pending payment orders with providers. Runs every 30 min."""
+    while True:
+        try:
+            if pool is not None and FEATURE_PAYMENT_RECONCILIATION:
+                async with pool.acquire() as db:
+                    # Check YooKassa pending orders older than 5 min
+                    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+                    pending = await db.fetch(
+                        "SELECT * FROM payment_orders WHERE provider='yookassa' "
+                        "AND status IN ('created','pending') AND created_at < $1 "
+                        "LIMIT 50", cutoff)
+                    for order in pending:
+                        try:
+                            ext_id = order["external_payment_id"]
+                            if not ext_id:
+                                continue
+                            import base64
+                            auth = base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode()).decode()
+                            async with httpx.AsyncClient(timeout=30) as client:
+                                r = await client.get(
+                                    f"https://api.yookassa.ru/v3/payments/{ext_id}",
+                                    headers={"Authorization": f"Basic {auth}"})
+                            if r.status_code == 200:
+                                data = r.json()
+                                if data.get("status") == "succeeded":
+                                    paid = await PaymentService.mark_order_paid(db, order["id"], ext_id)
+                                    if paid:
+                                        order_dict = dict(order)
+                                        order_dict["external_payment_id"] = ext_id
+                                        await WalletService.credit_purchase(db, order_dict)
+                                        await ReferralService.process_successful_payment(
+                                            db, payment_id=ext_id, user_id=order["user_id"],
+                                            cash_amount_minor=order["amount"],
+                                            metadata={"method": "yookassa_reconciliation"})
+                                        log.info("Reconciled YooKassa order %s", order["id"])
+                                elif data.get("status") in ("canceled", "cancelled"):
+                                    await db.execute(
+                                        "UPDATE payment_orders SET status='cancelled', cancelled_at=NOW() "
+                                        "WHERE id=$1 AND status NOT IN ('succeeded','cancelled')",
+                                        order["id"])
+                        except Exception:
+                            log.exception("YooKassa reconciliation failed for order %s", order["id"])
+
+                    # Check Stars pending orders older than 10 min
+                    stars_cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+                    stars_pending = await db.fetch(
+                        "SELECT * FROM payment_orders WHERE provider='telegram_stars' "
+                        "AND status IN ('created','pending') AND created_at < $1 "
+                        "LIMIT 50", stars_cutoff)
+                    for order in stars_pending:
+                        # Stars orders can only be verified via Telegram API (not trivial)
+                        # Mark as expired if older than 1 hour
+                        if order["created_at"] < datetime.now(timezone.utc) - timedelta(hours=1):
+                            await db.execute(
+                                "UPDATE payment_orders SET status='expired', cancelled_at=NOW() "
+                                "WHERE id=$1 AND status IN ('created','pending')",
+                                order["id"])
+        except Exception:
+            log.exception("payment reconciliation loop error")
         await asyncio.sleep(1800)   # every 30 min
 
 
@@ -4743,8 +5525,9 @@ _PUBLIC_CALLBACKS = {
     "ws_how_to_add", "ws_example", "ws_send_hint", "ws_ai_functions",
     "ws_get_points", "ws_help", "ws_back",
     "ob_start_tutorial", "ob_start_skip_to_legal",
+    "balance_stars", "balance_back", "balance_history",
 }
-_PUBLIC_COMMANDS = {"start", "terms", "privacy", "documents", "help", "delete_me"}
+_PUBLIC_COMMANDS = {"start", "terms", "privacy", "documents", "help", "delete_me", "balance"}
 
 # Callbacks that require basic consent
 _BASIC_CALLBACKS = set()  # filled dynamically for most menu actions
@@ -5392,6 +6175,22 @@ async def _reply_parse_error(status_msg, err: Exception, hint: str = "рецеп
             "В ИИ будет передано содержимое рецепта, изображения "
             "или голосового сообщения без вашего Telegram ID.\n\n"
             "Подробнее: /documents",
+            reply_markup=kb)
+    elif "insufficient_balance" in msg:
+        try:
+            _, needed, available = msg.split(":")
+            needed, available = int(needed), int(available)
+        except Exception:
+            needed, available = 0, 0
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Пополнить через Telegram Stars", callback_data="balance_stars")],
+            [InlineKeyboardButton(text="🎁 Получить баллы бесплатно", callback_data="ws_get_points")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="onboarding_cancel")],
+        ])
+        await status_msg.edit_text(
+            f"💰 <b>Недостаточно AI-баллов</b>\n\n"
+            f"Для этой функции нужно: <b>{needed}</b>\n"
+            f"На балансе: <b>{available}</b>",
             reply_markup=kb)
     elif isinstance(err, ValueError):
         await status_msg.edit_text(f"🤷 {msg}")
@@ -6089,10 +6888,47 @@ async def voice_cancel(callback: CallbackQuery, state: FSMContext):
 
 @dp.pre_checkout_query()
 async def on_pre_checkout(query):
-    # Top-up disabled — decline any lingering Stars invoice so no money is taken.
+    if pool is None:
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Сервис запускается, попробуйте через минуту")
+        return
+    payload = query.invoice_payload or ""
+    if not payload.startswith("po:"):
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Некорректный платёж. Создайте новый счёт.")
+        return
+    async with pool.acquire() as db:
+        order = await PaymentService.find_order_by_payload(db, payload)
+    if not order:
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Заказ не найден. Создайте новый счёт.")
+        return
+    if order["user_id"] != query.from_user.id:
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Этот счёт предназначен для другого пользователя.")
+        return
+    if order["provider"] != "telegram_stars":
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Неверный способ оплаты.")
+        return
+    if order["status"] not in ("created", "pending"):
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Заказ уже обработан. Создайте новый счёт.")
+        return
+    if order["currency"] != "XTR":
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Неверная валюта.")
+        return
+    if order["amount"] != query.total_amount:
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Сумма не совпадает. Создайте новый счёт.")
+        return
+    if order["expires_at"] and order["expires_at"] < datetime.now(timezone.utc):
+        await bot.answer_pre_checkout_query(query.id, ok=False,
+            error_message="Счёт истёк. Создайте новый счёт.")
+        return
     try:
-        await bot.answer_pre_checkout_query(
-            query.id, ok=False, error_message="Пополнение временно отключено")
+        await bot.answer_pre_checkout_query(query.id, ok=True)
     except Exception:
         log.exception("pre_checkout answer failed")
 
@@ -6101,44 +6937,214 @@ async def on_pre_checkout(query):
 async def on_successful_payment(message: Message):
     sp = message.successful_payment
     payload = sp.invoice_payload or ""
-    if not payload.startswith("topup:") or pool is None:
+    if not payload.startswith("po:") or pool is None:
         return
-    try:
-        _, uid_s, rub_s = payload.split(":")
-        uid = int(uid_s)
-        kopecks = int(rub_s) * 100
-    except Exception:
-        log.warning("bad stars payload: %s", payload)
-        return
-    charge_id = sp.telegram_payment_charge_id   # idempotency key
     async with pool.acquire() as db:
-        new_bal = await _credit(db, uid, kopecks, "topup_stars", ref=charge_id,
-                                meta={"stars": sp.total_amount})
-        # Also credit to new wallets system
-        await WalletService.credit_paid_points(
-            db, uid, kopecks // POINTS_PER_RUBLE,
-            reference_type="topup_stars", reference_id=charge_id,
-            idempotency_key=f"stars:{charge_id}",
-            metadata={"stars": sp.total_amount}
-        )
+        order = await PaymentService.find_order_by_payload(db, payload)
+    if not order:
+        log.warning("successful_payment: order not found for payload %s", payload[:20])
+        return
+    if order["user_id"] != message.from_user.id:
+        log.warning("successful_payment: user mismatch")
+        return
+    if order["status"] == "succeeded":
+        return  # Idempotent — already processed
+    charge_id = sp.telegram_payment_charge_id
+    # Mark order paid
+    async with pool.acquire() as db:
+        paid = await PaymentService.mark_order_paid(db, order["id"], charge_id)
+        if not paid:
+            return  # Already processed
+        # Credit balance via unified method
+        order_dict = dict(order)
+        order_dict["package_code"] = ""
+        try:
+            pkg = await db.fetchrow("SELECT code FROM payment_packages WHERE id=$1", order["package_id"])
+            if pkg:
+                order_dict["package_code"] = pkg["code"]
+        except Exception:
+            pass
+        new_bal = await WalletService.credit_purchase(db, order_dict)
         # Process referral reward
         reward = await ReferralService.process_successful_payment(
-            db, payment_id=charge_id, user_id=uid,
-            cash_amount_minor=kopecks,
-            metadata={"method": "stars", "stars": sp.total_amount}
+            db, payment_id=charge_id, user_id=order["user_id"],
+            cash_amount_minor=order["amount"],
+            metadata={"method": "stars", "order_id": str(order["id"])}
         )
-    await track(uid, "payment_succeeded",
-                props={"kopecks": kopecks, "method": "stars", "stars": sp.total_amount, "ref": charge_id})
+    await track(order["user_id"], "stars_payment_succeeded",
+                props={"order_id": str(order["id"]), "points": order["total_points"],
+                       "stars": sp.total_amount})
     try:
+        available = new_bal.get("available", 0)
         msg = (
-            f"✅ Баланс пополнен на {int(kopecks/100)} ₽ (⭐ {sp.total_amount}).\n"
-            f"Текущий баланс: {int(new_bal/100)} ₽"
+            f"✅ <b>Баланс пополнен</b>\n\n"
+            f"Начислено: <b>{order['total_points']} AI-баллов</b>\n"
+            f"Текущий баланс: <b>{available} AI-баллов</b>"
         )
         if reward:
             msg += f"\n\n🎁 Реферальный бонус: +{reward} баллов начислен вашему пригласившему"
-        await message.answer(msg)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✨ Посмотреть AI-функции", callback_data="ws_ai_functions")],
+            [InlineKeyboardButton(text="🌿 Открыть ПОЛЯНУ", web_app=WebAppInfo(url=FRONTEND_URL))],
+        ])
+        await message.answer(msg, reply_markup=kb)
     except Exception:
         pass
+
+
+# ── /balance command ──────────────────────────────────────────────────────────
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message):
+    if not message.from_user or pool is None:
+        return
+    uid = message.from_user.id
+    async with pool.acquire() as db:
+        bal = await WalletService.get_available_balance(db, uid)
+    text = (
+        f"✨ <b>AI-баланс</b>\n\n"
+        f"Доступно: <b>{bal['available']} баллов</b>\n"
+        f"Куплено: {bal['paid']}\n"
+        f"Получено бонусами: {bal['bonus']}\n"
+        f"Зарезервировано: {bal['reserved']}\n\n"
+        f"Баллы используются только для функций с ИИ:\n"
+        f"распознавания фото и голоса, генерации рецептов,\n"
+        f"изображений и умных рекомендаций.\n\n"
+        f"Основная библиотека и обычные инструменты бесплатны."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Пополнить через Telegram Stars", callback_data="balance_stars")],
+        [InlineKeyboardButton(text="🎁 Получить баллы бесплатно", callback_data="ws_get_points")],
+        [InlineKeyboardButton(text="📊 История операций", callback_data="balance_history")],
+    ])
+    await message.answer(text, reply_markup=kb)
+    await track(uid, "balance_screen_opened")
+
+
+@dp.callback_query(F.data == "balance_stars")
+async def cb_balance_stars(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    async with pool.acquire() as db:
+        packages = await PaymentService.get_available_packages(db, "telegram_stars")
+    if not packages:
+        await callback.answer("Пакеты временно недоступны", show_alert=True)
+        return
+    lines = ["⭐ <b>Пополнить AI-баланс</b>\n"]
+    buttons = []
+    for pkg in packages:
+        total = pkg["base_points"] + (pkg["promo_points"] or 0)
+        promo_note = f"\n    Включает {pkg['promo_points']} бонусных" if pkg.get("promo_points") else ""
+        lines.append(f"<b>{pkg['title']}</b>\n    {total} AI-баллов — {pkg['stars_amount']} ⭐{promo_note}")
+        buttons.append([InlineKeyboardButton(
+            text=f"{total} баллов — {pkg['stars_amount']} ⭐",
+            callback_data=f"buy_stars:{pkg['code']}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="balance_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+    await track(callback.from_user.id, "payment_packages_opened", props={"provider": "stars"})
+
+
+@dp.callback_query(F.data.startswith("buy_stars:"))
+async def cb_buy_stars(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    package_code = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+    try:
+        async with pool.acquire() as db:
+            order = await PaymentService.create_order(db, uid, package_code, "telegram_stars")
+    except ValueError as e:
+        await callback.answer(str(e), show_alert=True)
+        return
+    try:
+        await bot.send_invoice(
+            chat_id=uid,
+            title=f"ПОЛЯНА — {order['title']}",
+            description=f"{order['total_points']} AI-баллов",
+            payload=order["invoice_payload"],
+            currency="XTR",
+            prices=[LabeledPrice(label=order["title"], amount=order["amount"])],
+        )
+        await callback.answer()
+        await track(uid, "stars_invoice_opened", props={"package": package_code})
+    except Exception as e:
+        log.exception("send_invoice failed")
+        await callback.answer("Не удалось создать счёт. Попробуйте позже.", show_alert=True)
+
+
+@dp.callback_query(F.data == "balance_back")
+async def cb_balance_back(callback: CallbackQuery):
+    """Return to balance screen."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        bal = await WalletService.get_available_balance(db, uid)
+    text = (
+        f"✨ <b>AI-баланс</b>\n\n"
+        f"Доступно: <b>{bal['available']} баллов</b>\n"
+        f"Куплено: {bal['paid']}\n"
+        f"Получено бонусами: {bal['bonus']}\n"
+        f"Зарезервировано: {bal['reserved']}\n\n"
+        f"Баллы используются только для функций с ИИ.\n"
+        f"Основная библиотека бесплатна."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Пополнить через Telegram Stars", callback_data="balance_stars")],
+        [InlineKeyboardButton(text="🎁 Получить баллы бесплатно", callback_data="ws_get_points")],
+        [InlineKeyboardButton(text="📊 История операций", callback_data="balance_history")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "balance_history")
+async def cb_balance_history(callback: CallbackQuery):
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            "SELECT * FROM wallet_ledger WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20", uid)
+    if not rows:
+        text = "📊 <b>История операций</b>\n\nПока нет операций."
+    else:
+        lines = ["📊 <b>История операций</b>\n"]
+        type_labels = {
+            "purchase_credit": "Покупка", "promo_credit": "Бонус к покупке",
+            "referral_credit": "Реферальное начисление", "referral_pending": "Реферальное начисление (ожидание)",
+            "referral_activated": "Реферальное начисление", "ai_reservation": "Резерв ИИ",
+            "ai_usage": "Использование ИИ", "ai_usage_refund": "Возврат за ИИ",
+            "ai_reservation_release": "Освобождение резерва",
+            "manual_adjustment": "Корректировка", "referral_cancelled": "Отмена реферального",
+            "referral_reversed": "Реверс реферального",
+        }
+        for r in rows:
+            sign = "+" if r["amount"] > 0 else ""
+            label = type_labels.get(r["transaction_type"], r["transaction_type"])
+            dt = r["created_at"].strftime("%d.%m %H:%M") if r["created_at"] else ""
+            lines.append(f"{sign}{r['amount']} баллов — {label} · {dt}")
+        text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="balance_back")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
 
 
 # ── /start command ────────────────────────────────────────────────────────────
@@ -6992,6 +7998,7 @@ async def run_bot():
                 BotCommand(command="privacy", description="Данные и конфиденциальность"),
                 BotCommand(command="help", description="Как пользоваться ПОЛЯНОЙ"),
                 BotCommand(command="delete_me", description="Удалить аккаунт"),
+                BotCommand(command="balance", description="AI-баланс и пополнение"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
@@ -7019,6 +8026,7 @@ async def _bg_init():
         asyncio.create_task(_referral_maturation_loop())
     # OpenRouter low-balance monitor stays: recipe text/photo/voice parsing still uses it.
     asyncio.create_task(_openrouter_balance_loop())
+    asyncio.create_task(_payment_reconciliation_loop())
 
 
 @app.on_event("startup")
