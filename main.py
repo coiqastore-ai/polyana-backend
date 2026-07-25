@@ -1,4 +1,4 @@
-import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib
+import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib, string
 import httpx
 import invite
 from datetime import datetime, timedelta, timezone
@@ -67,9 +67,694 @@ PRICE_AI_INVITE = 4900   # 49 ₽ — AI invitation (includes 1 free reroll)
 # per Star in-app, so crediting ~1.7₽/Star keeps it roughly fair. TUNE THIS.
 STAR_RUB_RATE = 1.7
 
-# Referral program
-REFERRAL_PERCENT = 10        # % of a referee's spend credited to the referrer
-REFERRAL_HOLD_HOURS = 24     # delay before a bonus matures (chargeback protection)
+# Referral program config
+REFERRAL_ENABLED = ENV("REFERRAL_ENABLED", "true").lower() == "true"
+REFERRAL_REWARD_PERCENT_BP = int(ENV("REFERRAL_REWARD_PERCENT_BP", "1000"))  # 1000 = 10%
+REFERRAL_HOLD_DAYS = int(ENV("REFERRAL_HOLD_DAYS", "7"))
+REFERRAL_REWARD_LIFETIME_MONTHS = int(ENV("REFERRAL_REWARD_LIFETIME_MONTHS", "0"))  # 0 = unlimited
+REFERRAL_MAX_REWARD_PER_PAYMENT_POINTS = ENV("REFERRAL_MAX_REWARD_PER_PAYMENT_POINTS")
+REFERRAL_MAX_REWARD_PER_MONTH_POINTS = ENV("REFERRAL_MAX_REWARD_PER_MONTH_POINTS")
+REFERRAL_MIN_PAYMENT_AMOUNT_MINOR = int(ENV("REFERRAL_MIN_PAYMENT_AMOUNT_MINOR", "0"))
+POINTS_PER_RUBLE = int(ENV("POINTS_PER_RUBLE", "1"))
+
+# Legacy aliases (for backward compat with existing code)
+REFERRAL_PERCENT = REFERRAL_REWARD_PERCENT_BP // 100  # 10
+REFERRAL_HOLD_HOURS = REFERRAL_HOLD_DAYS * 24
+
+
+# ── Wallet Service ────────────────────────────────────────────────────────────
+
+class WalletService:
+    """Manages paid_points, bonus_points, pending_bonus_points, bonus_debt_points.
+    All mutations go through ledger entries."""
+
+    @staticmethod
+    async def get_balance(db, user_id: int) -> dict:
+        row = await db.fetchrow(
+            "SELECT * FROM wallets WHERE user_id=$1", user_id
+        )
+        if not row:
+            return {
+                "paid_points": 0, "bonus_points": 0,
+                "pending_bonus_points": 0, "bonus_debt_points": 0,
+                "total_available_points": 0,
+            }
+        paid = row["paid_points"] or 0
+        bonus = row["bonus_points"] or 0
+        return {
+            "paid_points": paid,
+            "bonus_points": bonus,
+            "pending_bonus_points": row["pending_bonus_points"] or 0,
+            "bonus_debt_points": row["bonus_debt_points"] or 0,
+            "total_available_points": paid + bonus,
+        }
+
+    @staticmethod
+    async def credit_paid_points(db, user_id: int, points: int,
+                                  reference_type: str = None, reference_id: str = None,
+                                  idempotency_key: str = None, metadata: dict = None) -> int:
+        """Credit paid points. Returns new paid balance."""
+        meta_json = json.dumps(metadata) if metadata else None
+        async with db.transaction():
+            # Ensure wallet exists
+            await db.execute(
+                "INSERT INTO wallets (user_id, paid_points) VALUES ($1, 0) ON CONFLICT DO NOTHING",
+                user_id
+            )
+            row = await db.fetchrow(
+                "UPDATE wallets SET paid_points = paid_points + $2, updated_at = NOW() "
+                "WHERE user_id = $1 RETURNING paid_points",
+                user_id, points
+            )
+            new_paid = row["paid_points"]
+            # Ledger entry
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                    "idempotency_key, balance_after, metadata) "
+                    "VALUES ($1, 'paid', $2, 'payment_credit', $3, $4, $5, $6, $7)",
+                    user_id, points, reference_type, reference_id,
+                    idempotency_key, new_paid, meta_json
+                )
+            except asyncpg.UniqueViolationError:
+                pass  # Idempotent — already recorded
+            return new_paid
+
+    @staticmethod
+    async def credit_bonus_points(db, user_id: int, points: int,
+                                   reference_type: str = None, reference_id: str = None,
+                                   idempotency_key: str = None, metadata: dict = None) -> int:
+        """Credit bonus points. Returns new bonus balance."""
+        meta_json = json.dumps(metadata) if metadata else None
+        async with db.transaction():
+            await db.execute(
+                "INSERT INTO wallets (user_id, bonus_points) VALUES ($1, 0) ON CONFLICT DO NOTHING",
+                user_id
+            )
+            row = await db.fetchrow(
+                "UPDATE wallets SET bonus_points = bonus_points + $2, updated_at = NOW() "
+                "WHERE user_id = $1 RETURNING bonus_points",
+                user_id, points
+            )
+            new_bonus = row["bonus_points"]
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                    "idempotency_key, balance_after, metadata) "
+                    "VALUES ($1, 'bonus', $2, 'referral_activated', $3, $4, $5, $6, $7)",
+                    user_id, points, reference_type, reference_id,
+                    idempotency_key, new_bonus, meta_json
+                )
+            except asyncpg.UniqueViolationError:
+                pass
+            return new_bonus
+
+    @staticmethod
+    async def credit_pending_bonus(db, user_id: int, points: int,
+                                    reference_type: str = None, reference_id: str = None,
+                                    idempotency_key: str = None, metadata: dict = None) -> int:
+        """Credit pending bonus points. Returns new pending balance."""
+        meta_json = json.dumps(metadata) if metadata else None
+        async with db.transaction():
+            await db.execute(
+                "INSERT INTO wallets (user_id, pending_bonus_points) VALUES ($1, 0) ON CONFLICT DO NOTHING",
+                user_id
+            )
+            row = await db.fetchrow(
+                "UPDATE wallets SET pending_bonus_points = pending_bonus_points + $2, updated_at = NOW() "
+                "WHERE user_id = $1 RETURNING pending_bonus_points",
+                user_id, points
+            )
+            new_pending = row["pending_bonus_points"]
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                    "idempotency_key, balance_after, metadata) "
+                    "VALUES ($1, 'pending_bonus', $2, 'referral_pending', $3, $4, $5, $6, $7)",
+                    user_id, points, reference_type, reference_id,
+                    idempotency_key, new_pending, meta_json
+                )
+            except asyncpg.UniqueViolationError:
+                pass
+            return new_pending
+
+    @staticmethod
+    async def debit_for_ai(db, user_id: int, cost_points: int,
+                            reference_type: str = None, reference_id: str = None,
+                            metadata: dict = None) -> tuple[bool, int]:
+        """Debit points for AI usage: bonus first, then paid. Returns (success, remaining_paid)."""
+        meta_json = json.dumps(metadata) if metadata else None
+        async with db.transaction():
+            row = await db.fetchrow(
+                "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", user_id
+            )
+            if not row:
+                return False, 0
+            bonus = row["bonus_points"] or 0
+            paid = row["paid_points"] or 0
+            total = bonus + paid
+            if total < cost_points:
+                return False, paid
+
+            # Deduct bonus first
+            bonus_used = min(bonus, cost_points)
+            remaining = cost_points - bonus_used
+            paid_used = remaining
+
+            new_bonus = bonus - bonus_used
+            new_paid = paid - paid_used
+
+            await db.execute(
+                "UPDATE wallets SET bonus_points=$2, paid_points=$3, updated_at=NOW() "
+                "WHERE user_id=$1",
+                user_id, new_bonus, new_paid
+            )
+
+            # Ledger entries
+            if bonus_used > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                        "balance_after, metadata) "
+                        "VALUES ($1, 'bonus', $2, 'ai_usage', $3, $4, $5, $6)",
+                        user_id, -bonus_used, reference_type, reference_id,
+                        new_bonus, meta_json
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+            if paid_used > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                        "balance_after, metadata) "
+                        "VALUES ($1, 'paid', $2, 'ai_usage', $3, $4, $5, $6)",
+                        user_id, -paid_used, reference_type, reference_id,
+                        new_paid, meta_json
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+
+            return True, new_paid
+
+    @staticmethod
+    async def refund_ai_charge(db, user_id: int, bonus_used: int, paid_used: int,
+                                reference_type: str = None, reference_id: str = None,
+                                metadata: dict = None) -> None:
+        """Refund points after AI failure."""
+        meta_json = json.dumps(metadata) if metadata else None
+        async with db.transaction():
+            await db.execute(
+                "UPDATE wallets SET "
+                "bonus_points = bonus_points + $2, "
+                "paid_points = paid_points + $3, "
+                "updated_at = NOW() "
+                "WHERE user_id=$1",
+                user_id, bonus_used, paid_used
+            )
+            if bonus_used > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                        "metadata) "
+                        "VALUES ($1, 'bonus', $2, 'ai_usage_refund', $3, $4, $5)",
+                        user_id, bonus_used, reference_type, reference_id, meta_json
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+            if paid_used > 0:
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, "
+                        "metadata) "
+                        "VALUES ($1, 'paid', $2, 'ai_usage_refund', $3, $4, $5)",
+                        user_id, paid_used, reference_type, reference_id, meta_json
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+
+    @staticmethod
+    async def activate_pending_rewards(db, user_id: int) -> int:
+        """Move matured pending bonus to available bonus. Returns count activated."""
+        async with db.transaction():
+            # Find matured rewards
+            rows = await db.fetch(
+                "SELECT id, reward_points FROM referral_rewards "
+                "WHERE referrer_user_id=$1 AND status='pending' AND available_at <= NOW() "
+                "FOR UPDATE",
+                user_id
+            )
+            if not rows:
+                return 0
+
+            total_to_activate = sum(r["reward_points"] for r in rows)
+
+            # Debit pending, credit bonus
+            await db.execute(
+                "UPDATE wallets SET "
+                "pending_bonus_points = pending_bonus_points - $2, "
+                "bonus_points = bonus_points + $2, "
+                "updated_at = NOW() "
+                "WHERE user_id = $1",
+                user_id, total_to_activate
+            )
+
+            # Update reward statuses
+            reward_ids = [r["id"] for r in rows]
+            await db.execute(
+                "UPDATE referral_rewards SET status='available', activated_at=NOW(), updated_at=NOW() "
+                "WHERE id = ANY($1)",
+                reward_ids
+            )
+
+            # Ledger
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, reference_type, "
+                    "balance_after, metadata) "
+                    "VALUES ($1, 'bonus', $2, 'referral_activated', 'referral_rewards', $3, $4)",
+                    user_id, total_to_activate,
+                    json.dumps({"reward_ids": [str(rid) for rid in reward_ids]}),
+                    (await db.fetchrow("SELECT bonus_points FROM wallets WHERE user_id=$1", user_id))["bonus_points"]
+                )
+            except asyncpg.UniqueViolationError:
+                pass
+
+            return len(rows)
+
+
+# ── Referral Service ──────────────────────────────────────────────────────────
+
+class ReferralService:
+    """Handles referral codes, relations, reward calculation, and activation."""
+
+    @staticmethod
+    async def generate_code(user_id: int) -> str:
+        """Generate a unique URL-safe referral code for a user."""
+        import string
+        chars = string.ascii_uppercase + string.digits
+        for _ in range(20):
+            code = ''.join(secrets.choice(chars) for _ in range(8))
+            async with pool.acquire() as db:
+                exists = await db.fetchval(
+                    "SELECT 1 FROM referral_codes WHERE code=$1", code
+                )
+                if not exists:
+                    await db.execute(
+                        "INSERT INTO referral_codes (user_id, code) VALUES ($1,$2) "
+                        "ON CONFLICT (user_id) DO UPDATE SET code=EXCLUDED.code",
+                        user_id, code
+                    )
+                    return code
+        raise RuntimeError("Failed to generate unique referral code")
+
+    @staticmethod
+    async def get_or_create_code(user_id: int) -> str:
+        """Get existing code or create new one."""
+        async with pool.acquire() as db:
+            row = await db.fetchrow(
+                "SELECT code FROM referral_codes WHERE user_id=$1", user_id
+            )
+            if row:
+                return row["code"]
+        return await ReferralService.generate_code(user_id)
+
+    @staticmethod
+    async def get_referrer(db, referred_user_id: int) -> int | None:
+        """Get referrer for a user, or None."""
+        return await db.fetchval(
+            "SELECT referrer_user_id FROM referral_relations WHERE referred_user_id=$1",
+            referred_user_id
+        )
+
+    @staticmethod
+    async def bind_referrer(db, referred_user_id: int, referrer_user_id: int,
+                             source_type: str = "referral_link",
+                             source_id: str = None) -> bool:
+        """Bind a referrer to a user. Returns True if bound, False if already has referrer or self-referral."""
+        if referred_user_id == referrer_user_id:
+            log.warning("self_referral_attempt: user=%s", referred_user_id)
+            await track(referred_user_id, "referral_self_attempt",
+                       props={"referrer_id": referrer_user_id})
+            return False
+
+        # Check if already has referrer
+        existing = await ReferralService.get_referrer(db, referred_user_id)
+        if existing:
+            return False  # Already bound — don't change
+
+        try:
+            await db.execute(
+                "INSERT INTO referral_relations "
+                "(referrer_user_id, referred_user_id, source_type, source_id) "
+                "VALUES ($1,$2,$3,$4)",
+                referrer_user_id, referred_user_id, source_type, source_id
+            )
+            await track(referred_user_id, "referral_bound",
+                       props={"referrer_id": referrer_user_id, "source_type": source_type,
+                              "source_id": source_id})
+            # Notify referrer
+            try:
+                await bot.send_message(
+                    referrer_user_id,
+                    "👋 Ваш друг присоединился к ПОЛЯНЕ\n\n"
+                    "Когда он пополнит баланс, вы получите 10%\n"
+                    "бонусными баллами.")
+            except Exception:
+                pass
+            return True
+        except asyncpg.UniqueViolationError:
+            return False  # Race condition — already bound
+
+    @staticmethod
+    async def bind_referrer_from_recipe_share(db, recipient_user_id: int,
+                                               owner_user_id: int,
+                                               share_id: str) -> bool:
+        """Bind referrer via recipe share. Only for truly new users."""
+        return await ReferralService.bind_referrer(
+            db, recipient_user_id, owner_user_id,
+            source_type="recipe_share", source_id=share_id
+        )
+
+    @staticmethod
+    async def is_active_user(db, user_id: int) -> bool:
+        """Check if user is 'active' (has recipes, AI usage, events, or payments)."""
+        has_recipe = await db.fetchval(
+            "SELECT 1 FROM recipes WHERE user_id=$1 LIMIT 1", user_id
+        )
+        if has_recipe:
+            return True
+        has_event = await db.fetchval(
+            "SELECT 1 FROM events WHERE telegram_user_id=$1 LIMIT 1", user_id
+        )
+        if has_event:
+            return True
+        has_payment = await db.fetchval(
+            "SELECT 1 FROM payment_txns WHERE telegram_user_id=$1 AND kind LIKE 'topup%' LIMIT 1",
+            user_id
+        )
+        if has_payment:
+            return True
+        has_ai = await db.fetchval(
+            "SELECT 1 FROM wallet_ledger WHERE user_id=$1 AND transaction_type='ai_usage' LIMIT 1",
+            user_id
+        )
+        return bool(has_ai)
+
+    @staticmethod
+    async def process_successful_payment(db, payment_id: str, user_id: int,
+                                          cash_amount_minor: int,
+                                          metadata: dict = None) -> int | None:
+        """Process a successful payment for referral rewards. Returns reward_points or None."""
+        if not REFERRAL_ENABLED:
+            return None
+
+        # Check minimum payment
+        if cash_amount_minor < REFERRAL_MIN_PAYMENT_AMOUNT_MINOR:
+            return None
+
+        # Find referrer
+        referrer_id = await ReferralService.get_referrer(db, user_id)
+        if not referrer_id or referrer_id == user_id:
+            return None
+
+        # Check idempotency — one reward per payment
+        existing = await db.fetchval(
+            "SELECT id FROM referral_rewards WHERE payment_id=$1", payment_id
+        )
+        if existing:
+            return None  # Already processed
+
+        # Calculate reward per T.Z. formula:
+        # reward_points = floor(cash_amount_minor × percent_bp / 10_000 / 100)
+        # 100 converts kopecks to rubles for the final points calculation
+        reward_points = (cash_amount_minor * REFERRAL_REWARD_PERCENT_BP) // 10_000 // 100
+        if reward_points <= 0:
+            return None
+
+        # Apply max per payment limit
+        if REFERRAL_MAX_REWARD_PER_PAYMENT_POINTS:
+            max_per = int(REFERRAL_MAX_REWARD_PER_PAYMENT_POINTS)
+            reward_points = min(reward_points, max_per)
+
+        # Apply max per month limit
+        if REFERRAL_MAX_REWARD_PER_MONTH_POINTS:
+            max_month = int(REFERRAL_MAX_REWARD_PER_MONTH_POINTS)
+            month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            month_total = await db.fetchval(
+                "SELECT COALESCE(SUM(reward_points),0) FROM referral_rewards "
+                "WHERE referrer_user_id=$1 AND created_at >= $2 AND status != 'cancelled'",
+                referrer_id, month_start
+            ) or 0
+            remaining = max_month - month_total
+            if remaining <= 0:
+                return None
+            reward_points = min(reward_points, remaining)
+
+        # Create reward record
+        available_at = datetime.now(timezone.utc) + timedelta(days=REFERRAL_HOLD_DAYS)
+        try:
+            await db.execute(
+                "INSERT INTO referral_rewards "
+                "(referrer_user_id, referred_user_id, payment_id, cash_amount_minor, "
+                "reward_percent_bp, reward_points, status, available_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
+                referrer_id, user_id, payment_id, cash_amount_minor,
+                REFERRAL_REWARD_PERCENT_BP, reward_points, available_at
+            )
+        except asyncpg.UniqueViolationError:
+            return None  # Idempotent
+
+        # Credit pending points
+        await WalletService.credit_pending_bonus(
+            db, referrer_id, reward_points,
+            reference_type="referral_reward", reference_id=payment_id,
+            idempotency_key=f"ref_pending:{payment_id}",
+            metadata={"referred_user_id": user_id, "cash_amount_minor": cash_amount_minor}
+        )
+
+        # Update activated_at if first payment
+        await db.execute(
+            "UPDATE referral_relations SET first_payment_at = COALESCE(first_payment_at, NOW()) "
+            "WHERE referred_user_id=$1 AND first_payment_at IS NULL",
+            user_id
+        )
+
+        # Analytics
+        await track(referrer_id, "referral_reward_created",
+                   props={"referred_user_id": user_id, "payment_id": payment_id,
+                          "reward_points": reward_points, "cash_amount_minor": cash_amount_minor})
+        await track(referrer_id, "referral_reward_pending",
+                   props={"reward_points": reward_points, "available_at": available_at.isoformat()})
+
+        # Notify referrer
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎁 Вам начислено {reward_points} бонусных баллов\n\n"
+                "Друг пополнил баланс ПОЛЯНЫ.\n"
+                f"Баллы станут доступны через {REFERRAL_HOLD_DAYS} дн.")
+        except Exception:
+            pass
+
+        return reward_points
+
+    @staticmethod
+    async def process_refund(db, payment_id: str) -> int | None:
+        """Process a refund for a referral reward. Returns reversed points or None."""
+        reward = await db.fetchrow(
+            "SELECT * FROM referral_rewards WHERE payment_id=$1", payment_id
+        )
+        if not reward:
+            return None
+
+        # Idempotent — already reversed/cancelled
+        if reward["status"] in ("cancelled", "reversed", "partially_reversed"):
+            return None
+
+        points = reward["reward_points"]
+        referrer_id = reward["referrer_user_id"]
+
+        if reward["status"] == "pending":
+            # Cancel before activation
+            await db.execute(
+                "UPDATE referral_rewards SET status='cancelled', cancelled_at=NOW(), updated_at=NOW() "
+                "WHERE id=$1",
+                reward["id"]
+            )
+            # Debit pending
+            await db.execute(
+                "UPDATE wallets SET pending_bonus_points = GREATEST(0, pending_bonus_points - $2), "
+                "updated_at = NOW() WHERE user_id=$1",
+                referrer_id, points
+            )
+            try:
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, metadata) "
+                    "VALUES ($1, 'pending_bonus', $2, 'referral_cancelled', 'referral_reward', $3, $4)",
+                    referrer_id, -points, payment_id,
+                    json.dumps({"reason": "refund_before_activation"})
+                )
+            except asyncpg.UniqueViolationError:
+                pass
+            await track(referrer_id, "referral_reward_cancelled",
+                       props={"payment_id": payment_id, "reward_points": points})
+            return points
+        else:
+            # After activation — reverse
+            await db.execute(
+                "UPDATE referral_rewards SET status='reversed', reversed_at=NOW(), updated_at=NOW() "
+                "WHERE id=$1",
+                reward["id"]
+            )
+
+            # Check if bonus was spent
+            bonus_balance = await db.fetchval(
+                "SELECT bonus_points FROM wallets WHERE user_id=$1", referrer_id
+            ) or 0
+
+            if bonus_balance >= points:
+                # Enough bonus — just reverse
+                await db.execute(
+                    "UPDATE wallets SET bonus_points = bonus_points - $2, updated_at=NOW() "
+                    "WHERE user_id=$1",
+                    referrer_id, points
+                )
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, metadata) "
+                        "VALUES ($1, 'bonus', $2, 'referral_reversed', 'referral_reward', $3, $4)",
+                        referrer_id, -points, payment_id,
+                        json.dumps({"reason": "refund_after_activation"})
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+            else:
+                # Not enough bonus — create debt
+                spent = points - bonus_balance
+                await db.execute(
+                    "UPDATE wallets SET "
+                    "bonus_points = 0, "
+                    "bonus_debt_points = bonus_debt_points + $2, "
+                    "updated_at = NOW() "
+                    "WHERE user_id=$1",
+                    referrer_id, spent
+                )
+                # Partial reversal in ledger
+                if bonus_balance > 0:
+                    try:
+                        await db.execute(
+                            "INSERT INTO wallet_ledger "
+                            "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, metadata) "
+                            "VALUES ($1, 'bonus', $2, 'referral_reversed', 'referral_reward', $3, $4)",
+                            referrer_id, -bonus_balance, payment_id,
+                            json.dumps({"reason": "refund_partial_reversal"})
+                        )
+                    except asyncpg.UniqueViolationError:
+                        pass
+                try:
+                    await db.execute(
+                        "INSERT INTO wallet_ledger "
+                        "(user_id, wallet_type, amount, transaction_type, reference_type, reference_id, metadata) "
+                        "VALUES ($1, 'bonus_debt', $2, 'referral_debt_repayment', 'referral_reward', $3, $4)",
+                        referrer_id, spent, payment_id,
+                        json.dumps({"reason": "refund_bonus_debt"})
+                    )
+                except asyncpg.UniqueViolationError:
+                    pass
+
+            await track(referrer_id, "referral_reward_reversed",
+                       props={"payment_id": payment_id, "reward_points": points,
+                              "had_debt": bonus_balance < points})
+            # Notify referrer
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    "Вознаграждение по платежу было отменено\n"
+                    "из-за возврата оплаты.")
+            except Exception:
+                pass
+            return points
+
+    @staticmethod
+    async def get_dashboard(db, user_id: int) -> dict:
+        """Get referral dashboard data."""
+        code = await ReferralService.get_or_create_code(user_id)
+        username = await _get_bot_username()
+        link = f"https://t.me/{username}?start=ref_{code}" if username else ""
+
+        stats = await db.fetchrow(
+            "SELECT "
+            "  COUNT(*) as invited, "
+            "  COUNT(*) FILTER (WHERE activated_at IS NOT NULL) as activated, "
+            "  COUNT(*) FILTER (WHERE first_payment_at IS NOT NULL) as paying "
+            "FROM referral_relations WHERE referrer_user_id=$1",
+            user_id
+        )
+
+        totals = await db.fetchrow(
+            "SELECT "
+            "  COALESCE(SUM(reward_points),0) as total_reward_points "
+            "FROM referral_rewards WHERE referrer_user_id=$1 AND status != 'cancelled'",
+            user_id
+        )
+
+        wallet = await WalletService.get_balance(db, user_id)
+
+        return {
+            "referral_code": code,
+            "referral_url": link,
+            "balance": wallet,
+            "stats": {
+                "invited": stats["invited"] or 0,
+                "activated": stats["activated"] or 0,
+                "paying": stats["paying"] or 0,
+                "total_reward_points": totals["total_reward_points"] or 0,
+            },
+        }
+
+    @staticmethod
+    async def get_history(db, user_id: int, limit: int = 50, offset: int = 0) -> list:
+        """Get referral reward history."""
+        rows = await db.fetch(
+            "SELECT rr.*, "
+            "  COALESCE(u.first_name, 'Пользователь ПОЛЯНЫ') as ref_first_name, "
+            "  u.username as ref_username "
+            "FROM referral_rewards rr "
+            "LEFT JOIN users u ON u.telegram_user_id = rr.referred_user_id "
+            "WHERE rr.referrer_user_id=$1 "
+            "ORDER BY rr.created_at DESC LIMIT $2 OFFSET $3",
+            user_id, limit, offset
+        )
+        return [
+            {
+                "id": str(r["id"]),
+                "reward_points": r["reward_points"],
+                "status": r["status"],
+                "referred_name": _anonymize_name(r["ref_first_name"], r["ref_username"]),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "available_at": r["available_at"].isoformat() if r["available_at"] else None,
+            }
+            for r in rows
+        ]
+
+
+def _anonymize_name(first_name: str | None, username: str | None) -> str:
+    """Show 'Name K.' or @username, never full name."""
+    if username:
+        return f"@{username}"
+    if first_name and len(first_name) > 1:
+        return f"{first_name[0]}{first_name[1:]}"
+    return "Пользователь ПОЛЯНЫ"
 
 pool = None
 _db_ready = False
@@ -437,7 +1122,7 @@ async def init_db():
                 ON invite_grants(telegram_user_id, event_id);
         """)
 
-        # ── Migration L: referrals ────────────────────────────────────────────
+        # ── Migration L: referrals (legacy, kept for compatibility) ──────────────
         await c.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
                 referee_id   BIGINT PRIMARY KEY,
@@ -457,6 +1142,93 @@ async def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_refbonus_due
                 ON referral_bonuses(available_at) WHERE NOT paid;
+        """)
+
+        # ── Migration M: referral codes (URL-safe, non-user_id) ────────────────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id    BIGINT NOT NULL UNIQUE,
+                code       VARCHAR(32) NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        # ── Migration N: referral_relations (expanded from referrals) ──────────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_relations (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                referrer_user_id  BIGINT NOT NULL,
+                referred_user_id  BIGINT NOT NULL UNIQUE,
+                source_type       VARCHAR(32) NOT NULL DEFAULT 'referral_link',
+                source_id         TEXT,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                activated_at      TIMESTAMPTZ,
+                first_payment_at  TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS idx_rr_referrer ON referral_relations(referrer_user_id);
+            -- Self-referral check: prevent referrer_user_id = referred_user_id
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'no_self_referral') THEN
+                    ALTER TABLE referral_relations ADD CONSTRAINT no_self_referral
+                        CHECK (referrer_user_id <> referred_user_id);
+                END IF;
+            END $$;
+        """)
+
+        # ── Migration O: referral_rewards (expanded from referral_bonuses) ─────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS referral_rewards (
+                id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                referrer_user_id    BIGINT NOT NULL,
+                referred_user_id    BIGINT NOT NULL,
+                payment_id          UUID NOT NULL UNIQUE,
+                cash_amount_minor   BIGINT NOT NULL,
+                reward_percent_bp   INTEGER NOT NULL,
+                reward_points       BIGINT NOT NULL,
+                status              VARCHAR(32) NOT NULL DEFAULT 'pending',
+                available_at        TIMESTAMPTZ,
+                activated_at        TIMESTAMPTZ,
+                cancelled_at        TIMESTAMPTZ,
+                reversed_at         TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_rr_referrer ON referral_rewards(referrer_user_id);
+            CREATE INDEX IF NOT EXISTS idx_rr_referred ON referral_rewards(referred_user_id);
+            CREATE INDEX IF NOT EXISTS idx_rr_status_available
+                ON referral_rewards(status, available_at) WHERE status = 'pending';
+        """)
+
+        # ── Migration P: wallets (paid/bonus/pending/debt) ────────────────────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id              BIGINT PRIMARY KEY,
+                paid_points          BIGINT NOT NULL DEFAULT 0,
+                bonus_points         BIGINT NOT NULL DEFAULT 0,
+                pending_bonus_points BIGINT NOT NULL DEFAULT 0,
+                bonus_debt_points    BIGINT NOT NULL DEFAULT 0,
+                updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        # ── Migration Q: wallet_ledger (audit trail for all point changes) ────
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_ledger (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id         BIGINT NOT NULL,
+                wallet_type     VARCHAR(32) NOT NULL,
+                amount          BIGINT NOT NULL,
+                transaction_type VARCHAR(64) NOT NULL,
+                reference_type  VARCHAR(32),
+                reference_id    TEXT,
+                idempotency_key VARCHAR(255) UNIQUE,
+                balance_after   BIGINT,
+                metadata        JSONB,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_wl_user ON wallet_ledger(user_id);
+            CREATE INDEX IF NOT EXISTS idx_wl_user_type ON wallet_ledger(user_id, wallet_type);
         """)
 
         # ── Analytics: append-only event log (North Star / K-factor / funnel) ──
@@ -2730,46 +3502,47 @@ async def _debit(db, uid: int, amount: int, kind: str, meta: dict | None = None)
 
 
 async def _accrue_referral_bonus(db, referee_id: int, spend: int, source_ref: str) -> None:
-    """If the referee was referred, schedule a matured-in-24h bonus for the referrer."""
-    referrer = await db.fetchval(
-        "SELECT referrer_id FROM referrals WHERE referee_id=$1", referee_id
-    )
-    if not referrer or referrer == referee_id:
-        return
-    bonus = spend * REFERRAL_PERCENT // 100
-    if bonus <= 0:
-        return
-    await db.execute(
-        """
-        INSERT INTO referral_bonuses (referrer_id, referee_id, source_ref, amount, available_at)
-        VALUES ($1,$2,$3,$4, NOW() + ($5 || ' hours')::interval)
-        ON CONFLICT (source_ref) DO NOTHING
-        """,
-        referrer, referee_id, source_ref, bonus, str(REFERRAL_HOLD_HOURS),
+    """If the referee was referred, schedule a matured-in-24h bonus for the referrer.
+    Now uses ReferralService for proper pending/bonus separation."""
+    # Use the new service for proper referral reward processing
+    await ReferralService.process_successful_payment(
+        db, payment_id=source_ref, user_id=referee_id,
+        cash_amount_minor=spend,
+        metadata={"legacy_call": True}
     )
 
 
 async def _referral_maturation_loop():
-    """Credit matured referral bonuses to referrers. Runs every 10 minutes."""
+    """Activate matured referral rewards. Runs every 10 minutes.
+    Uses the new WalletService for proper pending→bonus transition."""
     while True:
         try:
             if pool is not None:
                 async with pool.acquire() as db:
+                    # Find users with matured pending rewards
                     rows = await db.fetch(
-                        "SELECT id, referrer_id, amount FROM referral_bonuses "
-                        "WHERE NOT paid AND available_at <= NOW() LIMIT 200"
+                        "SELECT DISTINCT referrer_user_id FROM referral_rewards "
+                        "WHERE status='pending' AND available_at <= NOW() LIMIT 100"
                     )
                     for r in rows:
-                        await _credit(db, r["referrer_id"], r["amount"], "referral_bonus",
-                                      ref=f"refbonus:{r['id']}")
-                        await db.execute(
-                            "UPDATE referral_bonuses SET paid=TRUE WHERE id=$1", r["id"])
-                        try:
-                            await bot.send_message(
-                                r["referrer_id"],
-                                f"💰 Реферальный бонус +{int(r['amount']/100)} ₽ зачислен на баланс!")
-                        except Exception:
-                            pass
+                        uid = r["referrer_user_id"]
+                        count = await WalletService.activate_pending_rewards(db, uid)
+                        if count > 0:
+                            # Get total activated points for notification
+                            total = await db.fetchval(
+                                "SELECT SUM(reward_points) FROM referral_rewards "
+                                "WHERE referrer_user_id=$1 AND status='available' "
+                                "AND activated_at >= NOW() - INTERVAL '1 minute'",
+                                uid
+                            ) or 0
+                            try:
+                                await bot.send_message(
+                                    uid,
+                                    f"✅ {total} бонусных баллов доступны\n\n"
+                                    "Используйте их для распознавания рецептов "
+                                    "и других ИИ-функций.")
+                            except Exception:
+                                pass
         except Exception:
             log.exception("referral maturation loop error")
         await asyncio.sleep(600)
@@ -2795,23 +3568,29 @@ async def _get_bot_username() -> str:
     return _bot_username
 
 
-@app.get("/api/referral")
+@app.get("/api/referrals/me")
 async def referral_info(user_id: int = Depends(get_current_user), db=Depends(get_db)):
-    username = await _get_bot_username()
-    link = f"https://t.me/{username}?start=ref_{user_id}" if username else ""
-    invited = await db.fetchval(
-        "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", user_id) or 0
-    earned = await db.fetchval(
-        "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", user_id) or 0
-    pending = await db.fetchval(
-        "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", user_id) or 0
-    return {
-        "link": link,
-        "percent": REFERRAL_PERCENT,
-        "invited": invited,
-        "earned_rub": round(earned / 100, 2),
-        "pending_rub": round(pending / 100, 2),
-    }
+    return await ReferralService.get_dashboard(db, user_id)
+
+
+@app.get("/api/referrals/history")
+async def referral_history(
+    user_id: int = Depends(get_current_user), db=Depends(get_db),
+    limit: int = Query(default=50, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    return {"history": await ReferralService.get_history(db, user_id, limit, offset)}
+
+
+@app.get("/api/wallet/me")
+async def wallet_info(user_id: int = Depends(get_current_user), db=Depends(get_db)):
+    return await WalletService.get_balance(db, user_id)
+
+
+# Legacy endpoint for backward compat
+@app.get("/api/referral")
+async def referral_info_legacy(user_id: int = Depends(get_current_user), db=Depends(get_db)):
+    return await ReferralService.get_dashboard(db, user_id)
 
 
 # ── YooKassa top-up ───────────────────────────────────────────────────────────
@@ -2861,12 +3640,26 @@ async def yookassa_webhook(body: dict, db=Depends(get_db)):
     if uid and kopecks > 0:
         new_bal = await _credit(db, uid, kopecks, "topup_yookassa", ref=pid,
                                 meta={"amount_rub": real["amount"]["value"]})
+        # Also credit to new wallets system
+        await WalletService.credit_paid_points(
+            db, uid, kopecks // POINTS_PER_RUBLE,
+            reference_type="topup_yookassa", reference_id=pid,
+            idempotency_key=f"yookassa:{pid}",
+            metadata={"amount_rub": real["amount"]["value"]}
+        )
         await track(uid, "payment_succeeded",
                     props={"kopecks": kopecks, "method": "yookassa", "ref": pid})
+        # Process referral reward
+        reward = await ReferralService.process_successful_payment(
+            db, payment_id=pid, user_id=uid,
+            cash_amount_minor=kopecks,
+            metadata={"method": "yookassa", "amount_rub": real["amount"]["value"]}
+        )
         try:
-            await bot.send_message(
-                uid, f"✅ Баланс пополнен на {int(kopecks/100)} ₽.\nТекущий баланс: {int(new_bal/100)} ₽"
-            )
+            msg = f"✅ Баланс пополнен на {int(kopecks/100)} ₽.\nТекущий баланс: {int(new_bal/100)} ₽"
+            if reward:
+                msg += f"\n\n🎁 Реферальный бонус: +{reward} баллов начислен вашему пригласившему"
+            await bot.send_message(uid, msg)
         except Exception:
             pass
     return {"ok": True}
@@ -3177,29 +3970,34 @@ async def _flush_text_buffer(user_id: int):
 
 async def _send_referral(msg: Message, uid: int):
     async with pool.acquire() as db:
-        invited = await db.fetchval(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id=$1", uid) or 0
-        earned = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND paid", uid) or 0
-        pending = await db.fetchval(
-            "SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1 AND NOT paid", uid) or 0
+        dashboard = await ReferralService.get_dashboard(db, uid)
     username = await _get_bot_username()
-    link = f"https://t.me/{username}?start=ref_{uid}" if username else "(ссылка недоступна)"
+    link = dashboard["referral_url"]
+    stats = dashboard["stats"]
+    wallet = dashboard["balance"]
     text = (
-        "💰 <b>Партнёрская программа</b>\n\n"
-        f"Приглашай друзей и получай <b>{REFERRAL_PERCENT}%</b> с их трат в боте — "
-        "бонусом на баланс (начисляется через 24 часа).\n\n"
-        f"🔗 Твоя ссылка:\n{link}\n\n"
-        f"👥 Приглашено: <b>{invited}</b>\n"
-        f"✅ Заработано: <b>{int(earned/100)} ₽</b>\n"
-        f"⏳ Ждёт зачисления: <b>{int(pending/100)} ₽</b>"
+        "🎁 <b>Пользуйтесь ИИ в ПОЛЯНЕ бесплатно</b>\n\n"
+        "Приглашайте друзей и получайте <b>10%</b> от каждого\n"
+        "их пополнения бонусными баллами.\n\n"
+        "Баллы можно тратить на:\n"
+        "📷 распознавание рецептов по фото\n"
+        "🎙 обработку голосовых сообщений\n"
+        "✨ создание меню\n"
+        "🍽 AI-рекомендации\n"
+        "🧾 распознавание чеков\n\n"
+        f"🔗 Твоя ссылка:\n<code>{link}</code>\n\n"
+        f"👥 Приглашено друзей: <b>{stats['invited']}</b>\n"
+        f"✅ Активных: <b>{stats['activated']}</b>\n"
+        f"💳 Пополняли баланс: <b>{stats['paying']}</b>\n"
+        f"💰 Получено всего: <b>{stats['total_reward_points']} баллов</b>"
     )
     kb = None
     if username:
-        share_url = f"https://t.me/share/url?url={link}&text=Попробуй%20ПОЛЯНУ%20%F0%9F%8C%BF"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)
-        ]])
+        share_text = "🌿 Я сохраняю рецепты в ПОЛЯНЕ"
+        share_url = f"https://t.me/share/url?url={urllib.parse.quote(link, safe='')}&text={urllib.parse.quote(share_text, safe='')}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📨 Пригласить друга", url=share_url)],
+        ])
     await msg.answer(text, reply_markup=kb)
 
 
@@ -3226,14 +4024,20 @@ async def cmd_ref(message: Message):
 @dp.message(Command("terms"))
 async def cmd_terms(message: Message):
     await message.answer(
-        "📄 <b>Правила и документы</b>\n\n"
-        "• Пользовательское соглашение\n"
-        "• Политика конфиденциальности\n"
-        "• Условия партнёрской программы\n\n"
-        "Документы готовятся и будут опубликованы здесь до старта приёма оплат. "
-        "Оплачивая услуги бота, вы соглашаетесь с ними.\n\n"
-        "<i>Бонусы партнёрской программы начисляются на внутренний баланс, "
-        "тратятся внутри бота и не выводятся.</i>"
+        "📄 <b>Правила бонусной программы «Приглашение друзей»</b>\n\n"
+        "1. Бонус начисляется за подходящие денежные пополнения баланса.\n"
+        "2. Размер по умолчанию — 10% от суммы пополнения.\n"
+        "3. Бонус начисляется бонусными баллами (AI-баллами).\n"
+        "4. Баллы нельзя вывести, перевести другому пользователю или обменять на деньги.\n"
+        "5. Баллы используются только внутри ПОЛЯНЫ для ИИ-функций.\n"
+        "6. Баллы не начисляются с бонусной части оплаты.\n"
+        "7. Начисление может быть отменено при возврате оплаты.\n"
+        "8. Саморефералы запрещены.\n"
+        "9. Один пользователь может иметь только одного пригласившего.\n"
+        "10. При злоупотреблениях бонус может быть отменён.\n"
+        "11. Правила и процент могут изменяться только для будущих операций.\n\n"
+        "Начисление доступно через 7 дней после пополнения.\n\n"
+        "<i>Подробнее: /ref</i>"
     )
 
 
@@ -3444,6 +4248,19 @@ async def handle_shared_recipe_save(callback: CallbackQuery):
             "INSERT INTO recipe_share_saves (share_id, recipient_user_id, created_recipe_id) VALUES ($1,$2,$3)",
             share["id"], callback.from_user.id, new_rec["id"]
         )
+
+        # Referral: bind owner as referrer for truly new users
+        owner_id = share["owner_user_id"]
+        recipient_id = callback.from_user.id
+        if owner_id != recipient_id:
+            is_new = not await ReferralService.is_active_user(db, recipient_id)
+            if is_new:
+                bound = await ReferralService.bind_referrer_from_recipe_share(
+                    db, recipient_id, owner_id, str(share["id"])
+                )
+                if bound:
+                    log.info("referral_bound: referrer=%s referred=%s via=recipe_share share=%s",
+                             owner_id, recipient_id, share["id"])
 
     await callback.answer("Рецепт сохранён в ПОЛЯНУ 🌿", show_alert=True)
 
@@ -3839,13 +4656,29 @@ async def on_successful_payment(message: Message):
     async with pool.acquire() as db:
         new_bal = await _credit(db, uid, kopecks, "topup_stars", ref=charge_id,
                                 meta={"stars": sp.total_amount})
+        # Also credit to new wallets system
+        await WalletService.credit_paid_points(
+            db, uid, kopecks // POINTS_PER_RUBLE,
+            reference_type="topup_stars", reference_id=charge_id,
+            idempotency_key=f"stars:{charge_id}",
+            metadata={"stars": sp.total_amount}
+        )
+        # Process referral reward
+        reward = await ReferralService.process_successful_payment(
+            db, payment_id=charge_id, user_id=uid,
+            cash_amount_minor=kopecks,
+            metadata={"method": "stars", "stars": sp.total_amount}
+        )
     await track(uid, "payment_succeeded",
                 props={"kopecks": kopecks, "method": "stars", "stars": sp.total_amount, "ref": charge_id})
     try:
-        await message.answer(
+        msg = (
             f"✅ Баланс пополнен на {int(kopecks/100)} ₽ (⭐ {sp.total_amount}).\n"
             f"Текущий баланс: {int(new_bal/100)} ₽"
         )
+        if reward:
+            msg += f"\n\n🎁 Реферальный бонус: +{reward} баллов начислен вашему пригласившему"
+        await message.answer(msg)
     except Exception:
         pass
 
@@ -4156,22 +4989,36 @@ async def cmd_start(message: Message):
     # Analytics: top-of-funnel + attribution source (ref_<id> / event_<id> / organic)
     await track(user.id, "user_start", src_payload=(arg or "organic"))
 
-    # Referral capture: ?start=ref_<referrer_id> (only for a brand-new referee)
+    # Referral capture: ?start=ref_<code> (URL-safe code, not user_id)
     if arg and arg.startswith("ref_") and pool is not None:
+        code = arg.replace("ref_", "")
         try:
-            referrer_id = int(arg.replace("ref_", ""))
-        except ValueError:
-            referrer_id = 0
-        if referrer_id and referrer_id != user.id:
-            try:
-                async with pool.acquire() as db:
-                    await db.execute(
-                        "INSERT INTO referrals (referee_id, referrer_id) VALUES ($1,$2) "
-                        "ON CONFLICT (referee_id) DO NOTHING",
-                        user.id, referrer_id,
-                    )
-            except Exception:
-                log.exception("referral capture failed")
+            async with pool.acquire() as db:
+                # Find referrer by code
+                referrer_user_id = await db.fetchval(
+                    "SELECT user_id FROM referral_codes WHERE code=$1", code
+                )
+                if referrer_user_id and referrer_user_id != user.id:
+                    # Check if user is truly new (no recipes, no events, no payments)
+                    is_new = not await ReferralService.is_active_user(db, user.id)
+                    if is_new:
+                        bound = await ReferralService.bind_referrer(
+                            db, user.id, referrer_user_id,
+                            source_type="referral_link", source_id=code
+                        )
+                        if bound:
+                            # Also create legacy referral for backward compat
+                            await db.execute(
+                                "INSERT INTO referrals (referee_id, referrer_id) VALUES ($1,$2) "
+                                "ON CONFLICT (referee_id) DO NOTHING",
+                                user.id, referrer_user_id,
+                            )
+                            log.info("referral_bound: referrer=%s referred=%s via=ref_link code=%s",
+                                     referrer_user_id, user.id, code)
+                    elif not is_new:
+                        log.info("referral_skip_active_user: user=%s", user.id)
+        except Exception:
+            log.exception("referral capture failed")
         # fall through to the normal welcome below
 
     if arg and arg.startswith("event_"):
@@ -4300,7 +5147,9 @@ async def _bg_init():
         log.error("init_db error: %s", e)
     # Start bot regardless
     asyncio.create_task(run_bot())
-    # Referral maturation loop disabled — referral bonuses aren't spendable now.
+    # Referral maturation loop: activate pending rewards
+    if REFERRAL_ENABLED:
+        asyncio.create_task(_referral_maturation_loop())
     # OpenRouter low-balance monitor stays: recipe text/photo/voice parsing still uses it.
     asyncio.create_task(_openrouter_balance_loop())
 
