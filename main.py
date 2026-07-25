@@ -5824,6 +5824,11 @@ async def _send_onboarding_step(event, user_id: int, step: int,
         await event.answer(text, reply_markup=kb)
 
 
+# ── Bot & Dispatcher ──────────────────────────────────────────────────────────
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+
+
 # ── Onboarding Callback Handlers ─────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("ob_next:"))
@@ -6151,10 +6156,6 @@ async def cb_ws_back(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer()
-
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
 
 
 # ── Bot helpers ───────────────────────────────────────────────────────────────
