@@ -5638,12 +5638,18 @@ async def _show_consent_prompt(event, user_id: int, consent_type: str):
             "Чтобы пользоваться ПОЛЯНОЙ, ознакомьтесь с документами.\n\n"
             "Необходимо принять:\n"
             "• Пользовательское соглашение\n"
-            "• Согласие на обработку персональных данных"
+            "• Согласие на обработку персональных данных\n"
+            "• Использование ИИ для обработки присланных материалов"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Открыть документы", callback_data="show_documents")],
-            [InlineKeyboardButton(text="✅ Принять соглашение", callback_data="ob_accept:terms")],
-            [InlineKeyboardButton(text="✅ Дать согласие на данные", callback_data="ob_accept:personal_data_consent")],
+            [InlineKeyboardButton(
+                text="✅ Принять все условия",
+                callback_data="ob_accept_all",
+            )],
+            [InlineKeyboardButton(
+                text="📋 Открыть документы",
+                callback_data="show_documents",
+            )],
         ])
     else:
         return
@@ -5761,7 +5767,12 @@ async def _send_onboarding_step(event, user_id: int, step: int,
             status = await LegalConsentService.get_user_acceptance_status(db, user_id)
         terms_ok = "✅" if status.get("terms", {}).get("accepted") else "⬜"
         pdn_ok = "✅" if status.get("personal_data_consent", {}).get("accepted") else "⬜"
-        status_text = f"{terms_ok} Пользовательское соглашение\n{pdn_ok} Обработка персональных данных"
+        ai_ok = "✅" if status.get("ai_processing_consent", {}).get("accepted") else "⬜"
+        status_text = (
+            f"{terms_ok} Пользовательское соглашение\n"
+            f"{pdn_ok} Обработка персональных данных\n"
+            f"{ai_ok} Использование ИИ для обработки рецептов"
+        )
         text = text.replace("{status_text}", status_text)
 
     # Build keyboard
@@ -5770,19 +5781,34 @@ async def _send_onboarding_step(event, user_id: int, step: int,
         # Legal screen — dynamic buttons
         async with pool.acquire() as db:
             status = await LegalConsentService.get_user_acceptance_status(db, user_id)
-        if not status.get("terms", {}).get("accepted"):
-            buttons.append([InlineKeyboardButton(text="✅ Принять соглашение",
-                                                  callback_data="ob_accept:terms")])
-        if not status.get("personal_data_consent", {}).get("accepted"):
-            buttons.append([InlineKeyboardButton(text="✅ Дать согласие на данные",
-                                                  callback_data="ob_accept:personal_data_consent")])
-        buttons.append([InlineKeyboardButton(text="📋 Открыть документы",
-                                              callback_data="show_documents")])
-        all_ok = (status.get("terms", {}).get("accepted") and
-                  status.get("personal_data_consent", {}).get("accepted"))
+        all_ok = (
+            status.get("terms", {}).get("accepted")
+            and status.get("personal_data_consent", {}).get("accepted")
+            and status.get("ai_processing_consent", {}).get("accepted")
+        )
+
+        if not all_ok:
+            buttons.append([
+                InlineKeyboardButton(
+                    text="✅ Принять все условия",
+                    callback_data="ob_accept_all",
+                )
+            ])
+
+        buttons.append([
+            InlineKeyboardButton(
+                text="📋 Открыть документы",
+                callback_data="show_documents",
+            )
+        ])
+
         if all_ok:
-            buttons.append([InlineKeyboardButton(text="Продолжить",
-                                                  callback_data=f"ob_next:{step}")])
+            buttons.append([
+                InlineKeyboardButton(
+                    text="Продолжить",
+                    callback_data=f"ob_next:{step}",
+                )
+            ])
     elif step == _ONB_STEP_COMPLETED:
         buttons.append([InlineKeyboardButton(text="📷 Отправить рецепт",
                                               callback_data="ob_action:send_recipe")])
@@ -5880,6 +5906,67 @@ async def cb_ob_skip(callback: CallbackQuery):
         await UserService.update_onboarding_step(db, uid, _ONB_STEP_LEGAL, "legal_pending")
     await _send_onboarding_step(callback, uid, _ONB_STEP_LEGAL)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "ob_accept_all")
+async def cb_ob_accept_all(callback: CallbackQuery):
+    """Accept all documents required during onboarding in one explicit action."""
+    if not callback.from_user or pool is None:
+        await callback.answer()
+        return
+
+    uid = callback.from_user.id
+    context = {
+        "source": "telegram_bot",
+        "message_id": callback.message.message_id if callback.message else None,
+        "chat_id": callback.message.chat.id if callback.message else None,
+    }
+
+    required_documents = (
+        "terms",
+        "personal_data_consent",
+        "ai_processing_consent",
+    )
+
+    try:
+        async with pool.acquire() as db:
+            for doc_type in required_documents:
+                document = await LegalConsentService.get_active_document(
+                    db,
+                    doc_type,
+                )
+                if not document:
+                    raise ValueError(
+                        f"Active legal document not found: {doc_type}"
+                    )
+
+                await LegalConsentService.accept_document(
+                    db,
+                    uid,
+                    doc_type,
+                    document["version"],
+                    context,
+                )
+
+            await UserService.update_onboarding_step(
+                db,
+                uid,
+                _ONB_STEP_LEGAL,
+            )
+
+        await _send_onboarding_step(
+            callback,
+            uid,
+            _ONB_STEP_LEGAL,
+        )
+        await callback.answer("✅ Условия приняты")
+
+    except Exception as e:
+        log.exception("accept all consents failed: %s", e)
+        await callback.answer(
+            "Не удалось сохранить согласие. Попробуйте ещё раз.",
+            show_alert=True,
+        )
 
 
 @dp.callback_query(F.data.startswith("ob_accept:"))
@@ -6219,11 +6306,13 @@ async def _flush_text_buffer(user_id: int):
     try:
         recipe = await parse_and_save_recipe(user_id, text=combined)
         await _reply_recipe_saved(status, recipe, status_msg=status)
-    except ValueError:
-        try:
-            await status.delete()
-        except Exception:
-            pass
+    except ValueError as e:
+        log.warning(
+            "Text recipe parse failed: user=%s error=%s",
+            user_id,
+            e,
+        )
+        await _reply_parse_error(status, e, "рецепт")
     except Exception as e:
         await _reply_parse_error(status, e, "рецепт")
 

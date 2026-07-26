@@ -72,7 +72,7 @@ REQUIRES_ACCEPTANCE = {
     "terms": True,
     "privacy_policy": False,  # info only, not gated
     "personal_data_consent": True,
-    "ai_processing_consent": False,  # gated separately before first AI action
+    "ai_processing_consent": True,   # accepted once during onboarding
     "referral_terms": False,  # info only
 }
 
