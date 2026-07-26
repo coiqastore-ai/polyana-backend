@@ -1323,6 +1323,13 @@ AI_OPERATION_CATALOG = {
         "fallback_model": None,
         "enabled": True,
     },
+    "recipe_generate": {
+        "title": "Генерация рецепта",
+        "points": 3,
+        "model": "google/gemini-2.5-flash-lite",
+        "fallback_model": "google/gemini-2.5-flash",
+        "enabled": FEATURE_AI_RECIPE_GENERATION,
+    },
     "recipe_image_generate": {
         "title": "Генерация изображения блюда",
         "points": 20,
@@ -5497,6 +5504,11 @@ class VoiceStates(StatesGroup):
     editing = State()   # User is typing a corrected transcript
 
 
+class RecipeGenerationStates(StatesGroup):
+    awaiting_prompt = State()
+    preview = State()
+
+
 # FSM states for onboarding flow
 class OnboardingStates(StatesGroup):
     welcome = State()       # Screen 1: welcome
@@ -6177,6 +6189,7 @@ async def cb_ws_help(callback: CallbackQuery):
         "<b>Команды:</b>\n"
         "/start — главное меню\n"
         "/add — добавить рецепт\n"
+        "/generate — придумать новый рецепт\n"
         "/ref — партнёрская программа\n"
         "/documents — юридические документы\n"
         "/privacy — данные и конфиденциальность\n"
@@ -6348,6 +6361,717 @@ async def _send_referral(msg: Message, uid: int):
             [InlineKeyboardButton(text="📨 Пригласить друга", url=share_url)],
         ])
     await msg.answer(text, reply_markup=kb)
+
+
+
+# ── Recipe generation MVP ─────────────────────────────────────────────────────
+
+_GENERATION_LOCKS: set[int] = set()
+
+_GENERATION_CATEGORIES = {
+    "завтрак",
+    "обед",
+    "ужин",
+    "десерт",
+    "суп",
+    "салат",
+    "закуска",
+    "напиток",
+    "выпечка",
+    "другое",
+}
+
+
+def _generation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="💾 Сохранить",
+                callback_data="gen_save",
+            ),
+            InlineKeyboardButton(
+                text="🔄 Другой вариант",
+                callback_data="gen_retry",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="gen_cancel",
+            ),
+        ],
+    ])
+
+
+def _clean_generated_recipe(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("ИИ вернул результат неправильного формата")
+
+    name = str(data.get("name") or "").strip()
+    if len(name) < 2:
+        raise ValueError("ИИ не указал название блюда")
+
+    raw_ingredients = data.get("ingredients")
+    if not isinstance(raw_ingredients, list):
+        raise ValueError("ИИ не сформировал список ингредиентов")
+
+    ingredients = []
+
+    for item in raw_ingredients[:40]:
+        if not isinstance(item, dict):
+            continue
+
+        ingredient_name = str(
+            item.get("name") or ""
+        ).strip()
+
+        if not ingredient_name:
+            continue
+
+        qty = item.get("qty")
+
+        if qty not in (None, "", 0):
+            try:
+                qty = float(
+                    str(qty).replace(",", ".")
+                )
+            except (TypeError, ValueError):
+                qty = None
+        else:
+            qty = None
+
+        ingredients.append({
+            "name": ingredient_name[:160],
+            "qty": qty,
+            "unit": str(
+                item.get("unit") or ""
+            ).strip()[:30],
+        })
+
+    raw_steps = data.get("steps")
+    if not isinstance(raw_steps, list):
+        raise ValueError("ИИ не сформировал шаги приготовления")
+
+    steps = []
+
+    for item in raw_steps[:30]:
+        if isinstance(item, dict):
+            step_text = str(
+                item.get("text") or ""
+            ).strip()
+        else:
+            step_text = str(item or "").strip()
+
+        if step_text:
+            steps.append({
+                "text": step_text[:1200],
+            })
+
+    if len(ingredients) < 2:
+        raise ValueError("Получилось слишком мало ингредиентов")
+
+    if len(steps) < 2:
+        raise ValueError("Получилось слишком мало шагов приготовления")
+
+    try:
+        servings = int(data.get("servings") or 4)
+    except (TypeError, ValueError):
+        servings = 4
+
+    servings = max(1, min(servings, 50))
+
+    try:
+        cook_time = int(
+            data.get("cook_time_minutes") or 30
+        )
+    except (TypeError, ValueError):
+        cook_time = 30
+
+    cook_time = max(1, min(cook_time, 1440))
+
+    category = str(
+        data.get("category") or "другое"
+    ).strip().lower()
+
+    if category not in _GENERATION_CATEGORIES:
+        category = "другое"
+
+    emoji = str(data.get("emoji") or "🍽").strip()
+    if not emoji:
+        emoji = "🍽"
+
+    return {
+        "name": name[:160],
+        "name_original": None,
+        "emoji": emoji[:12],
+        "servings": servings,
+        "cook_time_minutes": cook_time,
+        "category": category,
+        "original_language": "ru",
+        "source_type": "ai_generated",
+        "ingredients": ingredients,
+        "steps": steps,
+    }
+
+
+def _format_generated_recipe_preview(recipe: dict) -> str:
+    lines = [
+        "🍲 <b>Вот что получилось</b>",
+        "",
+        f"{_esc(recipe['emoji'])} <b>{_esc(recipe['name'])}</b>",
+        (
+            f"🍽 {recipe['servings']} порц. · "
+            f"⏱ {recipe['cook_time_minutes']} мин. · "
+            f"{_esc(recipe['category'])}"
+        ),
+        "",
+        "<b>Ингредиенты:</b>",
+    ]
+
+    for ingredient in recipe["ingredients"]:
+        qty = ingredient.get("qty")
+        unit = ingredient.get("unit") or ""
+
+        amount = ""
+
+        if qty is not None:
+            if float(qty).is_integer():
+                qty_text = str(int(qty))
+            else:
+                qty_text = (
+                    f"{qty:.2f}"
+                    .rstrip("0")
+                    .rstrip(".")
+                )
+
+            amount = f" — {qty_text}"
+            if unit:
+                amount += f" {_esc(unit)}"
+
+        lines.append(
+            f"• {_esc(ingredient['name'])}{amount}"
+        )
+
+    lines.extend([
+        "",
+        "<b>Приготовление:</b>",
+    ])
+
+    for index, step in enumerate(
+        recipe["steps"],
+        start=1,
+    ):
+        lines.append(
+            f"{index}. {_esc(step['text'])}"
+        )
+
+    lines.extend([
+        "",
+        "Сохранить этот рецепт в библиотеку?",
+    ])
+
+    return "\n".join(lines)
+
+
+async def _generate_recipe_draft(
+    user_id: int,
+    user_prompt: str,
+) -> dict:
+    prompt = (user_prompt or "").strip()
+
+    if len(prompt) < 10:
+        raise ValueError(
+            "Опиши пожелания чуть подробнее — хотя бы одним предложением."
+        )
+
+    if len(prompt) > 2000:
+        raise ValueError(
+            "Описание слишком длинное. Сократи его до 2000 символов."
+        )
+
+    if pool is None:
+        raise RuntimeError("База данных ещё не готова")
+
+    async with pool.acquire() as db:
+        await LegalConsentService.require_ai_access(
+            db,
+            user_id,
+        )
+
+    operation = AI_OPERATION_CATALOG[
+        "recipe_generate"
+    ]
+
+    models = [
+        operation["model"],
+        operation["fallback_model"],
+    ]
+
+    client = _get_or_client()
+    last_error = None
+
+    system_prompt = (
+        "Ты профессиональный повар и редактор рецептов. "
+        "Создай один реалистичный домашний рецепт строго по пожеланиям пользователя. "
+        "Не игнорируй ограничения, аллергии, запрещённые продукты, время и число порций. "
+        "Количество ингредиентов и шагов должно быть достаточным для приготовления. "
+        "Не добавляй объяснений вне JSON.\n\n"
+        "Верни строго JSON-объект:\n"
+        "{"
+        "\"name\":\"название на русском\","
+        "\"emoji\":\"одна подходящая эмодзи\","
+        "\"servings\":4,"
+        "\"cook_time_minutes\":40,"
+        "\"category\":\"ужин\","
+        "\"ingredients\":["
+        "{\"name\":\"Куриное филе\",\"qty\":500,\"unit\":\"г\"}"
+        "],"
+        "\"steps\":["
+        "{\"text\":\"Нарезать куриное филе.\"}"
+        "]"
+        "}\n\n"
+        "Допустимые категории: завтрак, обед, ужин, десерт, суп, "
+        "салат, закуска, напиток, выпечка, другое.\n"
+        "qty должно быть числом или null. "
+        "Единицы: г, кг, мл, л, шт, ст.л, ч.л, щепотка, по вкусу."
+    )
+
+    for attempt, model in enumerate(models, start=1):
+        if not model:
+            continue
+
+        started = time.monotonic()
+
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Пожелания пользователя:\n\n"
+                            + prompt
+                        ),
+                    },
+                ],
+                response_format={
+                    "type": "json_object",
+                },
+                temperature=0.65,
+                max_tokens=2600,
+            )
+
+            raw = response.choices[0].message.content
+            data = json.loads(raw)
+            recipe = _clean_generated_recipe(data)
+
+            latency_ms = int(
+                (time.monotonic() - started) * 1000
+            )
+
+            usage = getattr(response, "usage", None)
+            input_tokens = (
+                getattr(usage, "prompt_tokens", 0)
+                if usage else 0
+            )
+            output_tokens = (
+                getattr(usage, "completion_tokens", 0)
+                if usage else 0
+            )
+
+            log.info(
+                "Recipe generated: user=%s model=%s "
+                "attempt=%s latency_ms=%s input_tokens=%s "
+                "output_tokens=%s",
+                user_id,
+                model,
+                attempt,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+            )
+
+            await track(
+                user_id,
+                "recipe_generated",
+                {
+                    "model": model,
+                    "attempt": attempt,
+                    "fallback_used": attempt > 1,
+                    "latency_ms": latency_ms,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            )
+
+            return recipe
+
+        except Exception as exc:
+            last_error = exc
+
+            log.warning(
+                "Recipe generation failed: "
+                "user=%s model=%s attempt=%s error=%s",
+                user_id,
+                model,
+                attempt,
+                exc,
+            )
+
+    raise RuntimeError(
+        "Не удалось создать рецепт ни одной моделью"
+    ) from last_error
+
+
+async def _begin_recipe_generation(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    await state.set_state(
+        RecipeGenerationStates.awaiting_prompt
+    )
+
+    await message.answer(
+        "🍲 <b>Придумаем рецепт</b>\n\n"
+        "Напиши, что хочется приготовить.\n\n"
+        "Можно указать:\n"
+        "• какие продукты есть дома;\n"
+        "• число порций;\n"
+        "• максимальное время;\n"
+        "• что нельзя добавлять;\n"
+        "• желаемую кухню или тип блюда.\n\n"
+        "<b>Пример:</b>\n"
+        "Есть курица, картофель и сливки. "
+        "Нужно неострое блюдо на 4 человек, "
+        "не дольше 45 минут.\n\n"
+        "Для отмены отправь /cancel"
+    )
+
+
+
+
+    rows = [
+        list(row)
+        for row in keyboard.inline_keyboard
+    ]
+
+    already_present = any(
+        button.callback_data == "generate_recipe"
+        for row in rows
+        for button in row
+    )
+
+    if not already_present:
+        insert_at = len(rows)
+
+        for index, row in enumerate(rows):
+            if any(
+                button.callback_data == "ws_help"
+                for button in row
+            ):
+                insert_at = index
+                break
+
+        rows.insert(
+            insert_at,
+            [
+                InlineKeyboardButton(
+                    text="🍲 Придумать рецепт",
+                    callback_data="generate_recipe"
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+@dp.message(Command("generate"))
+async def cmd_generate_recipe(
+    message: Message,
+    state: FSMContext,
+):
+    if not FEATURE_AI_RECIPE_GENERATION:
+        await message.answer(
+            "Генерация рецептов временно отключена."
+        )
+        return
+
+    await _begin_recipe_generation(
+        message,
+        state,
+    )
+
+
+@dp.callback_query(F.data == "generate_recipe")
+async def cb_generate_recipe(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    if not FEATURE_AI_RECIPE_GENERATION:
+        await callback.message.answer(
+            "Генерация рецептов временно отключена."
+        )
+        return
+
+    await _begin_recipe_generation(
+        callback.message,
+        state,
+    )
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel_generation(
+    message: Message,
+    state: FSMContext,
+):
+    current_state = await state.get_state()
+
+    if current_state:
+        await state.clear()
+        await message.answer("❌ Отменено.")
+
+
+@dp.message(RecipeGenerationStates.awaiting_prompt)
+async def handle_recipe_generation_prompt(
+    message: Message,
+    state: FSMContext,
+):
+    if not message.from_user:
+        return
+
+    if not message.text:
+        await message.answer(
+            "Пришли пожелания обычным текстом."
+        )
+        return
+
+    prompt = message.text.strip()
+    user_id = message.from_user.id
+
+    if prompt.startswith("/"):
+        return
+
+    if user_id in _GENERATION_LOCKS:
+        await message.answer(
+            "⏳ Рецепт уже создаётся. Подожди немного."
+        )
+        return
+
+    await state.update_data(
+        generation_prompt=prompt
+    )
+
+    status = await message.answer(
+        "👨‍🍳 Придумываю рецепт…"
+    )
+
+    _GENERATION_LOCKS.add(user_id)
+
+    try:
+        recipe = await _generate_recipe_draft(
+            user_id,
+            prompt,
+        )
+
+    except ValueError as exc:
+        error_text = str(exc)
+
+        if "consent_required" in error_text:
+            await status.edit_text(
+                "Нужно принять условия использования ИИ "
+                "в разделе /documents."
+            )
+        else:
+            await status.edit_text(
+                f"🤷 {_esc(error_text)}"
+            )
+
+        return
+
+    except Exception:
+        log.exception(
+            "Recipe generation error: user=%s",
+            user_id,
+        )
+
+        await status.edit_text(
+            "❌ Не получилось создать рецепт. "
+            "Попробуй ещё раз через минуту."
+        )
+
+        return
+
+    finally:
+        _GENERATION_LOCKS.discard(user_id)
+
+    await state.update_data(
+        generated_recipe=recipe
+    )
+
+    await state.set_state(
+        RecipeGenerationStates.preview
+    )
+
+    await status.edit_text(
+        _format_generated_recipe_preview(recipe),
+        reply_markup=_generation_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "gen_retry")
+async def cb_retry_generated_recipe(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+
+    if user_id in _GENERATION_LOCKS:
+        await callback.answer(
+            "Рецепт уже создаётся",
+            show_alert=True,
+        )
+        return
+
+    data = await state.get_data()
+    prompt = data.get("generation_prompt")
+
+    if not prompt:
+        await callback.answer(
+            "Описание потеряно. Запусти /generate ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "👨‍🍳 Придумываю другой вариант…"
+    )
+
+    _GENERATION_LOCKS.add(user_id)
+
+    try:
+        recipe = await _generate_recipe_draft(
+            user_id,
+            prompt,
+        )
+
+        await state.update_data(
+            generated_recipe=recipe
+        )
+
+        await state.set_state(
+            RecipeGenerationStates.preview
+        )
+
+        await callback.message.edit_text(
+            _format_generated_recipe_preview(recipe),
+            reply_markup=_generation_keyboard(),
+        )
+
+    except Exception:
+        log.exception(
+            "Recipe retry error: user=%s",
+            user_id,
+        )
+
+        await callback.message.edit_text(
+            "❌ Не получилось создать другой вариант. "
+            "Запусти /generate ещё раз."
+        )
+
+        await state.clear()
+
+    finally:
+        _GENERATION_LOCKS.discard(user_id)
+
+
+@dp.callback_query(F.data == "gen_save")
+async def cb_save_generated_recipe(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    recipe = data.get("generated_recipe")
+
+    if not isinstance(recipe, dict):
+        await callback.answer(
+            "Черновик не найден. Запусти /generate ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        saved = await _save_parsed_recipe(
+            callback.from_user.id,
+            recipe,
+        )
+
+        await state.clear()
+
+        await _reply_recipe_saved(
+            callback.message,
+            saved,
+            status_msg=callback.message,
+        )
+
+        await callback.answer("✅ Сохранено")
+
+        await track(
+            callback.from_user.id,
+            "generated_recipe_saved",
+            {
+                "recipe_id": saved["id"],
+            },
+        )
+
+    except Exception:
+        log.exception(
+            "Generated recipe save failed: user=%s",
+            callback.from_user.id,
+        )
+
+        await callback.answer(
+            "Не удалось сохранить рецепт",
+            show_alert=True,
+        )
+
+
+@dp.callback_query(F.data == "gen_cancel")
+async def cb_cancel_generated_recipe(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await state.clear()
+
+    if callback.message:
+        await callback.message.edit_text(
+            "❌ Генерация отменена."
+        )
+
+    await callback.answer()
+
+
 
 
 @dp.message(Command("add"))
@@ -7794,6 +8518,7 @@ def _returning_user_keyboard():
             InlineKeyboardButton(text="📄 Документы",
                                   callback_data="show_documents"),
         ],
+        [InlineKeyboardButton(text="🍲 Придумать рецепт", callback_data="generate_recipe")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="ws_help")],
     ])
 
@@ -8126,6 +8851,7 @@ async def run_bot():
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="add", description="Добавить рецепт в библиотеку"),
+                BotCommand(command="generate", description="Придумать новый рецепт"),
                 BotCommand(command="split", description="Делёж расходов"),
                 BotCommand(command="ref", description="Партнёрская программа"),
                 BotCommand(command="terms", description="Правила бонусной программы"),
