@@ -1141,6 +1141,9 @@ class UserService:
         await db.execute(
             "UPDATE user_legal_acceptances SET revoked_at=NOW(), action='revoked' "
             "WHERE user_id=$1 AND action='accepted'", user_id)
+        # Delete payment email (for YooKassa receipts)
+        await db.execute(
+            "DELETE FROM payment_customer_emails WHERE user_id=$1", user_id)
 
 
 # ── Legal Consent Service ────────────────────────────────────────────────────
@@ -7149,13 +7152,17 @@ async def _reply_recipe_saved(message: Message, recipe: dict, status_msg=None):
     )
     recipe_url = f"{FRONTEND_URL}?screen=recipe&id={recipe['id']}"
     add_url = f"{FRONTEND_URL}?screen=add_to_event&recipe_id={recipe['id']}"
+    share_url = f"{FRONTEND_URL}?screen=quick_share&recipe_id={recipe['id']}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📖 Открыть", web_app=WebAppInfo(url=recipe_url)),
             InlineKeyboardButton(text="📅 В событие", web_app=WebAppInfo(url=add_url)),
         ],
         [
-            InlineKeyboardButton(text="📤 Поделиться", callback_data=f"share_recipe_{recipe['id']}"),
+            InlineKeyboardButton(
+                text="📤 Поделиться",
+                web_app=WebAppInfo(url=share_url),
+            ),
         ],
     ])
     if status_msg:
@@ -7249,19 +7256,44 @@ async def handle_share_recipe(callback: CallbackQuery):
         )
 
     bot_username = await _get_bot_username()
-    share_screen_url = f"https://t.me/{bot_username}?startapp=share_{token}"
+    share_screen_url = (
+        f"https://t.me/{bot_username}"
+        f"?startapp=shared_{token}"
+    )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="📤 Поделиться рецептом",
-            web_app=WebAppInfo(url=share_screen_url),
+            text="📤 Выбрать чат и отправить",
+            url=share_screen_url,
         )
     ]])
 
-    await callback.message.answer(
-        "Откроется ПОЛЯНА — нажмите «Выбрать чат и отправить»:", reply_markup=kb
-    )
-    await callback.answer()
+    try:
+        if not callback.message:
+            await callback.answer(
+                "Не удалось открыть отправку",
+                show_alert=True,
+            )
+            return
+
+        await callback.message.answer(
+            "Нажмите кнопку ниже, затем выберите чат:",
+            reply_markup=kb,
+        )
+        await callback.answer()
+
+    except Exception as exc:
+        log.exception(
+            "Recipe share button failed: "
+            "user=%s recipe=%s error=%s",
+            callback.from_user.id,
+            recipe_id,
+            exc,
+        )
+        await callback.answer(
+            "Не удалось подготовить отправку",
+            show_alert=True,
+        )
 
 
 @dp.callback_query(F.data.startswith("rs:"))

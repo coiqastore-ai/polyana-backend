@@ -90,6 +90,20 @@ CREDIT_ENABLED = (
     == "true"
 )
 
+PAYMENT_RECEIPT_MODE = os.getenv(
+    "PAYMENT_RECEIPT_MODE",
+    "full_prepayment",
+).strip()
+
+if PAYMENT_RECEIPT_MODE not in {
+    "full_prepayment",
+    "full_payment",
+}:
+    raise RuntimeError(
+        "PAYMENT_RECEIPT_MODE must be "
+        "full_prepayment or full_payment"
+    )
+
 
 app = FastAPI(
     title="ПОЛЯНА Pay",
@@ -557,6 +571,15 @@ async def synchronize_order(
                 or {}
             ).get("confirmation_url")
 
+            # receipt_registration: pending / succeeded / canceled
+            # (отражает состояние регистрации фискального чека в ЮKassa)
+            receipt_registration_raw = payment.get("receipt_registration")
+            receipt_registration = (
+                str(receipt_registration_raw)
+                if receipt_registration_raw
+                else None
+            )
+
             await db.execute(
                 """
                 UPDATE yookassa_test_orders
@@ -569,6 +592,7 @@ async def synchronize_order(
                         $6,
                         confirmation_url
                     ),
+                    receipt_registration=CAST($7 AS varchar),
                     paid_at=CASE
                         WHEN CAST($3 AS text)='succeeded'
                         THEN COALESCE(
@@ -597,6 +621,7 @@ async def synchronize_order(
                     ensure_ascii=False,
                 ),
                 confirmation_url,
+                receipt_registration,
             )
 
             updated = await db.fetchrow(
@@ -661,17 +686,34 @@ async def startup() -> None:
                 user_id,
                 created_at DESC
             );
+
+            CREATE TABLE IF NOT EXISTS
+            payment_customer_emails (
+                user_id BIGINT PRIMARY KEY,
+                email TEXT NOT NULL,
+                updated_at TIMESTAMPTZ
+                    NOT NULL DEFAULT NOW()
+            );
             """
+        )
+
+        # ALTER TABLE for columns added after initial deploy
+        # (CREATE TABLE IF NOT EXISTS does not add columns to existing table)
+        await db.execute(
+            "ALTER TABLE yookassa_test_orders "
+            "ADD COLUMN IF NOT EXISTS receipt_registration VARCHAR(32)"
         )
 
     log.info(
         (
             "ПОЛЯНА Pay started; "
             "test_mode=%s "
-            "credit_enabled=%s"
+            "credit_enabled=%s "
+            "receipt_mode=%s"
         ),
         TEST_MODE,
         CREDIT_ENABLED,
+        PAYMENT_RECEIPT_MODE,
     )
 
 
@@ -688,6 +730,7 @@ async def health() -> dict:
         "service": "ПОЛЯНА Pay",
         "test_mode": TEST_MODE,
         "credit_enabled": CREDIT_ENABLED,
+        "receipt_mode": PAYMENT_RECEIPT_MODE,
     }
 
 
@@ -765,6 +808,60 @@ async def home(
             LIMIT 5
             """,
             int(session["uid"]),
+        )
+
+        saved_email = await db.fetchval(
+            "SELECT email FROM payment_customer_emails WHERE user_id=$1",
+            int(session["uid"]),
+        )
+
+    # Email gate: no email → show email form instead of packages
+    if not saved_email:
+        return render_page(
+            "Email для чека",
+            f"""
+            <section class="card">
+              <span class="badge">
+                Тестовый магазин
+              </span>
+
+              <h1>📧 Email для кассового чека</h1>
+
+              <p>
+                Чек об оплате будет отправлен
+                на эту почту.
+              </p>
+
+              <form method="post" action="/api/save-email">
+                <p>
+                  <input
+                    type="email"
+                    name="email"
+                    placeholder="user@example.com"
+                    required
+                    maxlength="254"
+                    style="width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #385069;background:#101c29;color:#fff;font-size:16px"
+                  >
+                </p>
+                <input
+                  type="hidden"
+                  name="csrf"
+                  value="{html.escape(session["csrf"])}"
+                >
+                <button type="submit">
+                  Сохранить и продолжить
+                </button>
+              </form>
+
+              <p>
+                <small>
+                  Email сохраняется для следующих покупок.
+                  Изменить можно в любой момент.
+                  В рассылки не используем без отдельного согласия.
+                </small>
+              </p>
+            </section>
+            """,
         )
 
     packages_html = ""
@@ -871,6 +968,12 @@ async def home(
           </p>
 
           <p>
+            📧 Чеки:
+            <b>{html.escape(saved_email)}</b>
+            · <a class="button secondary" style="display:inline;width:auto;margin-top:8px" href="/profile/email">изменить</a>
+          </p>
+
+          <p>
             <small>
               ЮKassa проведёт тестовый платёж,
               но кошелёк ПОЛЯНЫ пока
@@ -934,6 +1037,156 @@ async def telegram_auth(
     )
 
     return response
+
+
+@app.get("/profile/email")
+async def profile_email(
+    request: Request,
+):
+    session = read_session(request)
+
+    if not session:
+        return RedirectResponse(
+            "/",
+            status_code=303,
+        )
+
+    assert pool is not None
+
+    async with pool.acquire() as db:
+        saved_email = await db.fetchval(
+            "SELECT email FROM payment_customer_emails WHERE user_id=$1",
+            int(session["uid"]),
+        )
+
+    return render_page(
+        "Изменить email",
+        f"""
+        <section class="card">
+          <h1>📧 Email для кассового чека</h1>
+
+          <p>
+            Чек об оплате будет отправлен
+            на эту почту.
+          </p>
+
+          <form method="post" action="/api/save-email">
+            <p>
+              <input
+                type="email"
+                name="email"
+                value="{html.escape(saved_email or "")}"
+                placeholder="user@example.com"
+                required
+                maxlength="254"
+                style="width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #385069;background:#101c29;color:#fff;font-size:16px"
+              >
+            </p>
+            <input
+              type="hidden"
+              name="csrf"
+              value="{html.escape(session["csrf"])}"
+            >
+            <button type="submit">
+              Сохранить
+            </button>
+          </form>
+
+          <p>
+            <small>
+              В рассылки не используем без отдельного согласия.
+            </small>
+          </p>
+
+          <a class="button secondary" href="/">Назад к пакетам</a>
+        </section>
+        """,
+    )
+
+
+@app.post("/api/save-email")
+async def save_email(
+    request: Request,
+):
+    session = read_session(request)
+
+    if not session:
+        raise HTTPException(
+            401,
+            "Telegram login required",
+        )
+
+    form = parse_qs(
+        (
+            await request.body()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+    )
+
+    raw_email = (
+        form.get("email")
+        or [""]
+    )[0]
+
+    csrf = (
+        form.get("csrf")
+        or [""]
+    )[0]
+
+    if not csrf or not hmac.compare_digest(
+        csrf,
+        str(session.get("csrf") or ""),
+    ):
+        raise HTTPException(
+            403,
+            "CSRF check failed",
+        )
+
+    import re
+
+    email = raw_email.strip()
+
+    if not email or len(email) > 254:
+        raise HTTPException(
+            400,
+            "Email пустой или слишком длинный",
+        )
+
+    if not re.match(
+        r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        email,
+    ):
+        raise HTTPException(
+            400,
+            "Неверный формат email",
+        )
+
+    # Нормализация: локальную часть оставляем как ввёл пользователь,
+    # домен приводим к нижнему регистру.
+    local_part, domain = email.rsplit("@", 1)
+    email = f"{local_part}@{domain.lower()}"
+
+    assert pool is not None
+
+    async with pool.acquire() as db:
+        await db.execute(
+            """
+            INSERT INTO payment_customer_emails
+                (user_id, email)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET email=$2, updated_at=NOW()
+            """,
+            int(session["uid"]),
+            email,
+        )
+
+    return RedirectResponse(
+        "/",
+        status_code=303,
+    )
 
 
 @app.post("/api/create-payment")
@@ -1000,6 +1253,17 @@ async def create_payment(
             raise HTTPException(
                 404,
                 "Payment package not found",
+            )
+
+        # Email обязателен для фискального чека ЮKassa (доставка только по email)
+        email = await db.fetchval(
+            "SELECT email FROM payment_customer_emails WHERE user_id=$1",
+            int(session["uid"]),
+        )
+        if not email:
+            raise HTTPException(
+                400,
+                "Укажите email для кассового чека на главной странице",
             )
 
         order_id = uuid.uuid4()
@@ -1077,6 +1341,31 @@ async def create_payment(
             "telegram_user_id": str(
                 session["uid"]
             ),
+        },
+        "receipt": {
+            "customer": {
+                "email": email,
+            },
+            "items": [
+                {
+                    "description": (
+                        f"Доступ к AI-функциям ПОЛЯНЫ — "
+                        f"пакет {total_points} баллов"
+                    ),
+                    "quantity": 1.0,
+                    "amount": {
+                        "value": (
+                            f"{amount_minor / 100:.2f}"
+                        ),
+                        "currency": "RUB",
+                    },
+                    "vat_code": 1,
+                    "payment_subject": "service",
+                    "payment_mode": PAYMENT_RECEIPT_MODE,
+                    "measure": "piece",
+                }
+            ],
+            "internet": True,
         },
     }
 
@@ -1349,12 +1638,14 @@ async def yookassa_webhook(
         (
             "Webhook verified: "
             "event=%s payment=%s "
-            "order=%s status=%s"
+            "order=%s status=%s "
+            "receipt_registration=%s"
         ),
         event,
         payment_id,
         order["id"],
         order["status"],
+        order.get("receipt_registration"),
     )
 
     return {
