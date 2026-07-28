@@ -90,6 +90,19 @@ CREDIT_ENABLED = (
     == "true"
 )
 
+YOOKASSA_MODE = os.getenv(
+    "YOOKASSA_MODE",
+    "test",
+).strip().lower()
+
+PAYMENT_LIVE_READY = (
+    os.getenv(
+        "PAYMENT_LIVE_READY",
+        "false",
+    ).lower()
+    == "true"
+)
+
 PAYMENT_RECEIPT_MODE = os.getenv(
     "PAYMENT_RECEIPT_MODE",
     "full_prepayment",
@@ -477,10 +490,11 @@ async def synchronize_order(
         async with db.transaction():
             order = await db.fetchrow(
                 """
-                SELECT *
-                FROM yookassa_test_orders
-                WHERE id=$1
-                FOR UPDATE
+                SELECT po.*, pp.code AS package_code
+                FROM payment_orders po
+                JOIN payment_packages pp ON pp.id = po.package_id
+                WHERE po.id=$1
+                FOR UPDATE OF po
                 """,
                 order_id,
             )
@@ -513,7 +527,7 @@ async def synchronize_order(
 
             if (
                 actual_minor
-                != order["amount_minor"]
+                != order["amount"]
                 or actual_currency
                 != order["currency"]
             ):
@@ -550,15 +564,6 @@ async def synchronize_order(
                     "Payment user mismatch",
                 )
 
-            if (
-                TEST_MODE
-                and payment.get("test") is not True
-            ):
-                raise HTTPException(
-                    409,
-                    "Expected a test payment",
-                )
-
             status = str(
                 payment.get("status")
                 or "unknown"
@@ -571,8 +576,6 @@ async def synchronize_order(
                 or {}
             ).get("confirmation_url")
 
-            # receipt_registration: pending / succeeded / canceled
-            # (отражает состояние регистрации фискального чека в ЮKassa)
             receipt_registration_raw = payment.get("receipt_registration")
             receipt_registration = (
                 str(receipt_registration_raw)
@@ -582,17 +585,12 @@ async def synchronize_order(
 
             await db.execute(
                 """
-                UPDATE yookassa_test_orders
+                UPDATE payment_orders
                 SET
-                    yookassa_payment_id=$2,
+                    external_payment_id=$2,
                     status=CAST($3 AS varchar),
-                    is_test=$4,
-                    raw_payment=$5::jsonb,
-                    confirmation_url=COALESCE(
-                        $6,
-                        confirmation_url
-                    ),
-                    receipt_registration=CAST($7 AS varchar),
+                    metadata=COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                    receipt_registration=COALESCE(CAST($5 AS varchar), receipt_registration),
                     paid_at=CASE
                         WHEN CAST($3 AS text)='succeeded'
                         THEN COALESCE(
@@ -601,13 +599,13 @@ async def synchronize_order(
                         )
                         ELSE paid_at
                     END,
-                    canceled_at=CASE
+                    cancelled_at=CASE
                         WHEN CAST($3 AS text)='canceled'
                         THEN COALESCE(
-                            canceled_at,
+                            cancelled_at,
                             NOW()
                         )
-                        ELSE canceled_at
+                        ELSE cancelled_at
                     END,
                     updated_at=NOW()
                 WHERE id=$1
@@ -615,19 +613,21 @@ async def synchronize_order(
                 order_id,
                 payment_id,
                 status,
-                bool(payment.get("test")),
                 json.dumps(
-                    payment,
+                    {
+                        "raw_payment": payment,
+                        "confirmation_url": confirmation_url,
+                        "test": payment.get("test", False),
+                    },
                     ensure_ascii=False,
                 ),
-                confirmation_url,
                 receipt_registration,
             )
 
             updated = await db.fetchrow(
                 """
                 SELECT *
-                FROM yookassa_test_orders
+                FROM payment_orders
                 WHERE id=$1
                 """,
                 order_id,
@@ -640,6 +640,12 @@ async def synchronize_order(
 async def startup() -> None:
     global pool
 
+    # Safety: live mode cannot use test mode
+    if YOOKASSA_MODE == "live" and TEST_MODE:
+        raise RuntimeError(
+            "Live mode cannot use PAYMENT_TEST_MODE=true"
+        )
+
     pool = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=1,
@@ -650,44 +656,6 @@ async def startup() -> None:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS
-            yookassa_test_orders (
-                id UUID PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                username TEXT,
-                package_code TEXT NOT NULL,
-                package_title TEXT NOT NULL,
-                base_points BIGINT NOT NULL,
-                promo_points BIGINT
-                    NOT NULL DEFAULT 0,
-                total_points BIGINT NOT NULL,
-                amount_minor BIGINT NOT NULL,
-                currency VARCHAR(3)
-                    NOT NULL DEFAULT 'RUB',
-                status VARCHAR(32)
-                    NOT NULL DEFAULT 'created',
-                yookassa_payment_id
-                    TEXT UNIQUE,
-                idempotency_key
-                    TEXT NOT NULL UNIQUE,
-                confirmation_url TEXT,
-                is_test BOOLEAN,
-                raw_payment JSONB,
-                created_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW(),
-                paid_at TIMESTAMPTZ,
-                canceled_at TIMESTAMPTZ
-            );
-
-            CREATE INDEX IF NOT EXISTS
-            idx_yookassa_test_orders_user
-            ON yookassa_test_orders(
-                user_id,
-                created_at DESC
-            );
-
-            CREATE TABLE IF NOT EXISTS
             payment_customer_emails (
                 user_id BIGINT PRIMARY KEY,
                 email TEXT NOT NULL,
@@ -697,22 +665,19 @@ async def startup() -> None:
             """
         )
 
-        # ALTER TABLE for columns added after initial deploy
-        # (CREATE TABLE IF NOT EXISTS does not add columns to existing table)
-        await db.execute(
-            "ALTER TABLE yookassa_test_orders "
-            "ADD COLUMN IF NOT EXISTS receipt_registration VARCHAR(32)"
-        )
-
     log.info(
         (
             "ПОЛЯНА Pay started; "
+            "mode=%s "
             "test_mode=%s "
             "credit_enabled=%s "
+            "live_ready=%s "
             "receipt_mode=%s"
         ),
+        YOOKASSA_MODE,
         TEST_MODE,
         CREDIT_ENABLED,
+        PAYMENT_LIVE_READY,
         PAYMENT_RECEIPT_MODE,
     )
 
@@ -728,8 +693,10 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "ПОЛЯНА Pay",
+        "mode": YOOKASSA_MODE,
         "test_mode": TEST_MODE,
         "credit_enabled": CREDIT_ENABLED,
+        "live_ready": PAYMENT_LIVE_READY,
         "receipt_mode": PAYMENT_RECEIPT_MODE,
     }
 
@@ -798,13 +765,14 @@ async def home(
         recent_orders = await db.fetch(
             """
             SELECT
-                package_title,
-                amount_minor,
-                status,
-                created_at
-            FROM yookassa_test_orders
-            WHERE user_id=$1
-            ORDER BY created_at DESC
+                pp.title AS package_title,
+                po.amount,
+                po.status,
+                po.created_at
+            FROM payment_orders po
+            JOIN payment_packages pp ON pp.id = po.package_id
+            WHERE po.user_id=$1
+            ORDER BY po.created_at DESC
             LIMIT 5
             """,
             int(session["uid"]),
@@ -937,7 +905,7 @@ async def home(
                 (
                     "<li>"
                     f"{html.escape(order['package_title'])}: "
-                    f"{order['amount_minor'] / 100:.2f} ₽ — "
+                    f"{order['amount'] / 100:.2f} ₽ — "
                     f"{html.escape(order['status'])}"
                     "</li>"
                 )
@@ -1229,12 +1197,20 @@ async def create_payment(
             "CSRF check failed",
         )
 
+    # Live-ready gate
+    if YOOKASSA_MODE == "live" and not PAYMENT_LIVE_READY:
+        raise HTTPException(
+            503,
+            "Оплата временно недоступна",
+        )
+
     assert pool is not None
 
     async with pool.acquire() as db:
         package = await db.fetchrow(
             """
             SELECT
+                id,
                 code,
                 title,
                 description,
@@ -1278,38 +1254,42 @@ async def create_payment(
             package["rub_amount_minor"]
         )
 
+        environment = "test" if TEST_MODE else "live"
+
         await db.execute(
             """
-            INSERT INTO yookassa_test_orders (
+            INSERT INTO payment_orders (
                 id,
                 user_id,
-                username,
-                package_code,
-                package_title,
+                package_id,
+                provider,
+                environment,
                 base_points,
                 promo_points,
                 total_points,
-                amount_minor,
+                amount,
                 currency,
                 status,
-                idempotency_key
+                idempotency_key,
+                referral_base_points,
+                invoice_payload
             )
             VALUES (
-                $1,$2,$3,$4,$5,
-                $6,$7,$8,$9,
-                'RUB','creating',$10
+                $1,$2,$3,'yookassa',$4,
+                $5,$6,$7,$8,
+                'RUB','creating',$9,0,$10
             )
             """,
             order_id,
             int(session["uid"]),
-            session.get("username") or None,
-            package["code"],
-            package["title"],
+            package["id"],
+            environment,
             int(package["base_points"]),
             int(package["promo_points"] or 0),
             total_points,
             amount_minor,
             idempotency_key,
+            f"polyana:{order_id}",
         )
 
     payment_payload = {
@@ -1387,7 +1367,7 @@ async def create_payment(
         async with pool.acquire() as db:
             await db.execute(
                 """
-                UPDATE yookassa_test_orders
+                UPDATE payment_orders
                 SET
                     status='create_failed',
                     updated_at=NOW()
@@ -1398,7 +1378,9 @@ async def create_payment(
 
         raise
 
-    confirmation_url = order.get(
+    raw_meta = order.get("metadata") or {}
+    order_metadata = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+    confirmation_url = order_metadata.get(
         "confirmation_url"
     )
 
@@ -1445,11 +1427,12 @@ async def payment_result(
     async with pool.acquire() as db:
         order = await db.fetchrow(
             """
-            SELECT *
-            FROM yookassa_test_orders
+            SELECT po.*, pp.title AS package_title
+            FROM payment_orders po
+            JOIN payment_packages pp ON pp.id = po.package_id
             WHERE
-                id=$1
-                AND user_id=$2
+                po.id=$1
+                AND po.user_id=$2
             """,
             order_uuid,
             int(session["uid"]),
@@ -1464,14 +1447,14 @@ async def payment_result(
     order_data = dict(order)
 
     if order_data.get(
-        "yookassa_payment_id"
+        "external_payment_id"
     ):
         try:
             payment = await yookassa_request(
                 "GET",
                 (
                     "/payments/"
-                    f"{order_data['yookassa_payment_id']}"
+                    f"{order_data['external_payment_id']}"
                 ),
             )
 
@@ -1550,7 +1533,7 @@ async def payment_result(
             Сумма:
             <b>
               {
-                  order_data["amount_minor"]
+                  order_data["amount"]
                   / 100
               :.2f} ₽
             </b>
@@ -1604,6 +1587,7 @@ async def yookassa_webhook(
         "payment.succeeded",
         "payment.canceled",
         "payment.waiting_for_capture",
+        "refund.succeeded",
     }
 
     if event not in allowed_events:
@@ -1613,6 +1597,96 @@ async def yookassa_webhook(
                 "ignored": True,
             }
         )
+
+    if event == "refund.succeeded":
+        # Handle refund separately — different object structure
+        refund_object = payment_object
+        refund_id = str(refund_object.get("id") or "")
+        refund_payment_id = str(
+            (refund_object.get("payment_id") or {}).get("id")
+            if isinstance(refund_object.get("payment_id"), dict)
+            else refund_object.get("payment_id") or ""
+        )
+
+        if not refund_id or not refund_payment_id:
+            raise HTTPException(400, "Refund data incomplete")
+
+        # Verify refund via API
+        verified_refund = await yookassa_request(
+            "GET", f"/refunds/{refund_id}"
+        )
+
+        refund_amount = verified_refund.get("amount") or {}
+        refund_minor = int(round(float(refund_amount.get("value", "0")) * 100))
+        refund_currency = str(refund_amount.get("currency") or "")
+
+        async with pool.acquire() as db:
+            async with db.transaction():
+                # Find order by external_payment_id
+                order = await db.fetchrow(
+                    "SELECT * FROM payment_orders WHERE external_payment_id=$1 FOR UPDATE",
+                    refund_payment_id,
+                )
+                if not order:
+                    log.warning("Refund for unknown payment: %s", refund_payment_id)
+                    return {"ok": True, "ignored": True}
+
+                # Idempotent insert
+                try:
+                    await db.execute(
+                        """INSERT INTO payment_refunds
+                        (order_id, provider, external_refund_id, amount_minor, currency, status, processed_at, metadata)
+                        VALUES ($1, 'yookassa', $2, $3, $4, 'succeeded', NOW(), $5)""",
+                        order["id"], refund_id, refund_minor, refund_currency,
+                        json.dumps(verified_refund, ensure_ascii=False),
+                    )
+                except asyncpg.UniqueViolationError:
+                    log.info("Refund already processed: %s", refund_id)
+                    return {"ok": True}
+
+                # Proportional reversal
+                total_amount = order["amount"] or 1
+                base = order["base_points"] or 0
+                promo = order["promo_points"] or 0
+
+                if refund_minor >= total_amount:
+                    # Full refund
+                    reversed_base = base
+                    reversed_promo = promo
+                else:
+                    ratio = refund_minor / total_amount
+                    reversed_base = int(base * ratio)
+                    reversed_promo = int(promo * ratio)
+
+                # Reverse wallet points
+                if reversed_base > 0 or reversed_promo > 0:
+                    uid = order["user_id"]
+                    wallet = await db.fetchrow(
+                        "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid
+                    )
+                    if wallet:
+                        new_paid = max(0, (wallet["paid_points"] or 0) - reversed_base)
+                        new_bonus = max(0, (wallet["bonus_points"] or 0) - reversed_promo)
+                        await db.execute(
+                            "UPDATE wallets SET paid_points=$2, bonus_points=$3, updated_at=NOW() WHERE user_id=$1",
+                            uid, new_paid, new_bonus,
+                        )
+
+                # Update order
+                new_refunded = (order["refunded_amount"] or 0) + refund_minor
+                new_status = "refunded" if new_refunded >= total_amount else order["status"]
+                await db.execute(
+                    """UPDATE payment_orders SET
+                    refunded_amount=$2, reversed_base_points=reversed_base_points+$3,
+                    reversed_promo_points=reversed_promo_points+$4,
+                    status=$5, updated_at=NOW()
+                    WHERE id=$1""",
+                    order["id"], new_refunded, reversed_base, reversed_promo, new_status,
+                )
+
+        log.info("Refund processed: refund=%s order=%s reversed_base=%s reversed_promo=%s",
+                 refund_id, order["id"], reversed_base, reversed_promo)
+        return {"ok": True}
 
     if not payment_id:
         raise HTTPException(
@@ -1633,6 +1707,65 @@ async def yookassa_webhook(
     order = await synchronize_order(
         verified_payment
     )
+
+    # Credit wallet on payment.succeeded
+    if order["status"] == "succeeded" and CREDIT_ENABLED:
+        try:
+            async with pool.acquire() as db:
+                async with db.transaction():
+                    # Lock order — idempotency gate
+                    o = await db.fetchrow(
+                        "SELECT * FROM payment_orders WHERE id=$1 FOR UPDATE",
+                        order["id"])
+                    if o["credited_at"] is not None:
+                        log.info("Order %s already credited", order["id"])
+                    else:
+                        uid = o["user_id"]
+                        base = o["base_points"]
+                        promo = o.get("promo_points") or 0
+
+                        # Ensure wallet
+                        await db.execute(
+                            "INSERT INTO wallets (user_id, paid_points) "
+                            "VALUES ($1,0) ON CONFLICT DO NOTHING", uid)
+                        w = await db.fetchrow(
+                            "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid)
+
+                        paid_debt = w["paid_debt_points"] or 0
+                        bonus_debt = w["bonus_debt_points"] or 0
+
+                        base_debt = min(paid_debt, base)
+                        base_paid = base - base_debt
+                        promo_debt = min(bonus_debt, promo)
+                        promo_bonus = promo - promo_debt
+
+                        if base_debt > 0:
+                            await db.execute(
+                                "UPDATE wallets SET paid_debt_points=paid_debt_points-$2, "
+                                "updated_at=NOW() WHERE user_id=$1", uid, base_debt)
+                        if base_paid > 0:
+                            await db.execute(
+                                "UPDATE wallets SET paid_points=paid_points+$2, "
+                                "updated_at=NOW() WHERE user_id=$1", uid, base_paid)
+                        if promo_debt > 0:
+                            await db.execute(
+                                "UPDATE wallets SET bonus_debt_points=bonus_debt_points-$2, "
+                                "updated_at=NOW() WHERE user_id=$1", uid, promo_debt)
+                        if promo_bonus > 0:
+                            await db.execute(
+                                "UPDATE wallets SET bonus_points=bonus_points+$2, "
+                                "updated_at=NOW() WHERE user_id=$1", uid, promo_bonus)
+
+                        await db.execute(
+                            "UPDATE payment_orders SET credited_at=NOW(), "
+                            "credited_base_points=$2, credited_promo_points=$3, "
+                            "updated_at=NOW() WHERE id=$1",
+                            o["id"], base, promo)
+
+                        log.info("Credited order %s: base=%s promo=%s user=%s",
+                                 o["id"], base, promo, uid)
+        except Exception as exc:
+            log.error("Credit failed for order %s: %s", order["id"], exc)
 
     log.info(
         (

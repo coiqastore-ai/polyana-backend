@@ -431,7 +431,7 @@ class WalletService:
             "paid": paid,
             "bonus": bonus,
             "reserved": reserved,
-            "available": max(0, paid + bonus - reserved),
+            "available": paid + bonus,
             "paid_debt": row["paid_debt_points"] or 0,
             "bonus_debt": row["bonus_debt_points"] or 0,
             "pending": row["pending_bonus_points"] or 0,
@@ -466,9 +466,10 @@ class WalletService:
                 user_id, bonus_deduct, paid_deduct, points)
             await db.execute(
                 "INSERT INTO wallet_reservations "
-                "(user_id, operation_type, operation_id, points, status, expires_at, created_at) "
-                "VALUES ($1,$2,$3,$4,'reserved',$5,$6)",
+                "(user_id, operation_type, operation_id, points, paid_points, bonus_points, status, expires_at, created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,'reserved',$7,$8)",
                 user_id, operation_type, str(operation_id), points,
+                paid_deduct, bonus_deduct,
                 now + timedelta(minutes=10), now)
             # Ledger entries
             if bonus_deduct > 0:
@@ -476,10 +477,10 @@ class WalletService:
                     await db.execute(
                         "INSERT INTO wallet_ledger "
                         "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
-                        "paid_balance_after, bonus_balance_after, reserved_balance_after, created_at) "
-                        "VALUES ($1,'bonus',$2,'ai_reservation',$3,$4,$5,$6,$7)",
+                        "balance_after, reserved_balance_after, created_at) "
+                        "VALUES ($1,'bonus',$2,'ai_reservation',$3,$4,$5,$6)",
                         user_id, -bonus_deduct, f"reserve:{operation_id}",
-                        paid - paid_deduct, bonus - bonus_deduct, reserved + points, now)
+                        bonus - bonus_deduct + (paid - paid_deduct), reserved + points, now)
                 except asyncpg.UniqueViolationError:
                     pass
             if paid_deduct > 0:
@@ -487,10 +488,10 @@ class WalletService:
                     await db.execute(
                         "INSERT INTO wallet_ledger "
                         "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
-                        "paid_balance_after, bonus_balance_after, reserved_balance_after, created_at) "
-                        "VALUES ($1,'paid',$2,'ai_reservation',$3,$4,$5,$6,$7)",
+                        "balance_after, reserved_balance_after, created_at) "
+                        "VALUES ($1,'paid',$2,'ai_reservation',$3,$4,$5,$6)",
                         user_id, -paid_deduct, f"reserve_paid:{operation_id}",
-                        paid - paid_deduct, bonus - bonus_deduct, reserved + points, now)
+                        (bonus - bonus_deduct) + (paid - paid_deduct), reserved + points, now)
                 except asyncpg.UniqueViolationError:
                     pass
         return True
@@ -530,12 +531,9 @@ class WalletService:
                 "UPDATE wallet_reservations SET status='released', released_at=$2 "
                 "WHERE operation_id=$1",
                 str(operation_id), now)
-            # Return points: bonus first, then paid (reverse of reserve)
-            row = await db.fetchrow(
-                "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", res["user_id"])
-            bonus = row["bonus_points"] or 0
-            bonus_restore = min(points, points)  # restore proportionally
-            paid_restore = points - bonus_restore
+            # Return exactly what was originally deducted
+            paid_restore = res["paid_points"]
+            bonus_restore = res["bonus_points"]
             await db.execute(
                 "UPDATE wallets SET "
                 "bonus_points = bonus_points + $2, "
@@ -545,15 +543,16 @@ class WalletService:
                 "WHERE user_id = $1",
                 res["user_id"], bonus_restore, paid_restore, points)
             try:
+                row2 = await db.fetchrow(
+                    "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1",
+                    res["user_id"])
                 await db.execute(
                     "INSERT INTO wallet_ledger "
                     "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
-                    "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
-                    "VALUES ($1,'bonus',$2,'ai_reservation_release',$3,$4,$5,$6,$7,$8)",
+                    "balance_after, reserved_balance_after, metadata, created_at) "
+                    "VALUES ($1,'mixed',$2,'ai_reservation_release',$3,$4,$5,$6,$7)",
                     res["user_id"], points, f"release:{operation_id}",
-                    (row["paid_points"] or 0) + paid_restore,
-                    (row["bonus_points"] or 0) + bonus_restore,
-                    max(0, (row["reserved_points"] or 0) - points),
+                    row2["paid_points"] + row2["bonus_points"], row2["reserved_points"],
                     json.dumps({"reason": reason}), now)
             except asyncpg.UniqueViolationError:
                 pass
@@ -562,12 +561,27 @@ class WalletService:
     @staticmethod
     async def credit_purchase(db, order) -> dict:
         """Unified credit for any successful payment order.
-        Handles debt repayment, grant creation, and ledger entries.
+        Uses credited_at as the primary idempotency gate.
+        base_points → paid; promo_points → bonus. total_points is NOT used for crediting.
         Returns new balance dict."""
         now = datetime.now(timezone.utc)
         uid = order["user_id"]
-        total_pts = order["total_points"]
+        base = order["base_points"]
+        promo = order.get("promo_points", 0) or 0
+        order_id = order["id"]
+
         async with db.transaction():
+            # Lock order row first — idempotency gate
+            order_row = await db.fetchrow(
+                "SELECT * FROM payment_orders WHERE id=$1 FOR UPDATE", order_id)
+            if not order_row:
+                raise ValueError(f"Order {order_id} not found")
+            if order_row["credited_at"] is not None:
+                return await WalletService.get_available_balance(db, uid)
+            if order_row["status"] != "succeeded":
+                raise ValueError("Order is not succeeded")
+
+            # Lock wallet
             row = await db.fetchrow(
                 "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid)
             if not row:
@@ -575,82 +589,101 @@ class WalletService:
                     "INSERT INTO wallets (user_id, paid_points) VALUES ($1,0) ON CONFLICT DO NOTHING", uid)
                 row = await db.fetchrow(
                     "SELECT * FROM wallets WHERE user_id=$1 FOR UPDATE", uid)
+
             paid_debt = row["paid_debt_points"] or 0
-            # Repay debt first
-            debt_repay = min(paid_debt, total_pts)
-            remaining = total_pts - debt_repay
-            if debt_repay > 0:
+            bonus_debt = row["bonus_debt_points"] or 0
+
+            # base points: repay paid_debt first, remainder → paid_points
+            base_debt_repay = min(paid_debt, base)
+            base_to_paid = base - base_debt_repay
+
+            # promo points: repay bonus_debt first, remainder → bonus_points
+            promo_debt_repay = min(bonus_debt, promo)
+            promo_to_bonus = promo - promo_debt_repay
+
+            # Apply wallet mutations
+            if base_debt_repay > 0:
                 await db.execute(
                     "UPDATE wallets SET paid_debt_points = paid_debt_points - $2, updated_at=NOW() "
-                    "WHERE user_id=$1", uid, debt_repay)
+                    "WHERE user_id=$1", uid, base_debt_repay)
                 try:
                     await db.execute(
                         "INSERT INTO wallet_ledger "
                         "(user_id, wallet_type, amount, transaction_type, idempotency_key, metadata, created_at) "
                         "VALUES ($1,'paid',$2,'debt_repayment',$3,$4,$5)",
-                        uid, -debt_repay, f"debt_repay:{order['id']}",
-                        json.dumps({"order_id": str(order["id"])}), now)
+                        uid, -base_debt_repay, f"debt_repay:{order_id}",
+                        json.dumps({"order_id": str(order_id)}), now)
                 except asyncpg.UniqueViolationError:
                     pass
-            # Credit remaining as paid_points
-            if remaining > 0:
+
+            if base_to_paid > 0:
                 await db.execute(
                     "UPDATE wallets SET paid_points = paid_points + $2, updated_at=NOW() "
-                    "WHERE user_id=$1", uid, remaining)
+                    "WHERE user_id=$1", uid, base_to_paid)
                 try:
                     await db.execute(
                         "INSERT INTO wallet_grants "
                         "(user_id, source_type, source_id, wallet_type, initial_points, "
                         "remaining_points, status, created_at, metadata) "
                         "VALUES ($1,$2,$3,'paid',$4,$5,'active',$6,$7)",
-                        uid, f"{order['provider']}_purchase", str(order["id"]),
-                        remaining, remaining, now,
-                        json.dumps({"order_id": str(order["id"]), "package": order.get("package_code", "")}))
+                        uid, f"{order.get('provider', 'yookassa')}_purchase", str(order_id),
+                        base_to_paid, base_to_paid, now,
+                        json.dumps({"order_id": str(order_id), "package": order.get("package_code", "")}))
                 except asyncpg.UniqueViolationError:
                     pass
+
+            if promo_debt_repay > 0:
+                await db.execute(
+                    "UPDATE wallets SET bonus_debt_points = bonus_debt_points - $2, updated_at=NOW() "
+                    "WHERE user_id=$1", uid, promo_debt_repay)
                 try:
-                    row2 = await db.fetchrow(
-                        "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1", uid)
                     await db.execute(
                         "INSERT INTO wallet_ledger "
-                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
-                        "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
-                        "VALUES ($1,'paid',$2,'purchase_credit',$3,$4,$5,$6,$7,$8)",
-                        uid, remaining, f"purchase:{order['id']}",
-                        row2["paid_points"], row2["bonus_points"], row2["reserved_points"],
-                        json.dumps({"order_id": str(order["id"]), "debt_repaid": debt_repay}), now)
+                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, metadata, created_at) "
+                        "VALUES ($1,'bonus',$2,'debt_repayment',$3,$4,$5)",
+                        uid, -promo_debt_repay, f"bonus_debt_repay:{order_id}",
+                        json.dumps({"order_id": str(order_id)}), now)
                 except asyncpg.UniqueViolationError:
                     pass
-            # Credit promo points as bonus
-            promo = order.get("promo_points", 0) or 0
-            if promo > 0:
+
+            if promo_to_bonus > 0:
                 await db.execute(
                     "UPDATE wallets SET bonus_points = bonus_points + $2, updated_at=NOW() "
-                    "WHERE user_id=$1", uid, promo)
+                    "WHERE user_id=$1", uid, promo_to_bonus)
                 try:
                     await db.execute(
                         "INSERT INTO wallet_grants "
                         "(user_id, source_type, source_id, wallet_type, initial_points, "
                         "remaining_points, status, created_at, metadata) "
                         "VALUES ($1,$2,$3,'bonus',$4,$5,'active',$6,$7)",
-                        uid, "promo_credit", str(order["id"]),
-                        promo, promo, now,
-                        json.dumps({"order_id": str(order["id"])}))
+                        uid, "promo_credit", str(order_id),
+                        promo_to_bonus, promo_to_bonus, now,
+                        json.dumps({"order_id": str(order_id)}))
                 except asyncpg.UniqueViolationError:
                     pass
-                try:
-                    row3 = await db.fetchrow(
-                        "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1", uid)
-                    await db.execute(
-                        "INSERT INTO wallet_ledger "
-                        "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
-                        "paid_balance_after, bonus_balance_after, reserved_balance_after, metadata, created_at) "
-                        "VALUES ($1,'bonus',$2,'promo_credit',$3,$4,$5,$6,$7,$8)",
-                        uid, promo, f"promo:{order['id']}",
-                        row3["paid_points"], row3["bonus_points"], row3["reserved_points"],
-                        json.dumps({"order_id": str(order["id"])}), now)
-                except asyncpg.UniqueViolationError:
-                    pass
+
+            # Ledger entry for the combined credit
+            try:
+                row2 = await db.fetchrow(
+                    "SELECT paid_points, bonus_points, reserved_points FROM wallets WHERE user_id=$1", uid)
+                await db.execute(
+                    "INSERT INTO wallet_ledger "
+                    "(user_id, wallet_type, amount, transaction_type, idempotency_key, "
+                    "balance_after, reserved_balance_after, metadata, created_at) "
+                    "VALUES ($1,'mixed',$2,'purchase_credit',$3,$4,$5,$6,$7)",
+                    uid, base + promo, f"purchase:{order_id}",
+                    (row2["paid_points"] or 0) + (row2["bonus_points"] or 0), row2["reserved_points"],
+                    json.dumps({"order_id": str(order_id), "base": base, "promo": promo,
+                                "base_debt_repaid": base_debt_repay, "promo_debt_repaid": promo_debt_repay}), now)
+            except asyncpg.UniqueViolationError:
+                pass
+
+            # Mark order as credited — this is the primary idempotency flag
+            await db.execute(
+                "UPDATE payment_orders SET credited_at=NOW(), credited_base_points=$2, "
+                "credited_promo_points=$3, updated_at=NOW() WHERE id=$1",
+                order_id, base, promo)
+
         return await WalletService.get_available_balance(db, uid)
 
 
