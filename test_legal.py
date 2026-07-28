@@ -99,7 +99,7 @@ class TestDocumentTypes:
         import legal_docs
         assert legal_docs.REQUIRES_ACCEPTANCE["terms"] is True
         assert legal_docs.REQUIRES_ACCEPTANCE["personal_data_consent"] is True
-        assert legal_docs.REQUIRES_ACCEPTANCE["ai_processing_consent"] is False
+        assert legal_docs.REQUIRES_ACCEPTANCE["ai_processing_consent"] is True
         assert legal_docs.REQUIRES_ACCEPTANCE["privacy_policy"] is False
         assert legal_docs.REQUIRES_ACCEPTANCE["referral_terms"] is False
 
