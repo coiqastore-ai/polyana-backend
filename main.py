@@ -120,6 +120,10 @@ FEATURE_PAYMENTS_YOOKASSA_WEB = ENV("FEATURE_PAYMENTS_YOOKASSA_WEB", "true").low
 FEATURE_BALANCE = ENV("FEATURE_BALANCE", "true").lower() == "true"
 FEATURE_AI_BILLING = ENV("FEATURE_AI_BILLING", "true").lower() == "true"
 FEATURE_PAYMENT_RECONCILIATION = ENV("FEATURE_PAYMENT_RECONCILIATION", "true").lower() == "true"
+FEATURE_TELEGRAM_RICH_MESSAGES = ENV("FEATURE_TELEGRAM_RICH_MESSAGES", "false").lower() == "true"
+FEATURE_TELEGRAM_RICH_DRAFTS = ENV("FEATURE_TELEGRAM_RICH_DRAFTS", "false").lower() == "true"
+FEATURE_RECIPE_NUTRITION = ENV("FEATURE_RECIPE_NUTRITION", "true").lower() == "true"
+FEATURE_RECIPE_NUTRITION_RECALC = ENV("FEATURE_RECIPE_NUTRITION_RECALC", "true").lower() == "true"
 WELCOME_POINTS = int(ENV("WELCOME_POINTS", "0"))
 
 # Feature lists for welcome screen (flag, icon, title)
@@ -2669,6 +2673,43 @@ async def init_db():
         except Exception as e:
             log.warning("Legacy balance migration skipped: %s", e)
 
+        # ── Migration W: Nutrition columns for recipes ──────────────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_kcal_total')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_kcal_total NUMERIC(12,2); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_protein_g_total')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_protein_g_total NUMERIC(12,2); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_fat_g_total')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_fat_g_total NUMERIC(12,2); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_carbs_g_total')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_carbs_g_total NUMERIC(12,2); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_servings_base')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_servings_base NUMERIC(8,2); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_is_estimated')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_is_estimated BOOLEAN NOT NULL DEFAULT TRUE; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_method')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_method VARCHAR(32); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_confidence')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_confidence VARCHAR(16); END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_notes')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_notes TEXT; END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_calculated_at')
+                    THEN ALTER TABLE recipes ADD COLUMN nutrition_calculated_at TIMESTAMPTZ; END IF;
+            END $$;
+        """)
+
     _db_ready = True
     log.info("DB ready ✓  (recipes-as-library schema v3)")
 
@@ -3140,28 +3181,79 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
     if pool is None:
         raise RuntimeError("DB not ready")
 
+    # Extract nutrition data if present
+    nutrition = parsed.get("nutrition")
+    nutrition_fields = {}
+    if nutrition and FEATURE_RECIPE_NUTRITION:
+        nutrition_fields = {
+            "nutrition_kcal_total": nutrition.get("total_kcal"),
+            "nutrition_protein_g_total": nutrition.get("total_protein_g"),
+            "nutrition_fat_g_total": nutrition.get("total_fat_g"),
+            "nutrition_carbs_g_total": nutrition.get("total_carbs_g"),
+            "nutrition_servings_base": parsed.get("servings"),
+            "nutrition_is_estimated": True,
+            "nutrition_method": nutrition.get("method", "ai_generation"),
+            "nutrition_confidence": nutrition.get("confidence", "low"),
+            "nutrition_notes": nutrition.get("notes"),
+            "nutrition_calculated_at": "NOW()",
+        }
+
     async with pool.acquire() as db:
         try:
-            rec = await db.fetchrow(
-                """
-                INSERT INTO recipes
-                    (user_id, name, name_original, emoji, source_url, source_type,
-                     original_language, servings, cook_time_minutes, category, source_photo_file_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                RETURNING *
-                """,
-                user_id,
-                (parsed.get("name") or "Рецепт").strip(),
-                parsed.get("name_original"),
-                parsed.get("emoji") or "🍽",
-                parsed.get("source_url"),
-                parsed.get("source_type", "manual"),
-                parsed.get("original_language"),
-                int(parsed["servings"]) if parsed.get("servings") else None,
-                int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
-                parsed.get("category"),
-                parsed.get("source_photo_file_id"),
-            )
+            if nutrition_fields:
+                rec = await db.fetchrow(
+                    """
+                    INSERT INTO recipes
+                        (user_id, name, name_original, emoji, source_url, source_type,
+                         original_language, servings, cook_time_minutes, category, source_photo_file_id,
+                         nutrition_kcal_total, nutrition_protein_g_total, nutrition_fat_g_total,
+                         nutrition_carbs_g_total, nutrition_servings_base, nutrition_is_estimated,
+                         nutrition_method, nutrition_confidence, nutrition_notes, nutrition_calculated_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+                    RETURNING *
+                    """,
+                    user_id,
+                    (parsed.get("name") or "Рецепт").strip(),
+                    parsed.get("name_original"),
+                    parsed.get("emoji") or "🍽",
+                    parsed.get("source_url"),
+                    parsed.get("source_type", "manual"),
+                    parsed.get("original_language"),
+                    int(parsed["servings"]) if parsed.get("servings") else None,
+                    int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
+                    parsed.get("category"),
+                    parsed.get("source_photo_file_id"),
+                    nutrition_fields.get("nutrition_kcal_total"),
+                    nutrition_fields.get("nutrition_protein_g_total"),
+                    nutrition_fields.get("nutrition_fat_g_total"),
+                    nutrition_fields.get("nutrition_carbs_g_total"),
+                    nutrition_fields.get("nutrition_servings_base"),
+                    nutrition_fields.get("nutrition_is_estimated"),
+                    nutrition_fields.get("nutrition_method"),
+                    nutrition_fields.get("nutrition_confidence"),
+                    nutrition_fields.get("nutrition_notes"),
+                )
+            else:
+                rec = await db.fetchrow(
+                    """
+                    INSERT INTO recipes
+                        (user_id, name, name_original, emoji, source_url, source_type,
+                         original_language, servings, cook_time_minutes, category, source_photo_file_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    RETURNING *
+                    """,
+                    user_id,
+                    (parsed.get("name") or "Рецепт").strip(),
+                    parsed.get("name_original"),
+                    parsed.get("emoji") or "🍽",
+                    parsed.get("source_url"),
+                    parsed.get("source_type", "manual"),
+                    parsed.get("original_language"),
+                    int(parsed["servings"]) if parsed.get("servings") else None,
+                    int(parsed["cook_time_minutes"]) if parsed.get("cook_time_minutes") else None,
+                    parsed.get("category"),
+                    parsed.get("source_photo_file_id"),
+                )
         except asyncpg.UniqueViolationError:
             # Same URL already in this user's library — return existing
             existing = await db.fetchrow(
@@ -3212,7 +3304,7 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
                 recipe_id, i + 1, step_text,
             )
 
-    return {
+    result = {
         "id": recipe_id,
         "name": rec["name"],
         "emoji": rec["emoji"] or "🍽",
@@ -3222,6 +3314,13 @@ async def _save_parsed_recipe(user_id: int, parsed: dict) -> dict:
         "ingredients_count": ing_count,
         "already_exists": False,
     }
+
+    # Include nutrition in response if available
+    if nutrition_fields and rec.get("nutrition_kcal_total") is not None:
+        from nutrition import format_nutrition_details
+        result["nutrition"] = format_nutrition_details(dict(rec))
+
+    return result
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -3842,6 +3941,9 @@ async def list_recipes(
         SELECT r.id, r.name, r.name_original, r.emoji, r.servings, r.cook_time_minutes,
                r.category, r.tags, r.times_cooked, r.rating, r.source_url, r.source_type,
                r.notes, r.created_at,
+               r.nutrition_kcal_total, r.nutrition_protein_g_total, r.nutrition_fat_g_total,
+               r.nutrition_carbs_g_total, r.nutrition_servings_base, r.nutrition_is_estimated,
+               r.nutrition_method, r.nutrition_confidence, r.nutrition_notes,
                (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredients_count
         FROM recipes r
         WHERE {where_sql}
@@ -3849,28 +3951,37 @@ async def list_recipes(
         """,
         *params,
     )
+
+    recipes = []
+    for r in rows:
+        recipe_dict = {
+            "id": r["id"],
+            "name": r["name"],
+            "name_original": r["name_original"],
+            "emoji": r["emoji"] or "🍽",
+            "servings": r["servings"],
+            "cook_time_minutes": r["cook_time_minutes"],
+            "cook_time_min": r["cook_time_minutes"],   # compat
+            "category": r["category"],
+            "tags": list(r["tags"] or []),
+            "times_cooked": r["times_cooked"] or 0,
+            "rating": r["rating"],
+            "source_url": r["source_url"],
+            "source_type": r["source_type"] or "manual",
+            "notes": r["notes"],
+            "ingredients_count": r["ingredients_count"] or 0,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        # Add nutrition if available
+        if FEATURE_RECIPE_NUTRITION and r.get("nutrition_kcal_total") is not None:
+            from nutrition import format_nutrition_details
+            recipe_dict["nutrition"] = format_nutrition_details(dict(r))
+        else:
+            recipe_dict["nutrition"] = None
+        recipes.append(recipe_dict)
+
     return {
-        "recipes": [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "name_original": r["name_original"],
-                "emoji": r["emoji"] or "🍽",
-                "servings": r["servings"],
-                "cook_time_minutes": r["cook_time_minutes"],
-                "cook_time_min": r["cook_time_minutes"],   # compat
-                "category": r["category"],
-                "tags": list(r["tags"] or []),
-                "times_cooked": r["times_cooked"] or 0,
-                "rating": r["rating"],
-                "source_url": r["source_url"],
-                "source_type": r["source_type"] or "manual",
-                "notes": r["notes"],
-                "ingredients_count": r["ingredients_count"] or 0,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ],
+        "recipes": recipes,
         "total": len(rows),
     }
 
@@ -4103,7 +4214,7 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
     rec_dict = dict(rec)
     cook_time = rec_dict.get("cook_time_minutes") or rec_dict.get("cook_time_min")
 
-    return {
+    result = {
         "id": rec["id"],
         "user_id": rec["user_id"],
         "name": rec["name"],
@@ -4134,6 +4245,15 @@ async def get_recipe(recipe_id: int, user_id: int = Depends(get_current_user), d
             for s in steps
         ],
     }
+
+    # Add nutrition if available
+    if FEATURE_RECIPE_NUTRITION and rec_dict.get("nutrition_kcal_total") is not None:
+        from nutrition import format_nutrition_details
+        result["nutrition"] = format_nutrition_details(rec_dict)
+    else:
+        result["nutrition"] = None
+
+    return result
 
 
 # ── POST /api/recipes/import-url  (Mini App → import by URL) ─────────────────
@@ -4193,6 +4313,162 @@ async def delete_recipe_from_library(
         raise HTTPException(403, "Access denied")
     # CASCADE removes ingredients, recipe_steps, event_recipes links
     await db.execute("DELETE FROM recipes WHERE id=$1", recipe_id)
+
+
+# ── POST /api/recipes/{id}/calculate-nutrition ───────────────────────────────
+
+@app.post("/api/recipes/{recipe_id}/calculate-nutrition")
+async def calculate_recipe_nutrition(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Calculate nutrition for an existing recipe using AI. Costs 1 AI point."""
+    if not FEATURE_RECIPE_NUTRITION:
+        raise HTTPException(404, "Feature not available")
+
+    # Check recipe exists and user is owner
+    rec = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+    if not rec:
+        raise HTTPException(404, "Recipe not found")
+    if rec["user_id"] != user_id:
+        raise HTTPException(403, "Access denied")
+
+    # Check ingredients exist
+    ingredients = await db.fetch(
+        "SELECT name, qty, unit FROM ingredients WHERE recipe_id=$1 ORDER BY sort_order, id",
+        recipe_id,
+    )
+    if not ingredients:
+        raise HTTPException(422, "Recipe has no ingredients")
+
+    # Reserve 1 AI point
+    operation_id = None
+    if FEATURE_AI_BILLING:
+        try:
+            async with pool.acquire() as db:
+                await LegalConsentService.require_ai_access(db, user_id)
+                operation_id = await AIUsageBillingService.reserve(
+                    db, user_id, "recipe_nutrition", recipe_id=str(recipe_id)
+                )
+        except ValueError as e:
+            raise HTTPException(402, str(e))
+
+    try:
+        # Build ingredient list for AI
+        ing_lines = []
+        for ing in ingredients:
+            qty = ing["qty"]
+            unit = ing["unit"] or ""
+            name = ing["name"]
+            if qty is not None:
+                ing_lines.append(f"{qty} {unit} {name}".strip())
+            else:
+                ing_lines.append(name)
+
+        prompt = (
+            f"Рецепт: {rec['name']}\n"
+            f"Порций: {rec['servings'] or 4}\n\n"
+            f"Ингредиенты:\n" + "\n".join(f"- {l}" for l in ing_lines)
+        )
+
+        system_prompt = (
+            "Ты — диетолог. Рассчитай КБЖУ для рецепта на основе списка ингредиентов. "
+            "Верни строго JSON-объект:\n"
+            "{\n"
+            '  "total_kcal": 1720,\n'
+            '  "total_protein_g": 104,\n'
+            '  "total_fat_g": 72,\n'
+            '  "total_carbs_g": 168,\n'
+            '  "confidence": "medium",\n'
+            '  "assumptions": ["использовано около 10 г масла"]\n'
+            "}\n\n"
+            "Правила:\n"
+            "- считай КБЖУ на весь рецепт;\n"
+            "- учитывай количество каждого ингредиента;\n"
+            "- не придумывай точность, если количество неизвестно;\n"
+            "- при неопределённости ставь confidence=low;\n"
+            "- используй только числа;\n"
+            "- значения не могут быть отрицательными;\n"
+            "- assumptions — максимум 3 коротких пункта."
+        )
+
+        client = _get_or_client()
+        response = await client.chat.completions.create(
+            model=AI_OPERATION_CATALOG.get("recipe_nutrition", {}).get("model", "google/gemini-2.0-flash-001"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        raw = response.choices[0].message.content
+        nutrition_data = json.loads(raw)
+
+        # Validate
+        from nutrition import validate_nutrition
+        validation = validate_nutrition(nutrition_data, rec["servings"] or 4)
+
+        if not validation["valid"]:
+            raise ValueError(f"Invalid nutrition data: {validation['errors']}")
+
+        # Update recipe
+        servings_base = rec["servings"] or 4
+        await db.execute(
+            """
+            UPDATE recipes SET
+                nutrition_kcal_total = $1,
+                nutrition_protein_g_total = $2,
+                nutrition_fat_g_total = $3,
+                nutrition_carbs_g_total = $4,
+                nutrition_servings_base = $5,
+                nutrition_is_estimated = TRUE,
+                nutrition_method = 'ai_recalculation',
+                nutrition_confidence = $6,
+                nutrition_notes = $7,
+                nutrition_calculated_at = NOW()
+            WHERE id = $8
+            """,
+            nutrition_data.get("total_kcal"),
+            nutrition_data.get("total_protein_g"),
+            nutrition_data.get("total_fat_g"),
+            nutrition_data.get("total_carbs_g"),
+            servings_base,
+            validation["confidence"],
+            "; ".join(validation["notes"]) if validation["notes"] else None,
+            recipe_id,
+        )
+
+        # Commit reservation
+        if operation_id and FEATURE_AI_BILLING:
+            async with pool.acquire() as db:
+                await AIUsageBillingService.commit_charge(
+                    db, operation_id, provider="openrouter",
+                    model=AI_OPERATION_CATALOG.get("recipe_nutrition", {}).get("model", "unknown")
+                )
+
+        # Return updated nutrition
+        rec_updated = await db.fetchrow("SELECT * FROM recipes WHERE id=$1", recipe_id)
+        from nutrition import format_nutrition_details
+        return {
+            "nutrition": format_nutrition_details(dict(rec_updated)),
+            "warnings": validation["warnings"],
+        }
+
+    except Exception as exc:
+        # Release reservation on failure
+        if operation_id and FEATURE_AI_BILLING:
+            try:
+                async with pool.acquire() as db:
+                    await AIUsageBillingService.release_reservation(db, operation_id, "calculation_failed")
+            except Exception:
+                pass
+
+        log.exception("Nutrition calculation failed: recipe=%s user=%s", recipe_id, user_id)
+        raise HTTPException(500, f"Calculation failed: {str(exc)[:200]}")
 
 
 # ── Recipe share (inline prepared message) ────────────────────────────────────
@@ -6536,7 +6812,26 @@ def _clean_generated_recipe(data: dict) -> dict:
     if not emoji:
         emoji = "🍽"
 
-    return {
+    # Extract nutrition data if present
+    nutrition = None
+    if FEATURE_RECIPE_NUTRITION:
+        raw_nutrition = data.get("nutrition")
+        if isinstance(raw_nutrition, dict):
+            from nutrition import validate_nutrition
+            validation = validate_nutrition(raw_nutrition, servings)
+            if validation["valid"]:
+                nutrition = {
+                    "total_kcal": raw_nutrition.get("total_kcal"),
+                    "total_protein_g": raw_nutrition.get("total_protein_g"),
+                    "total_fat_g": raw_nutrition.get("total_fat_g"),
+                    "total_carbs_g": raw_nutrition.get("total_carbs_g"),
+                    "confidence": validation["confidence"],
+                    "notes": "; ".join(validation["notes"]) if validation["notes"] else None,
+                }
+            else:
+                log.warning("Nutrition validation failed: %s", validation["errors"])
+
+    result = {
         "name": name[:160],
         "name_original": None,
         "emoji": emoji[:12],
@@ -6548,6 +6843,11 @@ def _clean_generated_recipe(data: dict) -> dict:
         "ingredients": ingredients,
         "steps": steps,
     }
+
+    if nutrition:
+        result["nutrition"] = nutrition
+
+    return result
 
 
 def _format_generated_recipe_preview(recipe: dict) -> str:
@@ -6600,6 +6900,20 @@ def _format_generated_recipe_preview(recipe: dict) -> str:
         lines.append(
             f"{index}. {_esc(step['text'])}"
         )
+
+    # Add nutrition card if available
+    nutrition = recipe.get("nutrition")
+    if nutrition and FEATURE_RECIPE_NUTRITION:
+        from nutrition import nutrition_per_serving, format_nutrition_card
+        per = nutrition_per_serving({
+            "nutrition_kcal_total": nutrition.get("total_kcal"),
+            "nutrition_protein_g_total": nutrition.get("total_protein_g"),
+            "nutrition_fat_g_total": nutrition.get("total_fat_g"),
+            "nutrition_carbs_g_total": nutrition.get("total_carbs_g"),
+            "nutrition_servings_base": recipe.get("servings", 4),
+        })
+        if per:
+            lines.extend(["", format_nutrition_card(per)])
 
     lines.extend([
         "",
@@ -6664,12 +6978,29 @@ async def _generate_recipe_draft(
         "],"
         "\"steps\":["
         "{\"text\":\"Нарезать куриное филе.\"}"
-        "]"
+        "],"
+        "\"nutrition\":{"
+        "\"total_kcal\":1720,"
+        "\"total_protein_g\":104,"
+        "\"total_fat_g\":72,"
+        "\"total_carbs_g\":168,"
+        "\"confidence\":\"medium\","
+        "\"assumptions\":[\"масло не учитано\"]"
+        "}"
         "}\n\n"
         "Допустимые категории: завтрак, обед, ужин, десерт, суп, "
         "салат, закуска, напиток, выпечка, другое.\n"
         "qty должно быть числом или null. "
-        "Единицы: г, кг, мл, л, шт, ст.л, ч.л, щепотка, по вкусу."
+        "Единицы: г, кг, мл, л, шт, ст.л, ч.л, щепотка, по вкусу.\n\n"
+        "Правила расчёта КБЖУ:\n"
+        "- считай КБЖУ на весь рецепт (все порции вместе);\n"
+        "- учитывай количество каждого ингредиента;\n"
+        "- учитывай масло, соусы, сахар и другие калорийные добавки;\n"
+        "- не придумывай точность, если количество продукта неизвестно;\n"
+        "- при существенной неопределённости ставь confidence=low;\n"
+        "- используй только числа, без строк вроде \"около 300\";\n"
+        "- значения не могут быть отрицательными;\n"
+        "- assumptions — максимум 3 коротких пункта."
     )
 
     for attempt, model in enumerate(models, start=1):
@@ -6909,17 +7240,68 @@ async def handle_recipe_generation_prompt(
         generation_prompt=prompt
     )
 
-    status = await message.answer(
-        "👨‍🍳 Придумываю рецепт…"
-    )
-
     _GENERATION_LOCKS.add(user_id)
 
+    # Draft support for Telegram 8.0+
+    draft_id = f"recipe_draft_{user_id}_{int(time.time())}"
+    can_draft = (
+        FEATURE_TELEGRAM_RICH_DRAFTS
+        and hasattr(bot, 'send_rich_message_draft')
+    )
+
+    if can_draft:
+        try:
+            from aiogram.types import InputRichMessage
+            draft_msg = InputRichMessage(
+                html="🍲 <b>Создаю рецепт…</b>",
+            )
+            status = await bot.send_rich_message_draft(
+                chat_id=message.chat.id,
+                rich_message=draft_msg,
+                draft_id=draft_id,
+            )
+        except Exception as e:
+            log.warning("Rich draft failed, using regular message: %s", e)
+            can_draft = False
+            status = await message.answer("👨‍🍳 Придумываю рецепт…")
+    else:
+        # Fallback: send typing action
+        await bot.send_chat_action(message.chat.id, "typing")
+        status = await message.answer("👨‍🍳 Придумываю рецепт…")
+
     try:
+        # Update draft: understood preferences
+        if can_draft:
+            try:
+                draft_msg = InputRichMessage(
+                    html="✓ Понял пожелания\n⏳ Подбираю ингредиенты и рассчитываю КБЖУ",
+                )
+                await bot.send_rich_message_draft(
+                    chat_id=message.chat.id,
+                    rich_message=draft_msg,
+                    draft_id=draft_id,
+                )
+            except Exception:
+                pass
+
         recipe = await _generate_recipe_draft(
             user_id,
             prompt,
         )
+
+        # Update draft: ingredients ready
+        if can_draft:
+            try:
+                draft_msg = InputRichMessage(
+                    html="✓ Ингредиенты готовы\n✓ КБЖУ рассчитано\n⏳ Оформляю рецепт",
+                )
+                await bot.send_rich_message_draft(
+                    chat_id=message.chat.id,
+                    rich_message=draft_msg,
+                    draft_id=draft_id,
+                )
+            except Exception:
+                pass
 
     except ValueError as exc:
         error_text = str(exc)
@@ -6960,10 +7342,31 @@ async def handle_recipe_generation_prompt(
         RecipeGenerationStates.preview
     )
 
-    await status.edit_text(
-        _format_generated_recipe_preview(recipe),
-        reply_markup=_generation_keyboard(),
-    )
+    # Send final result as Rich Message or regular message
+    preview_text = _format_generated_recipe_preview(recipe)
+    keyboard = _generation_keyboard()
+
+    if FEATURE_TELEGRAM_RICH_MESSAGES and can_draft:
+        try:
+            from aiogram.types import InputRichMessage
+            rich_msg = InputRichMessage(
+                html=preview_text,
+                reply_markup=keyboard,
+            )
+            # Delete draft status and send final message
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            await bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=rich_msg,
+            )
+        except Exception as e:
+            log.warning("Rich message failed, falling back: %s", e)
+            await status.edit_text(preview_text, reply_markup=keyboard)
+    else:
+        await status.edit_text(preview_text, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == "gen_retry")
