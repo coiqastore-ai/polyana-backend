@@ -378,6 +378,47 @@ async def test_slug_uniqueness():
         await db.close()
 
 
+async def test_clone_preserves_description_and_image():
+    """Test that cloning preserves description and editorial_image_url."""
+    db = await get_db()
+    try:
+        await cleanup_test_data(db)
+
+        # Create editorial recipe with description and image
+        recipe = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Test Desc Image",
+            description="Очень вкусный рецепт с подробным описанием",
+            slug="test-desc-image",
+            editorial_image_url="https://example.com/chicken.jpg",
+            ingredients=[{"name": "Курица", "qty": 500, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Обжарить курицу"}],
+        )
+        await editorial_service.approve_editorial_recipe(db, recipe["id"])
+        await editorial_service.publish_editorial_recipe(db, recipe["id"])
+
+        # Clone to user
+        result = await editorial_service.clone_editorial_recipe_to_user(
+            db, recipe["id"], TEST_USER_A
+        )
+        assert result["already_saved"] is False
+
+        # Verify clone has description
+        clone = await db.fetchrow(
+            "SELECT description, editorial_image_url FROM recipes WHERE id=$1",
+            result["recipe_id"],
+        )
+        assert clone["description"] == "Очень вкусный рецепт с подробным описанием", \
+            f"Description mismatch: {clone['description']}"
+        assert clone["editorial_image_url"] == "https://example.com/chicken.jpg", \
+            f"Image URL mismatch: {clone['editorial_image_url']}"
+
+        print("✓ test_clone_preserves_description_and_image")
+    finally:
+        await cleanup_test_data(db)
+        await db.close()
+
+
 # ── Security tests ───────────────────────────────────────────────────────────
 
 def _read_main_source() -> str:
@@ -536,6 +577,7 @@ async def run_all():
         test_public_access_only_published,
         test_private_recipe_not_public,
         test_clone_creates_personal_copy,
+        test_clone_preserves_description_and_image,
         test_duplicate_save_returns_existing,
         test_independent_copies_per_user,
         test_editorial_not_modified_on_clone,

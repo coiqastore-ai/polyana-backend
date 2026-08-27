@@ -300,21 +300,25 @@ async def clone_editorial_recipe_to_user(
     new_rec = await db.fetchrow(
         """
         INSERT INTO recipes
-            (user_id, name, emoji, servings, cook_time_minutes,
+            (user_id, name, description, emoji, servings, cook_time_minutes,
              category, tags, source_url, source_type,
+             editorial_image_url,
              is_editorial, visibility, source_editorial_recipe_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'editorial_clone',
-                FALSE, 'private', $9)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'editorial_clone',
+                $10,
+                FALSE, 'private', $11)
         RETURNING id
         """,
         user_id,
         orig["name"],
+        orig["description"],
         orig["emoji"],
         orig["servings"],
         orig["cook_time_minutes"],
         orig["category"],
         orig["tags"],
         orig["source_url"],
+        orig["editorial_image_url"],
         editorial_recipe_id,
     )
     new_id = new_rec["id"]
