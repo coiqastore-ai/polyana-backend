@@ -6,7 +6,7 @@ import telegram_publisher
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
-from fastapi import FastAPI, HTTPException, Header, Query, Depends
+from fastapi import FastAPI, HTTPException, Header, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import uvicorn
@@ -3324,23 +3324,69 @@ async def health():
     }
 
 
+# Whitelisted public analytics events (no auth required, user_id=NULL)
+_PUBLIC_ANALYTICS_EVENTS = frozenset({
+    "editorial_recipe_opened",
+})
+
+# Props allowed for public analytics (everything else is dropped)
+_PUBLIC_ANALYTICS_ALLOWED_PROPS = frozenset({
+    "editorial_recipe_id", "slug", "source", "campaign",
+})
+
+# Simple per-IP rate limiting for public analytics
+_analytics_rate_cache: dict[str, list[float]] = {}
+_ANALYTICS_RATE_WINDOW = 60.0  # seconds
+_ANALYTICS_RATE_MAX = 30  # max events per window per IP
+
+
+def _check_analytics_rate(ip: str) -> bool:
+    """Return True if request is within rate limit."""
+    now = time.time()
+    bucket = _analytics_rate_cache.setdefault(ip, [])
+    # Prune old entries
+    bucket[:] = [t for t in bucket if now - t < _ANALYTICS_RATE_WINDOW]
+    if len(bucket) >= _ANALYTICS_RATE_MAX:
+        return False
+    bucket.append(now)
+    return True
+
+
 @app.post("/api/analytics/track")
-async def analytics_track(body: dict, db=Depends(get_db)):
-    """Public analytics endpoint (fire-and-forget from frontend)."""
+async def analytics_track(
+    request: Request,
+    body: dict,
+    db=Depends(get_db),
+):
+    """Public analytics endpoint — whitelist only, no user_id injection."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_analytics_rate(client_ip):
+        return {"ok": True, "rate_limited": True}
+
+    event_type = (body.get("event_type") or "").strip()[:64]
+    if event_type not in _PUBLIC_ANALYTICS_EVENTS:
+        return {"ok": True}
+
+    # Sanitize props: only allow whitelisted keys, strip everything else
+    raw_props = body.get("props") or {}
+    props = {k: str(v)[:128] for k, v in raw_props.items() if k in _PUBLIC_ANALYTICS_ALLOWED_PROPS}
+
+    # Public events always have user_id=NULL — no client-side injection
+    await track(None, event_type, props=props)
+    return {"ok": True}
+
+
+@app.post("/api/analytics/track-auth")
+async def analytics_track_auth(
+    body: dict,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Authenticated analytics endpoint — user_id from Telegram initData."""
     event_type = (body.get("event_type") or "").strip()[:64]
     if not event_type:
         return {"ok": True}
     props = body.get("props") or {}
-    # Extract user_id from initData if available (optional)
-    user_id = None
-    try:
-        init_data = body.get("init_data")
-        if init_data:
-            user = validate_init_data(init_data)
-            if user and "id" in user:
-                user_id = int(user["id"])
-    except Exception:
-        pass
     await track(user_id, event_type, props=props)
     return {"ok": True}
 
@@ -4471,13 +4517,27 @@ async def admin_update_editorial_recipe(
         "source_author": "source_author",
         "trend_score": "trend_score",
         "editorial_image_url": "editorial_image_url",
-        "content_slug": "content_slug",
     }
     sets, params = [], []
     for body_key, col in scalar_map.items():
         if body_key in body and body[body_key] is not None:
             params.append(body[body_key])
             sets.append(f"{col} = ${len(params)}")
+
+    # Handle content_slug with uniqueness check
+    if "content_slug" in body and body["content_slug"] is not None:
+        new_slug = body["content_slug"].strip()
+        if new_slug:
+            # Check if another recipe already uses this slug
+            existing = await db.fetchval(
+                "SELECT id FROM recipes WHERE content_slug=$1 AND id<>$2",
+                new_slug, recipe_id,
+            )
+            if existing:
+                raise HTTPException(409, f"Slug '{new_slug}' is already used by recipe {existing}")
+        params.append(new_slug)
+        sets.append(f"content_slug = ${len(params)}")
+
     if sets:
         params.append(recipe_id)
         await db.execute(

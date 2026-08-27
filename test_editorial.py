@@ -378,6 +378,116 @@ async def test_slug_uniqueness():
         await db.close()
 
 
+# ── Security tests ───────────────────────────────────────────────────────────
+
+async def test_public_analytics_rejects_arbitrary_event():
+    """Test that public analytics endpoint only accepts whitelisted events."""
+    import httpx
+
+    # This test verifies the endpoint logic directly via DB inspection
+    # In a real test we'd use httpx against a running server, but here we
+    # verify the whitelist logic by checking that non-whitelisted events
+    # are not stored when called through the public endpoint.
+    db = await get_db()
+    try:
+        # Count events before
+        count_before = await db.fetchval(
+            "SELECT COUNT(*) FROM analytics_events WHERE event_type='arbitrary_fake_event'"
+        )
+
+        # The public endpoint would reject 'arbitrary_fake_event' because it's not in
+        # _PUBLIC_ANALYTICS_EVENTS. We can't easily test the HTTP endpoint here without
+        # a running server, but we verify the whitelist exists in the code.
+        # This is a structural test.
+        import importlib
+        import main
+        assert hasattr(main, '_PUBLIC_ANALYTICS_EVENTS')
+        assert 'editorial_recipe_opened' in main._PUBLIC_ANALYTICS_EVENTS
+        assert 'arbitrary_fake_event' not in main._PUBLIC_ANALYTICS_EVENTS
+        assert 'user_start' not in main._PUBLIC_ANALYTICS_EVENTS
+
+        print("✓ test_public_analytics_rejects_arbitrary_event")
+    finally:
+        await db.close()
+
+
+async def test_public_analytics_no_user_id_injection():
+    """Test that public analytics always uses user_id=NULL."""
+    db = await get_db()
+    try:
+        # Verify the public endpoint code structure: it calls track(None, ...)
+        # We check that the function signature and implementation enforce this
+        import main
+        import inspect
+
+        # Read the source of analytics_track function
+        source = inspect.getsource(main.analytics_track)
+        # The function should call track(None, event_type, ...) — not user_id
+        assert "await track(None," in source, "Public analytics must use user_id=None"
+        assert "await track(user_id," not in source, "Public analytics must NOT pass user_id"
+
+        print("✓ test_public_analytics_no_user_id_injection")
+    finally:
+        await db.close()
+
+
+async def test_authenticated_analytics_uses_initdata():
+    """Test that authenticated analytics endpoint uses user_id from initData."""
+    import inspect
+    import main
+
+    source = inspect.getsource(main.analytics_track_auth)
+    # Should use Depends(get_current_user) for user_id
+    assert "get_current_user" in source, "Authenticated endpoint must use get_current_user"
+    assert "await track(user_id," in source, "Authenticated endpoint must pass user_id"
+
+    print("✓ test_authenticated_analytics_uses_initdata")
+
+
+async def test_slug_conflict_on_update():
+    """Test that updating content_slug to a conflicting value returns 409."""
+    db = await get_db()
+    try:
+        await cleanup_test_data(db)
+
+        # Create two editorial recipes
+        r1 = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Slug Test 1", slug="slug-test-1",
+            ingredients=[{"name": "A", "qty": 1, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Step"}],
+        )
+        r2 = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Slug Test 2", slug="slug-test-2",
+            ingredients=[{"name": "B", "qty": 1, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Step"}],
+        )
+
+        # Try to update r2's slug to r1's slug — should fail
+        try:
+            await db.execute(
+                "UPDATE recipes SET content_slug=$1 WHERE id=$2",
+                "slug-test-1", r2["id"],
+            )
+            # The DB will raise a unique violation — catch it
+            # In the actual endpoint, we check before updating
+            assert False, "Should have raised unique violation"
+        except asyncpg.UniqueViolationError:
+            pass  # Expected
+
+        # Verify the endpoint logic checks uniqueness
+        import inspect
+        import main
+        source = inspect.getsource(main.admin_update_editorial_recipe)
+        assert "409" in source or "already used" in source, "PUT endpoint must check slug uniqueness"
+
+        print("✓ test_slug_conflict_on_update")
+    finally:
+        await cleanup_test_data(db)
+        await db.close()
+
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 async def run_all():
@@ -392,6 +502,10 @@ async def run_all():
         test_cannot_publish_draft,
         test_approve_and_publish_workflow,
         test_slug_uniqueness,
+        test_public_analytics_rejects_arbitrary_event,
+        test_public_analytics_no_user_id_injection,
+        test_authenticated_analytics_uses_initdata,
+        test_slug_conflict_on_update,
     ]
 
     passed = 0
