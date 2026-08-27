@@ -52,7 +52,7 @@ async def send_editorial_for_approval(
     if not rec:
         raise ValueError("Recipe not found or not editorial")
 
-    if rec["editorial_status"] not in ("draft", "needs_revision"):
+    if rec["editorial_status"] not in ("draft", "needs_revision", "waiting_approval"):
         raise ValueError(f"Cannot send for approval from status '{rec['editorial_status']}'")
 
     # Build preview text
