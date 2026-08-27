@@ -121,7 +121,14 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
              os.environ.get("TREND_MIN_CONFIDENCE", 50))
 
     # 6. Select top N for LLM analysis
-    top_for_llm = sorted(qualified, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["max_llm_candidates"]]
+    # If no candidates pass quality gate, still analyze top N by score
+    # This allows LLM to potentially boost good candidates
+    if qualified:
+        top_for_llm = sorted(qualified, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["max_llm_candidates"]]
+    else:
+        # No qualified candidates - analyze top N anyway to find hidden gems
+        log.info("No qualified candidates, analyzing top %d by score anyway", config["max_llm_candidates"])
+        top_for_llm = sorted(scored, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["max_llm_candidates"]]
 
     # 7. LLM analysis for top candidates
     llm_analyzed = []

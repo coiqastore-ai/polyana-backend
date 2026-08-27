@@ -141,10 +141,9 @@ async def collect_from_all_sources(
 
 async def _collect_web(queries: list[str]) -> list[dict]:
     """
-    Collect from web search via Jina Reader.
+    Collect from web search via multiple backends.
 
-    Note: s.jina.ai is a SEARCH endpoint (returns search results),
-    not r.jina.ai which is a READER endpoint (reads specific URLs).
+    Tries: Jina search, then DuckDuckGo fallback.
     """
     candidates = []
     seen_urls = set()
@@ -154,37 +153,65 @@ async def _collect_web(queries: list[str]) -> list[dict]:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=30) as client:
-                # s.jina.ai = search endpoint
-                r = await client.get(
-                    f"https://s.jina.ai/{query}",
-                    headers={"Accept": "application/json"},
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    for item in data.get("data", [])[:5]:
-                        url = item.get("url", "")
-                        if url in seen_urls:
-                            continue
-                        seen_urls.add(url)
+                # Try Jina search first
+                try:
+                    r = await client.get(
+                        f"https://s.jina.ai/{query}",
+                        headers={"Accept": "application/json"},
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        for item in data.get("data", [])[:5]:
+                            url = item.get("url", "")
+                            if url in seen_urls:
+                                continue
+                            seen_urls.add(url)
 
-                        # Extract published date if available
-                        published_at = None
-                        if item.get("publishedDate"):
-                            try:
-                                published_at = datetime.fromisoformat(
-                                    item["publishedDate"].replace("Z", "+00:00")
-                                )
-                            except Exception:
-                                pass
+                            # Extract published date if available
+                            published_at = None
+                            if item.get("publishedDate"):
+                                try:
+                                    published_at = datetime.fromisoformat(
+                                        item["publishedDate"].replace("Z", "+00:00")
+                                    )
+                                except Exception:
+                                    pass
 
-                        candidates.append({
-                            "source_platform": "web",
-                            "source_url": url,
-                            "title": item.get("title", ""),
-                            "description": item.get("description", ""),
-                            "published_at": published_at,
-                            "raw_metadata": {"query": query, "search_backend": "jina"},
-                        })
+                            candidates.append({
+                                "source_platform": "web",
+                                "source_url": url,
+                                "title": item.get("title", ""),
+                                "description": item.get("description", ""),
+                                "published_at": published_at,
+                                "raw_metadata": {"query": query, "search_backend": "jina"},
+                            })
+                            continue  # Skip DuckDuckGo if Jina works
+                except Exception:
+                    pass
+
+                # Fallback: DuckDuckGo instant answer
+                try:
+                    ddg_url = f"https://api.duckduckgo.com/?q={query}+recipe&format=json&no_html=1"
+                    r = await client.get(ddg_url, timeout=15)
+                    if r.status_code == 200:
+                        data = r.json()
+                        # DuckDuckGo returns related topics
+                        for topic in data.get("RelatedTopics", [])[:3]:
+                            if isinstance(topic, dict) and topic.get("FirstURL"):
+                                url = topic["FirstURL"]
+                                if url in seen_urls:
+                                    continue
+                                seen_urls.add(url)
+                                candidates.append({
+                                    "source_platform": "web",
+                                    "source_url": url,
+                                    "title": topic.get("Text", "")[:100],
+                                    "description": topic.get("Text", ""),
+                                    "raw_metadata": {"query": query, "search_backend": "duckduckgo"},
+                                })
+                except Exception:
+                    pass
+
         except Exception as e:
             log.warning("Web search failed for '%s': %s", query, e)
 
@@ -244,7 +271,7 @@ async def _collect_youtube(queries: list[str]) -> list[dict]:
 
                     # Parse upload date
                     published_at = None
-                    if upload_date and len(upload_date) == 8:
+                    if upload_date and upload_date != "NA" and len(upload_date) == 8:
                         try:
                             published_at = datetime.strptime(upload_date, "%Y%m%d").replace(
                                 tzinfo=timezone.utc
