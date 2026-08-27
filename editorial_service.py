@@ -218,20 +218,20 @@ async def approve_editorial_recipe(
     db: asyncpg.Connection,
     recipe_id: int,
 ) -> dict | None:
-    """Approve a draft editorial recipe."""
+    """Approve a draft editorial recipe (transitions to publishing)."""
     rec = await db.fetchrow(
         "SELECT * FROM recipes WHERE id=$1 AND is_editorial=TRUE", recipe_id
     )
     if not rec:
         return None
-    if rec["editorial_status"] not in ("draft", "archived"):
+    if rec["editorial_status"] not in ("draft", "archived", "waiting_approval"):
         raise ValueError(f"Cannot approve from status '{rec['editorial_status']}'")
 
     await db.execute(
-        "UPDATE recipes SET editorial_status='approved', updated_at=NOW() WHERE id=$1",
+        "UPDATE recipes SET editorial_status='publishing', updated_at=NOW() WHERE id=$1",
         recipe_id,
     )
-    return {"ok": True, "recipe_id": recipe_id, "status": "approved"}
+    return {"ok": True, "recipe_id": recipe_id, "status": "publishing"}
 
 
 async def publish_editorial_recipe(
@@ -244,7 +244,7 @@ async def publish_editorial_recipe(
     )
     if not rec:
         return None
-    if rec["editorial_status"] != "approved":
+    if rec["editorial_status"] != "publishing":
         raise ValueError(f"Cannot publish from status '{rec['editorial_status']}'")
 
     await db.execute(

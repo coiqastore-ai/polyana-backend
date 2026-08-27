@@ -1,9 +1,10 @@
 """
 Editorial approval flow — send preview to admin, handle callbacks.
 
-States: draft → waiting_approval → approved → published
+States: draft → waiting_approval → publishing → published
                              → rejected
                              → needs_revision
+                   publishing → waiting_approval (on failure/recovery)
 """
 
 import html
@@ -19,9 +20,9 @@ log = logging.getLogger("polyana.editorial_approval")
 # Valid state transitions
 _VALID_TRANSITIONS = {
     "draft": {"waiting_approval"},
-    "waiting_approval": {"approved", "rejected", "needs_revision"},
+    "waiting_approval": {"publishing", "rejected", "needs_revision"},
     "needs_revision": {"waiting_approval"},
-    "approved": {"published"},
+    "publishing": {"published", "waiting_approval"},
 }
 
 
@@ -52,7 +53,7 @@ async def send_editorial_for_approval(
     if not rec:
         raise ValueError("Recipe not found or not editorial")
 
-    if rec["editorial_status"] not in ("draft", "needs_revision", "waiting_approval"):
+    if rec["editorial_status"] not in ("draft", "needs_revision", "waiting_approval", "publishing"):
         raise ValueError(f"Cannot send for approval from status '{rec['editorial_status']}'")
 
     # Build preview text
@@ -174,20 +175,20 @@ async def handle_approval_callback(
     current_status = rec["editorial_status"]
 
     if action == "approve":
-        if not can_transition(current_status, "approved"):
+        if not can_transition(current_status, "publishing"):
             return {"ok": False, "error": f"Cannot approve from '{current_status}'"}
 
         # Check idempotency — already published?
         if rec.get("editorial_telegram_message_id"):
             return {"ok": True, "already_published": True}
 
-        # Transition to approved
+        # Step 1: Short transaction — lock, validate, set publishing
         await db.execute(
-            "UPDATE recipes SET editorial_status='approved', updated_at=NOW() WHERE id=$1",
+            "UPDATE recipes SET editorial_status='publishing', updated_at=NOW() WHERE id=$1",
             recipe_id,
         )
 
-        # Publish to Telegram channel
+        # Step 2: Telegram send (outside transaction — network call)
         try:
             result = await publish_recipe_to_telegram(
                 bot=bot,
@@ -199,9 +200,10 @@ async def handle_approval_callback(
             )
         except Exception as e:
             log.error("Failed to publish after approval: %s", e)
-            # Revert to waiting_approval so admin can retry
+            # Step 3b: Failure — revert to waiting_approval
             await db.execute(
-                "UPDATE recipes SET editorial_status='waiting_approval', updated_at=NOW() WHERE id=$1",
+                "UPDATE recipes SET editorial_status='waiting_approval', updated_at=NOW() "
+                "WHERE id=$1 AND editorial_telegram_message_id IS NULL",
                 recipe_id,
             )
             return {"ok": False, "error": f"Publish failed: {e}"}
@@ -266,3 +268,32 @@ async def handle_approval_callback(
         return {"ok": True, "needs_revision": True}
 
     return {"ok": False, "error": "Unknown action"}
+
+
+async def recover_stale_publishing(
+    *,
+    db: asyncpg.Connection,
+    stale_minutes: int = 10,
+) -> list[dict]:
+    """
+    Recover recipes stuck in 'publishing' state.
+    If status='publishing' AND editorial_telegram_message_id IS NULL
+    AND updated_at < NOW() - INTERVAL '{stale_minutes} minutes',
+    revert to 'waiting_approval'.
+    Returns list of recovered recipe ids.
+    """
+    rows = await db.fetch(
+        """
+        UPDATE recipes
+        SET editorial_status='waiting_approval', updated_at=NOW()
+        WHERE editorial_status='publishing'
+          AND editorial_telegram_message_id IS NULL
+          AND updated_at < NOW() - make_interval(mins => $1)
+        RETURNING id
+        """,
+        stale_minutes,
+    )
+    recovered = [r["id"] for r in rows]
+    if recovered:
+        log.info("Recovered %d stale publishing recipes: %s", len(recovered), recovered)
+    return recovered

@@ -119,7 +119,7 @@ async def publish_recipe_to_telegram(
 
     Requirements:
     - recipe exists and is_editorial=TRUE
-    - editorial_status = 'approved'
+    - editorial_status = 'publishing'
     - has at least 1 ingredient and 1 step
 
     After success: sets editorial_status='published', published_at=NOW().
@@ -133,8 +133,8 @@ async def publish_recipe_to_telegram(
     )
     if not rec:
         raise ValueError("Recipe not found or not editorial")
-    if rec["editorial_status"] != "approved":
-        raise ValueError(f"Cannot publish: status is '{rec['editorial_status']}', need 'approved'")
+    if rec["editorial_status"] != "publishing":
+        raise ValueError(f"Cannot publish: status is '{rec['editorial_status']}', need 'publishing'")
 
     # Fetch ingredients and steps
     ings = await db.fetch(

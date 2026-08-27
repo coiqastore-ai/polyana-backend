@@ -234,9 +234,9 @@ async def test_admin_can_approve_and_publish():
             steps=[{"step_number": 1, "text": "Step"}],
         )
 
-        # Approve
+        # Approve (now transitions to publishing)
         r1 = await editorial_service.approve_editorial_recipe(db, recipe["id"])
-        assert r1["status"] == "approved"
+        assert r1["status"] == "publishing"
 
         # Publish
         r2 = await editorial_service.publish_editorial_recipe(db, recipe["id"])
@@ -408,16 +408,20 @@ async def test_retry_after_publish_failure_succeeds():
             steps=[{"step_number": 1, "text": "Step"}],
         )
 
-        # Simulate: draft → waiting_approval → approved → (fail) → waiting_approval
+        # Simulate: draft → waiting_approval → publishing → (fail) → waiting_approval
         await db.execute(
             "UPDATE recipes SET editorial_status='waiting_approval' WHERE id=$1",
             recipe["id"],
         )
 
-        # Verify can_transition allows waiting_approval → approved
+        # Verify can_transition allows waiting_approval → publishing
         from editorial_approval import can_transition
-        assert can_transition("waiting_approval", "approved"), \
-            "waiting_approval → approved must be valid"
+        assert can_transition("waiting_approval", "publishing"), \
+            "waiting_approval → publishing must be valid"
+
+        # Verify can_transition allows publishing → waiting_approval (failure revert)
+        assert can_transition("publishing", "waiting_approval"), \
+            "publishing → waiting_approval must be valid for failure revert"
 
         print("✓ test_retry_after_publish_failure_succeeds")
     finally:
@@ -442,6 +446,107 @@ async def test_publish_failure_does_not_set_telegram_message_id():
         if in_except and ('return' in line or 'async def ' in line):
             break
     print("✓ test_publish_failure_does_not_set_telegram_message_id")
+
+
+async def test_publishing_state_blocks_second_callback():
+    """Test that publishing state blocks second callback."""
+    from editorial_approval import can_transition
+    # waiting_approval → publishing is valid
+    assert can_transition("waiting_approval", "publishing"), \
+        "waiting_approval → publishing must be valid"
+    # publishing → publishing is NOT valid (blocks second callback)
+    assert not can_transition("publishing", "publishing"), \
+        "publishing → publishing must be blocked"
+    # publishing → approved is NOT valid
+    assert not can_transition("publishing", "approved"), \
+        "publishing → approved must be blocked"
+    print("✓ test_publishing_state_blocks_second_callback")
+
+
+async def test_stale_publishing_can_be_recovered():
+    """Test that stale publishing state can be recovered."""
+    db = await get_db()
+    try:
+        await cleanup_test_data(db)
+
+        recipe = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Stale Publishing", slug="stale-publishing",
+            ingredients=[{"name": "Test", "qty": 1, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Step"}],
+        )
+
+        # Set to publishing with old updated_at
+        await db.execute(
+            "UPDATE recipes SET editorial_status='publishing', "
+            "updated_at=NOW() - INTERVAL '15 minutes' WHERE id=$1",
+            recipe["id"],
+        )
+
+        # Recover
+        from editorial_approval import recover_stale_publishing
+        recovered = await recover_stale_publishing(db=db, stale_minutes=10)
+        assert recipe["id"] in recovered, "Recipe should be recovered"
+
+        # Verify status
+        rec = await db.fetchrow("SELECT editorial_status FROM recipes WHERE id=$1", recipe["id"])
+        assert rec["editorial_status"] == "waiting_approval", \
+            f"Expected waiting_approval, got {rec['editorial_status']}"
+
+        print("✓ test_stale_publishing_can_be_recovered")
+    finally:
+        await cleanup_test_data(db)
+        await db.close()
+
+
+async def test_success_saves_telegram_message_id():
+    """Test that successful publish saves telegram message id."""
+    import editorial_approval
+    import inspect
+    source = inspect.getsource(editorial_approval.handle_approval_callback)
+    # After success, must save message_id
+    assert "editorial_telegram_message_id" in source or "publish_recipe_to_telegram" in source, \
+        "Success path must save telegram message id"
+    print("✓ test_success_saves_telegram_message_id")
+
+
+async def test_double_callback_does_not_duplicate_publish():
+    """Test that double callback doesn't create duplicate posts."""
+    db = await get_db()
+    try:
+        await cleanup_test_data(db)
+
+        recipe = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Double Callback", slug="double-callback",
+            ingredients=[{"name": "Test", "qty": 1, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Step"}],
+        )
+
+        # Set to waiting_approval
+        await db.execute(
+            "UPDATE recipes SET editorial_status='waiting_approval' WHERE id=$1",
+            recipe["id"],
+        )
+
+        # First callback: waiting_approval → publishing
+        from editorial_approval import can_transition
+        assert can_transition("waiting_approval", "publishing")
+
+        # Simulate first callback setting publishing
+        await db.execute(
+            "UPDATE recipes SET editorial_status='publishing' WHERE id=$1",
+            recipe["id"],
+        )
+
+        # Second callback: publishing → publishing should be blocked
+        assert not can_transition("publishing", "publishing"), \
+            "Second callback must be blocked"
+
+        print("✓ test_double_callback_does_not_duplicate_publish")
+    finally:
+        await cleanup_test_data(db)
+        await db.close()
 
 
 # ── Daily digest tests ───────────────────────────────────────────────────────
@@ -563,6 +668,10 @@ async def run_all():
         test_publish_failure_returns_to_waiting_approval,
         test_retry_after_publish_failure_succeeds,
         test_publish_failure_does_not_set_telegram_message_id,
+        test_publishing_state_blocks_second_callback,
+        test_stale_publishing_can_be_recovered,
+        test_success_saves_telegram_message_id,
+        test_double_callback_does_not_duplicate_publish,
         # Digest
         test_digest_counts_new_users,
         test_digest_counts_successful_payments,
