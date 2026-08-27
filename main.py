@@ -1,6 +1,8 @@
 import os, hashlib, hmac, json, asyncio, secrets, time, logging, io, re, base64, urllib, string, uuid
 import httpx
 import invite
+import editorial_service
+import telegram_publisher
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
@@ -61,6 +63,11 @@ YOOKASSA_VAT_CODE = ENV("YOOKASSA_VAT_CODE", "1")
 ADMIN_CHAT_ID = int(ENV("ADMIN_CHAT_ID", "257938367") or 0)
 SUPPORT_HANDLE = ENV("SUPPORT_HANDLE", "@chigra89")
 OPENROUTER_LOW_BALANCE_USD = float(ENV("OPENROUTER_LOW_BALANCE_USD", "5"))
+
+# Editorial content config
+EDITORIAL_USER_ID = int(ENV("EDITORIAL_USER_ID", str(ADMIN_CHAT_ID)) or 0)
+EDITORIAL_TELEGRAM_CHAT_ID = ENV("EDITORIAL_TELEGRAM_CHAT_ID", "")
+EDITORIAL_BOT_USERNAME = ENV("EDITORIAL_BOT_USERNAME", "")
 
 # Prices in kopecks
 PRICE_AI_INVITE = 4900   # 49 ₽ — AI invitation (includes 1 free reroll)
@@ -2508,6 +2515,71 @@ async def init_db():
             ON CONFLICT (code) DO NOTHING;
         """)
 
+        # ── Migration W: Editorial content system ─────────────────────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                -- Editorial fields on recipes
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='is_editorial') THEN
+                    ALTER TABLE recipes ADD COLUMN is_editorial BOOLEAN NOT NULL DEFAULT FALSE;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='visibility') THEN
+                    ALTER TABLE recipes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='editorial_status') THEN
+                    ALTER TABLE recipes ADD COLUMN editorial_status TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='source_platform') THEN
+                    ALTER TABLE recipes ADD COLUMN source_platform TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='source_author') THEN
+                    ALTER TABLE recipes ADD COLUMN source_author TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='trend_score') THEN
+                    ALTER TABLE recipes ADD COLUMN trend_score NUMERIC(5,2);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='trend_discovered_at') THEN
+                    ALTER TABLE recipes ADD COLUMN trend_discovered_at TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='published_at') THEN
+                    ALTER TABLE recipes ADD COLUMN published_at TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='content_slug') THEN
+                    ALTER TABLE recipes ADD COLUMN content_slug TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='description') THEN
+                    ALTER TABLE recipes ADD COLUMN description TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='editorial_image_url') THEN
+                    ALTER TABLE recipes ADD COLUMN editorial_image_url TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='source_editorial_recipe_id') THEN
+                    ALTER TABLE recipes ADD COLUMN source_editorial_recipe_id INT REFERENCES recipes(id) ON DELETE SET NULL;
+                END IF;
+            END $$;
+
+            -- Unique slug index (only when slug is not null)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_content_slug
+                ON recipes(content_slug) WHERE content_slug IS NOT NULL;
+
+            -- Prevent duplicate clones: one user can save an editorial recipe only once
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_editorial_clone
+                ON recipes(user_id, source_editorial_recipe_id)
+                WHERE source_editorial_recipe_id IS NOT NULL;
+        """)
+
         # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
         await c.execute("DROP INDEX IF EXISTS idx_recipes_user")
         await c.execute("DROP INDEX IF EXISTS idx_recipes_event")
@@ -3250,6 +3322,27 @@ async def health():
         "db_ready": _db_ready,
         "db_error": _db_error,
     }
+
+
+@app.post("/api/analytics/track")
+async def analytics_track(body: dict, db=Depends(get_db)):
+    """Public analytics endpoint (fire-and-forget from frontend)."""
+    event_type = (body.get("event_type") or "").strip()[:64]
+    if not event_type:
+        return {"ok": True}
+    props = body.get("props") or {}
+    # Extract user_id from initData if available (optional)
+    user_id = None
+    try:
+        init_data = body.get("init_data")
+        if init_data:
+            user = validate_init_data(init_data)
+            if user and "id" in user:
+                user_id = int(user["id"])
+    except Exception:
+        pass
+    await track(user_id, event_type, props=props)
+    return {"ok": True}
 
 
 # ── GET /api/files/photo/{file_id}  (proxy a Telegram photo) ─────────────────
@@ -4267,6 +4360,215 @@ async def prepare_recipe_share(
             "share_id": str(share["id"]),
             "fallback": True,
         }
+
+
+# ── Editorial content endpoints ───────────────────────────────────────────────
+
+@app.get("/api/public/recipes/{slug}")
+async def get_public_editorial_recipe(slug: str, db=Depends(get_db)):
+    """Public endpoint for published editorial recipes (no auth)."""
+    recipe = await editorial_service.get_editorial_recipe_by_slug(db, slug)
+    if not recipe:
+        raise HTTPException(404, "Recipe not found")
+    return recipe
+
+
+@app.post("/api/editorial/recipes/{recipe_id}/save")
+async def save_editorial_recipe(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Save a copy of an editorial recipe to user's library."""
+    try:
+        result = await editorial_service.clone_editorial_recipe_to_user(db, recipe_id, user_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    event_type = "editorial_recipe_already_saved" if result["already_saved"] else "editorial_recipe_saved"
+    await track(user_id, event_type, props={"editorial_recipe_id": recipe_id})
+
+    return {"ok": True, "recipe_id": result["recipe_id"], "already_saved": result["already_saved"]}
+
+
+# ── Admin editorial endpoints ─────────────────────────────────────────────────
+
+@app.get("/api/admin/editorial/recipes")
+async def admin_list_editorial_recipes(
+    status: str | None = Query(default=None),
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """List all editorial recipes (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+    recipes = await editorial_service.list_editorial_recipes(db, status=status)
+    return {"recipes": recipes, "total": len(recipes)}
+
+
+@app.post("/api/admin/editorial/recipes", status_code=201)
+async def admin_create_editorial_recipe(
+    body: dict,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Create a new editorial recipe (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+    try:
+        recipe = await editorial_service.create_editorial_recipe(
+            db,
+            EDITORIAL_USER_ID,
+            name=body.get("name", ""),
+            description=body.get("description"),
+            emoji=body.get("emoji", "🍽"),
+            slug=body.get("slug"),
+            servings=body.get("servings", 4),
+            cook_time_minutes=body.get("cook_time_minutes"),
+            category=body.get("category"),
+            tags=body.get("tags"),
+            source_url=body.get("source_url"),
+            source_platform=body.get("source_platform"),
+            source_author=body.get("source_author"),
+            trend_score=body.get("trend_score"),
+            editorial_image_url=body.get("editorial_image_url"),
+            ingredients=body.get("ingredients"),
+            steps=body.get("steps"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return recipe
+
+
+@app.put("/api/admin/editorial/recipes/{recipe_id}")
+async def admin_update_editorial_recipe(
+    recipe_id: int,
+    body: dict,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Update an editorial recipe (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+
+    rec = await db.fetchrow(
+        "SELECT * FROM recipes WHERE id=$1 AND is_editorial=TRUE", recipe_id
+    )
+    if not rec:
+        raise HTTPException(404, "Editorial recipe not found")
+
+    # Update scalar fields
+    scalar_map = {
+        "name": "name",
+        "description": "description",
+        "emoji": "emoji",
+        "servings": "servings",
+        "cook_time_minutes": "cook_time_minutes",
+        "category": "category",
+        "tags": "tags",
+        "source_url": "source_url",
+        "source_platform": "source_platform",
+        "source_author": "source_author",
+        "trend_score": "trend_score",
+        "editorial_image_url": "editorial_image_url",
+        "content_slug": "content_slug",
+    }
+    sets, params = [], []
+    for body_key, col in scalar_map.items():
+        if body_key in body and body[body_key] is not None:
+            params.append(body[body_key])
+            sets.append(f"{col} = ${len(params)}")
+    if sets:
+        params.append(recipe_id)
+        await db.execute(
+            f"UPDATE recipes SET {', '.join(sets)}, updated_at=NOW() WHERE id = ${len(params)}",
+            *params,
+        )
+
+    # Replace ingredients if provided
+    if "ingredients" in body:
+        await db.execute("DELETE FROM ingredients WHERE recipe_id=$1", recipe_id)
+        for i, ing in enumerate(body["ingredients"]):
+            ing_name = (ing.get("name") or "").strip()
+            if not ing_name:
+                continue
+            raw_qty = ing.get("qty")
+            qty_val = None
+            if raw_qty not in (None, "", 0):
+                try:
+                    qty_val = float(raw_qty)
+                except (TypeError, ValueError):
+                    qty_val = None
+            await db.execute(
+                "INSERT INTO ingredients (recipe_id, name, qty, unit, category, sort_order) VALUES ($1,$2,$3,$4,$5,$6)",
+                recipe_id, ing_name, qty_val,
+                (ing.get("unit") or "").strip(),
+                ing.get("category") or "прочее",
+                i,
+            )
+
+    # Replace steps if provided
+    if "steps" in body:
+        await db.execute("DELETE FROM recipe_steps WHERE recipe_id=$1", recipe_id)
+        for i, step in enumerate(body["steps"]):
+            step_text = (step.get("text") or "").strip()
+            if not step_text:
+                continue
+            await db.execute(
+                "INSERT INTO recipe_steps (recipe_id, step_number, text) VALUES ($1,$2,$3)",
+                recipe_id, step.get("step_number", i + 1), step_text,
+            )
+
+    return {"ok": True, "recipe_id": recipe_id}
+
+
+@app.post("/api/admin/editorial/recipes/{recipe_id}/approve")
+async def admin_approve_editorial_recipe(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Approve an editorial recipe (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+    try:
+        result = await editorial_service.approve_editorial_recipe(db, recipe_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not result:
+        raise HTTPException(404, "Editorial recipe not found")
+    return result
+
+
+@app.post("/api/admin/editorial/recipes/{recipe_id}/publish")
+async def admin_publish_editorial_recipe(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Publish an editorial recipe to Telegram (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+
+    if not EDITORIAL_TELEGRAM_CHAT_ID:
+        raise HTTPException(400, "EDITORIAL_TELEGRAM_CHAT_ID not configured")
+
+    try:
+        result = await telegram_publisher.publish_recipe_to_telegram(
+            bot=bot,
+            db=db,
+            recipe_id=recipe_id,
+            chat_id=int(EDITORIAL_TELEGRAM_CHAT_ID),
+            bot_username=EDITORIAL_BOT_USERNAME or await _get_bot_username(),
+            frontend_url=FRONTEND_URL,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    await track(user_id, "editorial_recipe_published",
+                props={"editorial_recipe_id": recipe_id})
+
+    return result
 
 
 # ── Share link & join ─────────────────────────────────────────────────────────
