@@ -3,6 +3,9 @@ import httpx
 import invite
 import editorial_service
 import telegram_publisher
+import editorial_approval
+import admin_digest
+import ai_provider_balance
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
@@ -2580,6 +2583,56 @@ async def init_db():
                 WHERE source_editorial_recipe_id IS NOT NULL;
         """)
 
+        # ── Migration X: Editorial Content v1.1 ─────────────────────────────
+        await c.execute("""
+            DO $$
+            BEGIN
+                -- Nutrition fields
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='calories_kcal') THEN
+                    ALTER TABLE recipes ADD COLUMN calories_kcal NUMERIC(8,2);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='protein_g') THEN
+                    ALTER TABLE recipes ADD COLUMN protein_g NUMERIC(8,2);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='fat_g') THEN
+                    ALTER TABLE recipes ADD COLUMN fat_g NUMERIC(8,2);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='carbs_g') THEN
+                    ALTER TABLE recipes ADD COLUMN carbs_g NUMERIC(8,2);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_basis') THEN
+                    ALTER TABLE recipes ADD COLUMN nutrition_basis TEXT DEFAULT 'per_serving';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='nutrition_source') THEN
+                    ALTER TABLE recipes ADD COLUMN nutrition_source TEXT;
+                END IF;
+                -- Approval flow fields
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='editorial_telegram_message_id') THEN
+                    ALTER TABLE recipes ADD COLUMN editorial_telegram_message_id BIGINT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='recipes' AND column_name='editorial_telegram_chat_id') THEN
+                    ALTER TABLE recipes ADD COLUMN editorial_telegram_chat_id BIGINT;
+                END IF;
+                -- First-touch attribution
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='users' AND column_name='acquisition_campaign') THEN
+                    ALTER TABLE users ADD COLUMN acquisition_campaign TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='users' AND column_name='acquisition_recipe_id') THEN
+                    ALTER TABLE users ADD COLUMN acquisition_recipe_id BIGINT;
+                END IF;
+            END $$;
+        """)
+
         # Drop stale duplicate indexes from old schema (simple DROP, no CONCURRENTLY needed for small DB)
         await c.execute("DROP INDEX IF EXISTS idx_recipes_user")
         await c.execute("DROP INDEX IF EXISTS idx_recipes_event")
@@ -4480,10 +4533,37 @@ async def admin_create_editorial_recipe(
             editorial_image_url=body.get("editorial_image_url"),
             ingredients=body.get("ingredients"),
             steps=body.get("steps"),
+            nutrition=body.get("nutrition"),
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
     return recipe
+
+
+@app.post("/api/admin/editorial/recipes/{recipe_id}/submit")
+async def admin_submit_editorial_recipe(
+    recipe_id: int,
+    user_id: int = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Submit editorial recipe for approval (admin only)."""
+    if user_id != ADMIN_CHAT_ID:
+        raise HTTPException(403, "Admin only")
+    try:
+        result = await editorial_approval.send_editorial_for_approval(
+            bot=bot,
+            db=db,
+            recipe_id=recipe_id,
+            admin_chat_id=ADMIN_CHAT_ID,
+            bot_username=EDITORIAL_BOT_USERNAME or await _get_bot_username(),
+            frontend_url=FRONTEND_URL,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    await track(user_id, "editorial_approval_requested",
+                props={"editorial_recipe_id": recipe_id})
+    return result
 
 
 @app.put("/api/admin/editorial/recipes/{recipe_id}")
@@ -4537,6 +4617,21 @@ async def admin_update_editorial_recipe(
                 raise HTTPException(409, f"Slug '{new_slug}' is already used by recipe {existing}")
         params.append(new_slug)
         sets.append(f"content_slug = ${len(params)}")
+
+    # Handle nutrition fields
+    if "nutrition" in body and body["nutrition"] is not None:
+        nut = body["nutrition"]
+        nut_fields = {
+            "calories_kcal": editorial_service._validate_nutrition_value(nut.get("calories_kcal")),
+            "protein_g": editorial_service._validate_nutrition_value(nut.get("protein_g")),
+            "fat_g": editorial_service._validate_nutrition_value(nut.get("fat_g")),
+            "carbs_g": editorial_service._validate_nutrition_value(nut.get("carbs_g")),
+            "nutrition_basis": nut.get("basis", "per_serving"),
+            "nutrition_source": nut.get("source", "manual"),
+        }
+        for col, val in nut_fields.items():
+            params.append(val)
+            sets.append(f"{col} = ${len(params)}")
 
     if sets:
         params.append(recipe_id)
@@ -8045,6 +8140,8 @@ def _welcome_keyboard():
         ],
         [InlineKeyboardButton(text="📖 Показать, как пользоваться",
                               callback_data="ob_start_tutorial")],
+        [InlineKeyboardButton(text="🍲 Канал с рецептами",
+                              url="https://t.me/P0liyana")],
         [InlineKeyboardButton(text="▶️ Начать сразу",
                               callback_data="ob_start_skip_to_legal")],
     ])
@@ -8067,6 +8164,8 @@ def _returning_user_keyboard():
             InlineKeyboardButton(text="📄 Документы",
                                   callback_data="show_documents"),
         ],
+        [InlineKeyboardButton(text="🍲 Канал с рецептами",
+                              url="https://t.me/P0liyana")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="ws_help")],
     ])
 
@@ -8386,6 +8485,43 @@ async def cb_del_execute(callback: CallbackQuery):
     await callback.answer()
 
 
+# ── Editorial approval callbacks ─────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("ea:"))
+async def handle_editorial_approval(callback: CallbackQuery):
+    """Handle editorial approval/reject/revise callbacks."""
+    if not callback.from_user or callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer("Только администратор может согласовывать посты", show_alert=True)
+        return
+
+    async with pool.acquire() as db:
+        result = await editorial_approval.handle_approval_callback(
+            bot=bot,
+            db=db,
+            callback_data=callback.data,
+            admin_user_id=callback.from_user.id,
+            admin_chat_id=ADMIN_CHAT_ID,
+            message_id=callback.message.message_id if callback.message else 0,
+            chat_id=callback.message.chat.id if callback.message else 0,
+            bot_username=EDITORIAL_BOT_USERNAME or await _get_bot_username(),
+            frontend_url=FRONTEND_URL,
+        )
+
+    if result.get("ok"):
+        action = callback.data.split(":")[1]
+        event_map = {
+            "approve": "editorial_approved",
+            "reject": "editorial_rejected",
+            "revise": "editorial_revision_requested",
+        }
+        recipe_id = callback.data.split(":")[2]
+        await track(ADMIN_CHAT_ID, event_map.get(action, "editorial_callback"),
+                     props={"editorial_recipe_id": int(recipe_id)})
+        await callback.answer()
+    else:
+        await callback.answer(result.get("error", "Ошибка"), show_alert=True)
+
+
 async def run_bot():
     try:
         # Register consent middleware
@@ -8441,6 +8577,32 @@ async def _bg_init():
 async def startup():
     log.info("FastAPI starting on port %d", PORT)
     asyncio.create_task(_bg_init())  # non-blocking: /health responds immediately
+    asyncio.create_task(_daily_digest_loop())
+
+
+async def _daily_digest_loop():
+    """Send daily admin digest at 09:00 Moscow time."""
+    import pytz
+    MSK = pytz.timezone("Europe/Moscow")
+
+    while True:
+        try:
+            now = datetime.now(MSK)
+            # Calculate next 09:00
+            target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            log.info("Daily digest scheduled for %s (in %.0f seconds)", target, wait_seconds)
+            await asyncio.sleep(wait_seconds)
+
+            # Send digest
+            if pool:
+                async with pool.acquire() as db:
+                    await admin_digest.send_daily_admin_digest(bot, db, ADMIN_CHAT_ID)
+        except Exception as e:
+            log.error("Daily digest loop error: %s", e)
+            await asyncio.sleep(60)  # Retry after 1 minute on error
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ async def create_editorial_recipe(
     editorial_image_url: str | None = None,
     ingredients: list[dict] | None = None,
     steps: list[dict] | None = None,
+    nutrition: dict | None = None,
 ) -> dict:
     """Create a new editorial recipe in draft status."""
     if not name or not name.strip():
@@ -70,6 +71,16 @@ async def create_editorial_recipe(
     if existing:
         slug = f"{slug}-{secrets.token_hex(3)}"
 
+    # Extract nutrition fields
+    calories = protein = fat = carbs = nut_basis = nut_source = None
+    if nutrition:
+        calories = _validate_nutrition_value(nutrition.get("calories_kcal"))
+        protein = _validate_nutrition_value(nutrition.get("protein_g"))
+        fat = _validate_nutrition_value(nutrition.get("fat_g"))
+        carbs = _validate_nutrition_value(nutrition.get("carbs_g"))
+        nut_basis = nutrition.get("basis", "per_serving")
+        nut_source = nutrition.get("source", "manual")
+
     rec = await db.fetchrow(
         """
         INSERT INTO recipes
@@ -77,11 +88,13 @@ async def create_editorial_recipe(
              category, tags, source_url, source_type,
              is_editorial, visibility, editorial_status,
              source_platform, source_author, trend_score,
-             editorial_image_url, content_slug)
+             editorial_image_url, content_slug,
+             calories_kcal, protein_g, fat_g, carbs_g, nutrition_basis, nutrition_source)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
                 TRUE, 'private', 'draft',
                 $11,$12,$13,
-                $14,$15)
+                $14,$15,
+                $16,$17,$18,$19,$20,$21)
         RETURNING *
         """,
         editorial_user_id,
@@ -99,6 +112,7 @@ async def create_editorial_recipe(
         trend_score,
         editorial_image_url,
         slug,
+        calories, protein, fat, carbs, nut_basis, nut_source,
     )
 
     # Insert ingredients
@@ -303,10 +317,12 @@ async def clone_editorial_recipe_to_user(
             (user_id, name, description, emoji, servings, cook_time_minutes,
              category, tags, source_url, source_type,
              editorial_image_url,
+             calories_kcal, protein_g, fat_g, carbs_g, nutrition_basis, nutrition_source,
              is_editorial, visibility, source_editorial_recipe_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'editorial_clone',
                 $10,
-                FALSE, 'private', $11)
+                $11,$12,$13,$14,$15,$16,
+                FALSE, 'private', $17)
         RETURNING id
         """,
         user_id,
@@ -319,6 +335,12 @@ async def clone_editorial_recipe_to_user(
         orig["tags"],
         orig["source_url"],
         orig["editorial_image_url"],
+        orig["calories_kcal"],
+        orig["protein_g"],
+        orig["fat_g"],
+        orig["carbs_g"],
+        orig["nutrition_basis"],
+        orig["nutrition_source"],
         editorial_recipe_id,
     )
     new_id = new_rec["id"]
@@ -351,8 +373,34 @@ async def clone_editorial_recipe_to_user(
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
+def _validate_nutrition_value(val) -> float | None:
+    """Validate nutrition value: must be >= 0 if present."""
+    if val is None:
+        return None
+    try:
+        v = float(val)
+        if v < 0:
+            return None
+        if v > 99999:
+            return None  # Absurd limit
+        return v
+    except (TypeError, ValueError):
+        return None
+
+
 def _recipe_to_dict(rec) -> dict:
     """Convert a recipe record to a plain dict."""
+    # Build nutrition block
+    nutrition = None
+    if rec.get("calories_kcal") is not None or rec.get("protein_g") is not None:
+        nutrition = {
+            "calories_kcal": float(rec["calories_kcal"]) if rec.get("calories_kcal") is not None else None,
+            "protein_g": float(rec["protein_g"]) if rec.get("protein_g") is not None else None,
+            "fat_g": float(rec["fat_g"]) if rec.get("fat_g") is not None else None,
+            "carbs_g": float(rec["carbs_g"]) if rec.get("carbs_g") is not None else None,
+            "basis": rec.get("nutrition_basis") or "per_serving",
+        }
+
     return {
         "id": rec["id"],
         "user_id": rec["user_id"],
@@ -373,6 +421,7 @@ def _recipe_to_dict(rec) -> dict:
         "trend_score": float(rec["trend_score"]) if rec.get("trend_score") is not None else None,
         "editorial_image_url": rec.get("editorial_image_url"),
         "content_slug": rec.get("content_slug"),
+        "nutrition": nutrition,
         "published_at": rec["published_at"].isoformat() if rec.get("published_at") else None,
         "created_at": rec["created_at"].isoformat() if rec.get("created_at") else None,
     }
