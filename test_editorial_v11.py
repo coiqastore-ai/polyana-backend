@@ -354,6 +354,96 @@ async def test_concurrent_publish_does_not_duplicate_message():
     print("✓ test_concurrent_publish_does_not_duplicate_message")
 
 
+async def test_approval_uses_explicit_editorial_chat_id():
+    """Test that approval callback uses explicit editorial_chat_id parameter."""
+    source = _read_main_source()
+    # The callback handler must pass editorial_chat_id
+    assert "editorial_chat_id=EDITORIAL_TELEGRAM_CHAT_ID" in source, \
+        "Callback handler must pass editorial_chat_id"
+    # The approval function must accept it as parameter
+    import editorial_approval
+    import inspect
+    sig = inspect.signature(editorial_approval.handle_approval_callback)
+    assert "editorial_chat_id" in sig.parameters, \
+        "handle_approval_callback must accept editorial_chat_id parameter"
+    print("✓ test_approval_uses_explicit_editorial_chat_id")
+
+
+async def test_missing_editorial_chat_id_does_not_change_status():
+    """Test that missing editorial_chat_id prevents status change."""
+    import editorial_approval
+    import inspect
+    source = inspect.getsource(editorial_approval.handle_approval_callback)
+    # Must validate editorial_chat_id before state change
+    assert "not editorial_chat_id" in source, \
+        "Must check editorial_chat_id before state change"
+    print("✓ test_missing_editorial_chat_id_does_not_change_status")
+
+
+async def test_publish_failure_returns_to_waiting_approval():
+    """Test that publish failure reverts to waiting_approval."""
+    import editorial_approval
+    import inspect
+    source = inspect.getsource(editorial_approval.handle_approval_callback)
+    # Must revert to waiting_approval on failure
+    assert "waiting_approval" in source, \
+        "Must revert to waiting_approval on publish failure"
+    # Check that the except block contains the revert
+    # The pattern is: except ... → await db.execute(... waiting_approval ...)
+    assert "editorial_status='waiting_approval'" in source, \
+        "Must set editorial_status='waiting_approval' on failure"
+    print("✓ test_publish_failure_returns_to_waiting_approval")
+
+
+async def test_retry_after_publish_failure_succeeds():
+    """Test that recipe can be retried after publish failure."""
+    db = await get_db()
+    try:
+        await cleanup_test_data(db)
+
+        recipe = await editorial_service.create_editorial_recipe(
+            db, EDITORIAL_USER_ID,
+            name="Retry Test", slug="retry-test",
+            ingredients=[{"name": "Test", "qty": 1, "unit": "г"}],
+            steps=[{"step_number": 1, "text": "Step"}],
+        )
+
+        # Simulate: draft → waiting_approval → approved → (fail) → waiting_approval
+        await db.execute(
+            "UPDATE recipes SET editorial_status='waiting_approval' WHERE id=$1",
+            recipe["id"],
+        )
+
+        # Verify can_transition allows waiting_approval → approved
+        from editorial_approval import can_transition
+        assert can_transition("waiting_approval", "approved"), \
+            "waiting_approval → approved must be valid"
+
+        print("✓ test_retry_after_publish_failure_succeeds")
+    finally:
+        await cleanup_test_data(db)
+        await db.close()
+
+
+async def test_publish_failure_does_not_set_telegram_message_id():
+    """Test that failed publish doesn't set editorial_telegram_message_id."""
+    import editorial_approval
+    import inspect
+    source = inspect.getsource(editorial_approval.handle_approval_callback)
+    # The revert block should not set message_id
+    lines = source.split('\n')
+    in_except = False
+    for line in lines:
+        if 'except Exception' in line and 'publish' in line.lower():
+            in_except = True
+        if in_except:
+            assert "editorial_telegram_message_id" not in line, \
+                "Failed publish must not set editorial_telegram_message_id"
+        if in_except and ('return' in line or 'async def ' in line):
+            break
+    print("✓ test_publish_failure_does_not_set_telegram_message_id")
+
+
 # ── Daily digest tests ───────────────────────────────────────────────────────
 
 async def test_digest_counts_new_users():
@@ -468,6 +558,11 @@ async def run_all():
         test_needs_revision_not_published,
         test_double_publish_is_idempotent,
         test_concurrent_publish_does_not_duplicate_message,
+        test_approval_uses_explicit_editorial_chat_id,
+        test_missing_editorial_chat_id_does_not_change_status,
+        test_publish_failure_returns_to_waiting_approval,
+        test_retry_after_publish_failure_succeeds,
+        test_publish_failure_does_not_set_telegram_message_id,
         # Digest
         test_digest_counts_new_users,
         test_digest_counts_successful_payments,

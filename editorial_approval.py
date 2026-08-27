@@ -131,6 +131,7 @@ async def handle_approval_callback(
     callback_data: str,
     admin_user_id: int,
     admin_chat_id: int,
+    editorial_chat_id: int,
     message_id: int,
     chat_id: int,
     bot_username: str,
@@ -139,6 +140,8 @@ async def handle_approval_callback(
     """
     Handle admin approval callback.
     callback_data format: ea:{action}:{recipe_id}
+
+    editorial_chat_id: target Telegram channel/group ID for publishing.
     """
     from telegram_publisher import publish_recipe_to_telegram
 
@@ -155,6 +158,10 @@ async def handle_approval_callback(
     # Verify admin
     if admin_user_id != admin_chat_id:
         return {"ok": False, "error": "Not admin"}
+
+    # Validate channel config BEFORE any state change
+    if action == "approve" and not editorial_chat_id:
+        return {"ok": False, "error": "EDITORIAL_TELEGRAM_CHAT_ID is not configured"}
 
     # Fetch recipe with row lock to prevent concurrent callbacks
     rec = await db.fetchrow(
@@ -186,13 +193,17 @@ async def handle_approval_callback(
                 bot=bot,
                 db=db,
                 recipe_id=recipe_id,
-                chat_id=int(editorial_chat_id),
+                chat_id=editorial_chat_id,
                 bot_username=bot_username,
                 frontend_url=frontend_url,
             )
         except Exception as e:
             log.error("Failed to publish after approval: %s", e)
-            # Revert to approved (not published)
+            # Revert to waiting_approval so admin can retry
+            await db.execute(
+                "UPDATE recipes SET editorial_status='waiting_approval', updated_at=NOW() WHERE id=$1",
+                recipe_id,
+            )
             return {"ok": False, "error": f"Publish failed: {e}"}
 
         # Update admin message
@@ -255,7 +266,3 @@ async def handle_approval_callback(
         return {"ok": True, "needs_revision": True}
 
     return {"ok": False, "error": "Unknown action"}
-
-
-# Need to import this at module level for the callback handler
-editorial_chat_id = None

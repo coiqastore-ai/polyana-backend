@@ -69,7 +69,7 @@ OPENROUTER_LOW_BALANCE_USD = float(ENV("OPENROUTER_LOW_BALANCE_USD", "5"))
 
 # Editorial content config
 EDITORIAL_USER_ID = int(ENV("EDITORIAL_USER_ID", str(ADMIN_CHAT_ID)) or 0)
-EDITORIAL_TELEGRAM_CHAT_ID = ENV("EDITORIAL_TELEGRAM_CHAT_ID", "")
+EDITORIAL_TELEGRAM_CHAT_ID = int(ENV("EDITORIAL_TELEGRAM_CHAT_ID", "0") or 0) or None
 EDITORIAL_BOT_USERNAME = ENV("EDITORIAL_BOT_USERNAME", "")
 
 # Prices in kopecks
@@ -4713,7 +4713,7 @@ async def admin_publish_editorial_recipe(
             bot=bot,
             db=db,
             recipe_id=recipe_id,
-            chat_id=int(EDITORIAL_TELEGRAM_CHAT_ID),
+            chat_id=EDITORIAL_TELEGRAM_CHAT_ID,
             bot_username=EDITORIAL_BOT_USERNAME or await _get_bot_username(),
             frontend_url=FRONTEND_URL,
         )
@@ -8501,6 +8501,7 @@ async def handle_editorial_approval(callback: CallbackQuery):
             callback_data=callback.data,
             admin_user_id=callback.from_user.id,
             admin_chat_id=ADMIN_CHAT_ID,
+            editorial_chat_id=EDITORIAL_TELEGRAM_CHAT_ID,
             message_id=callback.message.message_id if callback.message else 0,
             chat_id=callback.message.chat.id if callback.message else 0,
             bot_username=EDITORIAL_BOT_USERNAME or await _get_bot_username(),
