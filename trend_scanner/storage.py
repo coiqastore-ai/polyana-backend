@@ -1,5 +1,5 @@
 """
-Storage operations for Trend Scanner.
+Storage operations for Trend Scanner v0.1.1.
 """
 
 import json
@@ -54,12 +54,20 @@ async def save_candidates(db: asyncpg.Connection, candidates: list[dict]):
                     normalized_title,
                     freshness_score, engagement_score, visual_score,
                     simplicity_score, ru_availability_score, poliana_fit_score,
-                    trend_score, status
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'candidate')
+                    trend_score, status,
+                    content_type, trend_confidence, canonical_dish_name,
+                    discovery_source_url, discovery_source_title,
+                    cross_source_score, engagement_velocity, age_hours,
+                    source_count, all_sources, all_source_urls
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'candidate',
+                          $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
                 ON CONFLICT (source_url) DO UPDATE SET
                     title = COALESCE(EXCLUDED.title, trend_candidates.title),
                     trend_score = GREATEST(EXCLUDED.trend_score, trend_candidates.trend_score),
-                    raw_engagement = EXCLUDED.raw_engagement
+                    raw_engagement = EXCLUDED.raw_engagement,
+                    content_type = COALESCE(EXCLUDED.content_type, trend_candidates.content_type),
+                    trend_confidence = GREATEST(EXCLUDED.trend_confidence, trend_candidates.trend_confidence),
+                    canonical_dish_name = COALESCE(EXCLUDED.canonical_dish_name, trend_candidates.canonical_dish_name)
                 """,
                 c.get("source_platform"),
                 c.get("source_url"),
@@ -77,6 +85,17 @@ async def save_candidates(db: asyncpg.Connection, candidates: list[dict]):
                 c.get("ru_availability_score"),
                 c.get("poliana_fit_score"),
                 c.get("trend_score"),
+                c.get("content_type"),
+                c.get("trend_confidence"),
+                c.get("canonical_dish_name"),
+                c.get("discovery_source_url"),
+                c.get("discovery_source_title"),
+                c.get("cross_source_score"),
+                c.get("engagement_velocity"),
+                c.get("age_hours"),
+                c.get("source_count", 1),
+                c.get("all_sources"),
+                c.get("all_source_urls"),
             )
         except Exception as e:
             log.warning("Failed to save candidate %s: %s", c.get("source_url", "?"), e)

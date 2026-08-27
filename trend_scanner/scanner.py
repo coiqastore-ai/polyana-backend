@@ -1,8 +1,17 @@
 """
-Trend Scanner — main entry point.
+Trend Scanner v0.1.1 — main entry point.
 
-Collects trending recipes from multiple sources, scores them,
-and sends a digest to the admin.
+Collects trending recipes from multiple sources, classifies them,
+scores them, and sends a digest to the admin.
+
+Pipeline:
+1. Collect 100-150 raw candidates
+2. Deterministic filters + content classification
+3. Dedupe
+4. Score (freshness, engagement, velocity, cross-source)
+5. Quality gate (min score + min confidence)
+6. Top 20-30 → LLM Poliana Fit
+7. Final top 0-10 admin candidates
 """
 
 import asyncio
@@ -59,7 +68,7 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
     """
     from .sources import collect_from_all_sources
     from .dedupe import deduplicate_candidates
-    from .scoring import score_candidates, cheap_filter
+    from .scoring import score_candidates, cheap_filter, passes_quality_gate
     from .storage import save_candidates, get_top_candidates, create_run, finish_run
     from .telegram_digest import send_trend_digest
 
@@ -86,9 +95,16 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
 
     log.info("Raw candidates collected: %d", len(raw_candidates))
 
-    # 2. Cheap filtering
+    # 2. Cheap filtering + content classification
     filtered = cheap_filter(raw_candidates)
     log.info("After cheap filter: %d", len(filtered))
+
+    # Count by content type
+    content_type_counts = {}
+    for c in filtered:
+        ct = c.get("content_type", "unknown")
+        content_type_counts[ct] = content_type_counts.get(ct, 0) + 1
+    log.info("Content types: %s", content_type_counts)
 
     # 3. Deduplication
     unique = deduplicate_candidates(filtered)
@@ -98,29 +114,37 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
     scored = score_candidates(unique)
     log.info("Scored candidates: %d", len(scored))
 
-    # 5. Select top N for LLM analysis
-    top_for_llm = sorted(scored, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["max_llm_candidates"]]
+    # 5. Quality gate
+    qualified = [c for c in scored if passes_quality_gate(c)]
+    log.info("After quality gate: %d (min_score=%d, min_confidence=%d)",
+             len(qualified), os.environ.get("TREND_MIN_SCORE", 60),
+             os.environ.get("TREND_MIN_CONFIDENCE", 50))
 
-    # 6. LLM analysis for top candidates
+    # 6. Select top N for LLM analysis
+    top_for_llm = sorted(qualified, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["max_llm_candidates"]]
+
+    # 7. LLM analysis for top candidates
     llm_analyzed = []
+    llm_calls = 0
     for candidate in top_for_llm:
         try:
             from .scoring import analyze_with_llm
             analysis = await analyze_with_llm(candidate)
             candidate.update(analysis)
             llm_analyzed.append(candidate)
+            llm_calls += 1
         except Exception as e:
             log.warning("LLM analysis failed for %s: %s", candidate.get("title", "?"), e)
             llm_analyzed.append(candidate)
 
-    # 7. Re-score with LLM data
+    # 8. Re-score with LLM data
     for c in llm_analyzed:
         c["trend_score"] = _calculate_trend_score(c)
 
-    # 8. Select final top candidates
+    # 9. Select final top candidates
     final_top = sorted(llm_analyzed, key=lambda c: c.get("trend_score", 0), reverse=True)[:config["top_candidates"]]
 
-    # 9. Save to DB
+    # 10. Save to DB
     if not dry_run:
         await save_candidates(db, scored)
         await finish_run(db, run_id, {
@@ -129,7 +153,7 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
             "shortlisted": len(final_top),
         })
 
-    # 10. Send admin digest
+    # 11. Send admin digest
     if not dry_run and final_top:
         await send_trend_digest(db, final_top, source_results, run_id)
 
@@ -137,8 +161,11 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
         "run_id": run_id,
         "total_found": len(raw_candidates),
         "after_filter": len(filtered),
+        "content_types": content_type_counts,
         "after_dedupe": len(unique),
+        "qualified": len(qualified),
         "llm_analyzed": len(llm_analyzed),
+        "llm_calls": llm_calls,
         "top_candidates": len(final_top),
         "source_health": source_results,
         "dry_run": dry_run,
@@ -146,8 +173,14 @@ async def run_scan(*, db: asyncpg.Connection, dry_run: bool = False) -> dict:
 
     if dry_run:
         log.info("DRY RUN results:")
+        log.info("  Raw: %d, Filtered: %d, Deduped: %d, Qualified: %d, LLM: %d, Final: %d",
+                 len(raw_candidates), len(filtered), len(unique),
+                 len(qualified), len(llm_analyzed), len(final_top))
         for i, c in enumerate(final_top, 1):
-            log.info("  %d. %s (score: %.1f)", i, c.get("title", "?"), c.get("trend_score", 0))
+            log.info("  %d. %s (score: %.1f, confidence: %.1f, type: %s)",
+                     i, c.get("canonical_dish_name") or c.get("title", "?"),
+                     c.get("trend_score", 0), c.get("trend_confidence", 0),
+                     c.get("content_type", "?"))
 
     return result
 
@@ -165,6 +198,32 @@ def _calculate_trend_score(candidate: dict) -> float:
     }
     total = sum(scores[k] * TREND_WEIGHTS[k] for k in TREND_WEIGHTS)
     return round(total, 2)
+
+
+async def acquire_scan_lock(db: asyncpg.Connection) -> bool:
+    """
+    Acquire PostgreSQL advisory lock for trend scan.
+    Returns True if lock acquired, False if already locked.
+    """
+    try:
+        # Use a fixed lock ID based on 'trend_scan'
+        lock_id = 1234567890
+        result = await db.fetchval("SELECT pg_try_advisory_lock($1)", lock_id)
+        return result
+    except Exception as e:
+        log.error("Failed to acquire lock: %s", e)
+        return False
+
+
+async def release_scan_lock(db: asyncpg.Connection):
+    """
+    Release PostgreSQL advisory lock for trend scan.
+    """
+    try:
+        lock_id = 1234567890
+        await db.fetchval("SELECT pg_advisory_unlock($1)", lock_id)
+    except Exception as e:
+        log.error("Failed to release lock: %s", e)
 
 
 async def main():
@@ -195,8 +254,16 @@ async def main():
 
     db = await asyncpg.connect(db_url)
     try:
-        result = await run_scan(db=db, dry_run=args.dry_run)
-        print(json.dumps(result, indent=2, default=str))
+        # Try to acquire lock
+        if not await acquire_scan_lock(db):
+            log.error("Another scan is already running")
+            sys.exit(1)
+
+        try:
+            result = await run_scan(db=db, dry_run=args.dry_run)
+            print(json.dumps(result, indent=2, default=str))
+        finally:
+            await release_scan_lock(db)
     finally:
         await db.close()
 

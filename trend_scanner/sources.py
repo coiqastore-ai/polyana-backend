@@ -1,7 +1,7 @@
 """
-Source adapters for Trend Scanner.
+Source adapters for Trend Scanner v0.1.1.
 
-Collects candidates from Web, YouTube, RSS, and optionally Reddit/Instagram/X.
+Collects candidates from Web, YouTube, RSS with dynamic date-aware queries.
 """
 
 import asyncio
@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -20,31 +19,16 @@ log = logging.getLogger("polyana.trend_scanner.sources")
 # Trend queries config file path
 QUERIES_FILE = os.path.join(os.path.dirname(__file__), "trend_queries.json")
 
-# Default queries if config file not found
-DEFAULT_QUERIES = {
-    "ru": [
-        "вирусный рецепт",
-        "популярный рецепт",
-        "быстрый ужин",
-        "простой десерт",
-        "белковый рецепт",
-        "рецепт из 5 ингредиентов",
-        "ужин за 20 минут",
-        "рецепт с творогом",
-        "рецепт с курицей",
-    ],
-    "en": [
-        "viral recipe",
-        "trending recipe",
-        "easy dinner",
-        "quick dinner",
-        "high protein recipe",
-        "5 ingredient recipe",
-        "viral dessert",
-        "cottage cheese recipe",
-        "chicken recipe trend",
-        "food trend 2026",
-    ],
+# Source relevance weights
+SOURCE_RELEVANCE = {
+    "web": 1.0,
+    "youtube": 1.0,
+    "rss": 0.9,
+    "reddit": 1.0,
+    "instagram": 1.1,
+    "tiktok": 1.2,
+    "pinterest": 0.9,
+    "bilibili": 0.6,
 }
 
 
@@ -54,8 +38,61 @@ def load_queries() -> dict:
         with open(QUERIES_FILE, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        log.warning("trend_queries.json not found, using defaults")
-        return DEFAULT_QUERIES
+        log.warning("trend_queries.json not found")
+        return {}
+
+
+def get_dynamic_queries(queries_config: dict) -> list[str]:
+    """
+    Generate dynamic queries based on current date and day of week.
+
+    Returns list of queries to use for this scan.
+    """
+    now = datetime.now(timezone.utc)
+    month_names = {
+        1: "january", 2: "february", 3: "march", 4: "april",
+        5: "may", 6: "june", 7: "july", 8: "august",
+        9: "september", 10: "october", 11: "november", 12: "december",
+    }
+    day_names = {0: "monday", 1: "tuesday", 2: "wednesday", 3: "thursday",
+                 4: "friday", 5: "saturday", 6: "sunday"}
+
+    current_month = month_names[now.month]
+    current_day = day_names[now.weekday()]
+
+    all_queries = []
+
+    # 1. Core queries (every scan)
+    core = queries_config.get("core", {})
+    all_queries.extend(core.get("en", []))
+    all_queries.extend(core.get("ru", []))
+
+    # 2. Day-of-week queries
+    day_queries = queries_config.get(current_day, {})
+    all_queries.extend(day_queries.get("en", []))
+    all_queries.extend(day_queries.get("ru", []))
+
+    # 3. Seasonal/monthly queries
+    seasonal = queries_config.get("seasonal", {})
+    month_queries = seasonal.get(current_month, {})
+    all_queries.extend(month_queries.get("en", []))
+    all_queries.extend(month_queries.get("ru", []))
+
+    # 4. Evergreen queries (supplementary)
+    evergreen = queries_config.get("evergreen", {})
+    all_queries.extend(evergreen.get("en", []))
+    all_queries.extend(evergreen.get("ru", []))
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_queries = []
+    for q in all_queries:
+        q_lower = q.lower().strip()
+        if q_lower not in seen:
+            seen.add(q_lower)
+            unique_queries.append(q)
+
+    return unique_queries
 
 
 async def collect_from_all_sources(
@@ -68,7 +105,11 @@ async def collect_from_all_sources(
     Collect candidates from all enabled sources.
     Returns (candidates, source_health).
     """
-    queries = load_queries()
+    queries_config = load_queries()
+    queries = get_dynamic_queries(queries_config)
+
+    log.info("Dynamic queries generated: %d", len(queries))
+
     all_candidates = []
     source_health = {}
 
@@ -98,15 +139,22 @@ async def collect_from_all_sources(
     return all_candidates, source_health
 
 
-async def _collect_web(queries: dict) -> list[dict]:
-    """Collect from web search via Jina Reader + direct search."""
-    candidates = []
+async def _collect_web(queries: list[str]) -> list[dict]:
+    """
+    Collect from web search via Jina Reader.
 
-    for query in queries.get("en", [])[:5]:
+    Note: s.jina.ai is a SEARCH endpoint (returns search results),
+    not r.jina.ai which is a READER endpoint (reads specific URLs).
+    """
+    candidates = []
+    seen_urls = set()
+
+    # Use first 8 queries for web search
+    for query in queries[:8]:
         try:
-            # Use Jina search
             import httpx
             async with httpx.AsyncClient(timeout=30) as client:
+                # s.jina.ai = search endpoint
                 r = await client.get(
                     f"https://s.jina.ai/{query}",
                     headers={"Accept": "application/json"},
@@ -114,12 +162,28 @@ async def _collect_web(queries: dict) -> list[dict]:
                 if r.status_code == 200:
                     data = r.json()
                     for item in data.get("data", [])[:5]:
+                        url = item.get("url", "")
+                        if url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+
+                        # Extract published date if available
+                        published_at = None
+                        if item.get("publishedDate"):
+                            try:
+                                published_at = datetime.fromisoformat(
+                                    item["publishedDate"].replace("Z", "+00:00")
+                                )
+                            except Exception:
+                                pass
+
                         candidates.append({
                             "source_platform": "web",
-                            "source_url": item.get("url", ""),
+                            "source_url": url,
                             "title": item.get("title", ""),
                             "description": item.get("description", ""),
-                            "raw_metadata": {"query": query},
+                            "published_at": published_at,
+                            "raw_metadata": {"query": query, "search_backend": "jina"},
                         })
         except Exception as e:
             log.warning("Web search failed for '%s': %s", query, e)
@@ -130,18 +194,29 @@ async def _collect_web(queries: dict) -> list[dict]:
     return candidates
 
 
-async def _collect_youtube(queries: dict) -> list[dict]:
-    """Collect from YouTube via yt-dlp search."""
+async def _collect_youtube(queries: list[str]) -> list[dict]:
+    """
+    Collect from YouTube via yt-dlp search.
+
+    Prefers: recent upload, specific dish, strong velocity.
+    Lowers: compilation, reaction, testing recipes, hour-long video.
+    """
     candidates = []
     venv_ytdlp = "/opt/trend-scanner/venv/bin/yt-dlp"
 
-    for query in queries.get("en", [])[:5]:
+    # Check if yt-dlp exists
+    if not os.path.exists(venv_ytdlp):
+        # Try system yt-dlp
+        venv_ytdlp = "yt-dlp"
+
+    # Use first 6 queries for YouTube
+    for query in queries[:6]:
         try:
             cmd = [
                 venv_ytdlp,
                 "--flat-playlist",
                 "--print", "%(id)s\t%(title)s\t%(view_count)s\t%(upload_date)s\t%(channel)s\t%(duration)s",
-                f"ytsearch5:{query} recipe",
+                f"ytsearch5:{query}",
             ]
 
             proc = await asyncio.create_subprocess_exec(
@@ -163,11 +238,26 @@ async def _collect_youtube(queries: dict) -> list[dict]:
                     channel = parts[4] if len(parts) > 4 else None
                     duration = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else None
 
+                    # Skip very long videos (>20 min) - likely compilations
+                    if duration and duration > 1200:
+                        continue
+
+                    # Parse upload date
+                    published_at = None
+                    if upload_date and len(upload_date) == 8:
+                        try:
+                            published_at = datetime.strptime(upload_date, "%Y%m%d").replace(
+                                tzinfo=timezone.utc
+                            )
+                        except Exception:
+                            pass
+
                     candidates.append({
                         "source_platform": "youtube",
                         "source_url": f"https://www.youtube.com/watch?v={video_id}",
                         "title": title,
                         "source_author": channel,
+                        "published_at": published_at,
                         "raw_engagement": {"views": views},
                         "raw_metadata": {
                             "upload_date": upload_date,
@@ -184,13 +274,22 @@ async def _collect_youtube(queries: dict) -> list[dict]:
 
 
 async def _collect_rss() -> list[dict]:
-    """Collect from RSS feeds."""
+    """
+    Collect from RSS feeds.
+
+    Includes Reddit food subreddits and other food blogs.
+    """
     candidates = []
 
     feeds = [
+        # Reddit
         ("https://www.reddit.com/r/recipes/.rss", "reddit"),
         ("https://www.reddit.com/r/Cooking/.rss", "reddit"),
         ("https://www.reddit.com/r/MealPrepSunday/.rss", "reddit"),
+        ("https://www.reddit.com/r/recipes/hot/.rss", "reddit"),
+        # Food blogs (if available)
+        # ("https://www.simplyrecipes.com/index.xml", "web"),
+        # ("https://www.budgetbytes.com/feed/", "web"),
     ]
 
     for feed_url, platform in feeds:
@@ -206,12 +305,17 @@ async def _collect_rss() -> list[dict]:
                 if hasattr(entry, "score"):
                     ups = entry.score
 
+                # Parse published date
+                published_at = None
+                if hasattr(entry, "published"):
+                    published_at = _parse_date(entry.published)
+
                 candidates.append({
                     "source_platform": platform,
                     "source_url": entry.get("link", ""),
                     "title": entry.get("title", ""),
                     "description": entry.get("summary", "")[:500],
-                    "published_at": _parse_date(entry.get("published")),
+                    "published_at": published_at,
                     "source_author": entry.get("author", ""),
                     "raw_engagement": {"upvotes": ups},
                     "raw_metadata": {"feed": feed_url},

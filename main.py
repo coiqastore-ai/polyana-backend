@@ -8523,6 +8523,109 @@ async def handle_editorial_approval(callback: CallbackQuery):
         await callback.answer(result.get("error", "Ошибка"), show_alert=True)
 
 
+# ── Trend Scanner ────────────────────────────────────────────────────────────
+
+@dp.message(Command("trendscan"))
+async def handle_trendscan(message: Message):
+    """Handle /trendscan command — admin only."""
+    if not message.from_user or message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Только администратор может запускать Trend Scanner")
+        return
+
+    await message.answer("🔎 Ищу трендовые рецепты...")
+
+    async with pool.acquire() as db:
+        # Try to acquire lock
+        from trend_scanner.scanner import run_scan, acquire_scan_lock, release_scan_lock
+
+        if not await acquire_scan_lock(db):
+            await message.answer("⏳ Trend Scan уже выполняется.")
+            return
+
+        try:
+            result = await run_scan(db=db, dry_run=False)
+
+            # Build summary
+            lines = [
+                "🔥 ПОЛЯНА — TREND SCAN COMPLETE",
+                "",
+                f"Проверено: {result.get('total_found', 0)}",
+                f"После фильтра: {result.get('after_filter', 0)}",
+                f"После дедупликации: {result.get('after_dedupe', 0)}",
+                f"Прошли quality gate: {result.get('qualified', 0)}",
+                f"LLM проверено: {result.get('llm_analyzed', 0)}",
+                f"Показано: {result.get('top_candidates', 0)}",
+                "",
+            ]
+
+            # Content types
+            content_types = result.get("content_types", {})
+            if content_types:
+                lines.append("Типы контента:")
+                for ct, count in content_types.items():
+                    lines.append(f"  {ct}: {count}")
+                lines.append("")
+
+            # Source health
+            source_health = result.get("source_health", {})
+            if source_health:
+                lines.append("Источники:")
+                for source, info in source_health.items():
+                    status = "✅" if info.get("status") == "ok" else "❌"
+                    count = info.get("count", 0)
+                    lines.append(f"  {status} {source}: {count}")
+
+            await message.answer("\n".join(lines))
+
+        except Exception as e:
+            log.error("Trend scan failed: %s", e)
+            await message.answer(f"❌ Ошибка: {e}")
+        finally:
+            await release_scan_lock(db)
+
+
+@dp.callback_query(F.data.startswith("ts:"))
+async def handle_trend_scanner_callback(callback: CallbackQuery):
+    """Handle trend scanner approve/reject callbacks."""
+    if not callback.from_user or callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer("Только администратор может управлять трендами", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Неверный формат", show_alert=True)
+        return
+
+    action = parts[1]
+    try:
+        candidate_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+
+    async with pool.acquire() as db:
+        from trend_scanner.storage import update_candidate_status
+
+        if action == "approve":
+            await update_candidate_status(db, candidate_id, "approved_for_adaptation")
+            await callback.answer("✅ Кандидат принят в работу")
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        elif action == "reject":
+            await update_candidate_status(db, candidate_id, "rejected")
+            await callback.answer("❌ Кандидат пропущен")
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        else:
+            await callback.answer("Неизвестное действие", show_alert=True)
+
+
 async def run_bot():
     try:
         # Register consent middleware

@@ -1,5 +1,8 @@
 """
-Scoring and filtering for Trend Scanner candidates.
+Scoring and filtering for Trend Scanner v0.1.1.
+
+Includes: content classification, freshness, engagement velocity,
+trend confidence, quality gates, and LLM analysis.
 """
 
 import logging
@@ -9,27 +12,29 @@ from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger("polyana.trend_scanner.scoring")
 
-# Cheap filter keywords that indicate non-recipe content
-NON_RECIPE_KEYWORDS = [
-    "restaurant review", "restaurant opening", "food critic",
-    "cooking class", "cooking show", "masterchef", "hell's kitchen",
-    "food fight", "food challenge", "eating contest",
-    "cocktail", "martini", "mojito", "whiskey", "vodka", "beer",
-    "wine tasting", "bartending",
-]
+# Quality gate thresholds (configurable via env)
+TREND_MIN_SCORE = int(os.environ.get("TREND_MIN_SCORE", "60"))
+TREND_MIN_CONFIDENCE = int(os.environ.get("TREND_MIN_CONFIDENCE", "50"))
 
-# Professional/complex indicators
-COMPLEX_INDICATORS = [
-    "sous vide", "molecular gastronomy", "fermentation chamber",
-    "smoking gun", "anti-griddle", "pacotizer", "rotovap",
-    "chef's table", "tasting menu", "degustation",
-]
+# Source relevance weights
+SOURCE_RELEVANCE = {
+    "web": 1.0,
+    "youtube": 1.0,
+    "rss": 0.9,
+    "reddit": 1.0,
+    "instagram": 1.1,
+    "tiktok": 1.2,
+    "pinterest": 0.9,
+    "bilibili": 0.6,
+}
 
 
 def cheap_filter(candidates: list[dict]) -> list[dict]:
     """
-    Filter out obviously irrelevant candidates before expensive LLM analysis.
+    Filter out obviously irrelevant candidates before expensive analysis.
     """
+    from .classifier import classify_content
+
     filtered = []
     now = datetime.now(timezone.utc)
 
@@ -38,12 +43,20 @@ def cheap_filter(candidates: list[dict]) -> list[dict]:
         desc = (c.get("description") or "").lower()
         text = f"{title} {desc}"
 
-        # Skip non-recipe content
-        if any(kw in text for kw in NON_RECIPE_KEYWORDS):
+        # Skip empty titles
+        if not title.strip():
             continue
 
-        # Skip overly complex professional dishes
-        if any(kw in text for kw in COMPLEX_INDICATORS):
+        # Skip very short titles (likely not recipes)
+        if len(title.strip()) < 5:
+            continue
+
+        # Classify content
+        classification = classify_content(c)
+        c.update(classification)
+
+        # Skip non-recipe content
+        if classification["content_type"] == "non_recipe":
             continue
 
         # Skip very old content (>60 days) without strong engagement
@@ -61,14 +74,6 @@ def cheap_filter(candidates: list[dict]) -> list[dict]:
                 if views < 100000 and upvotes < 1000:
                     continue
 
-        # Skip empty titles
-        if not title.strip():
-            continue
-
-        # Skip very short titles (likely not recipes)
-        if len(title.strip()) < 5:
-            continue
-
         filtered.append(c)
 
     return filtered
@@ -76,11 +81,13 @@ def cheap_filter(candidates: list[dict]) -> list[dict]:
 
 def score_candidates(candidates: list[dict]) -> list[dict]:
     """
-    Score candidates without LLM (freshness, engagement, cross-source).
+    Score candidates without LLM (freshness, engagement, cross-source, velocity).
     """
     for c in candidates:
         c["freshness_score"] = _score_freshness(c)
         c["engagement_score"] = _score_engagement(c)
+        c["engagement_velocity"] = _calculate_velocity(c)
+        c["trend_confidence"] = _calculate_confidence(c)
         c["cross_source_score"] = c.get("cross_source_score", 20)  # Default for single source
 
         # Calculate preliminary trend score
@@ -91,16 +98,26 @@ def score_candidates(candidates: list[dict]) -> list[dict]:
 
 
 def _score_freshness(candidate: dict) -> float:
-    """Score freshness: newer = higher."""
+    """
+    Score freshness: newer = higher.
+
+    0-1 day    100
+    2-3 days    90
+    4-7 days    80
+    8-14 days   60
+    15-30 days  35
+    >30 days    10
+    Unknown     20 (penalized)
+    """
     published = candidate.get("published_at")
     if not published:
-        return 30  # Unknown date = moderate score
+        return 20  # Unknown date = penalized
 
     if isinstance(published, str):
         try:
             published = datetime.fromisoformat(published.replace("Z", "+00:00"))
         except Exception:
-            return 30
+            return 20
 
     now = datetime.now(timezone.utc)
     age_days = (now - published).days
@@ -110,11 +127,11 @@ def _score_freshness(candidate: dict) -> float:
     elif age_days <= 3:
         return 90
     elif age_days <= 7:
-        return 75
+        return 80
     elif age_days <= 14:
-        return 55
+        return 60
     elif age_days <= 30:
-        return 30
+        return 35
     else:
         return 10
 
@@ -162,6 +179,144 @@ def _score_engagement(candidate: dict) -> float:
         return 30
 
 
+def _calculate_velocity(candidate: dict) -> float:
+    """
+    Calculate engagement velocity: views/age_hours or upvotes/age_hours.
+
+    Higher velocity = more trending.
+    """
+    published = candidate.get("published_at")
+    engagement = candidate.get("raw_engagement") or {}
+
+    if not published:
+        return 0
+
+    if isinstance(published, str):
+        try:
+            published = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except Exception:
+            return 0
+
+    now = datetime.now(timezone.utc)
+    age_hours = max(1, (now - published).total_seconds() / 3600)
+
+    # Store age_hours for confidence calculation
+    candidate["age_hours"] = age_hours
+
+    views = engagement.get("views") or 0
+    upvotes = engagement.get("upvotes") or 0
+
+    if views > 0:
+        velocity = views / age_hours
+    elif upvotes > 0:
+        velocity = (upvotes * 100) / age_hours  # Normalize upvotes to views
+    else:
+        return 0
+
+    # Normalize to 0-100 scale
+    # 1000 views/hour = 50, 10000 views/hour = 80, 100000 views/hour = 100
+    if velocity >= 100000:
+        return 100
+    elif velocity >= 10000:
+        return 80
+    elif velocity >= 1000:
+        return 60
+    elif velocity >= 100:
+        return 40
+    elif velocity >= 10:
+        return 20
+    else:
+        return 10
+
+
+def _calculate_confidence(candidate: dict) -> float:
+    """
+    Calculate trend confidence based on data quality.
+
+    Positive signals:
+    - published_at known
+    - engagement known
+    - multiple independent sources
+    - author known
+    - specific recipe identified
+    - recent source
+
+    Negative signals:
+    - date unknown
+    - engagement unknown
+    - single weak source
+    - ambiguous dish
+    - compilation extraction only
+    """
+    confidence = 50  # Base
+
+    # Published date known
+    if candidate.get("published_at"):
+        confidence += 10
+    else:
+        confidence -= 15
+
+    # Engagement known
+    engagement = candidate.get("raw_engagement") or {}
+    if engagement.get("views") or engagement.get("upvotes"):
+        confidence += 10
+    else:
+        confidence -= 10
+
+    # Multiple sources
+    source_count = candidate.get("source_count", 1)
+    if source_count >= 3:
+        confidence += 15
+    elif source_count >= 2:
+        confidence += 10
+    else:
+        confidence -= 5
+
+    # Author known
+    if candidate.get("source_author"):
+        confidence += 5
+
+    # Specific recipe identified
+    if candidate.get("content_type") == "specific_recipe":
+        confidence += 10
+    elif candidate.get("content_type") == "recipe_compilation":
+        confidence -= 10
+
+    # Canonical dish name
+    if candidate.get("canonical_dish_name"):
+        confidence += 5
+
+    # Recent source (within 7 days)
+    published = candidate.get("published_at")
+    if published:
+        if isinstance(published, str):
+            try:
+                published = datetime.fromisoformat(published.replace("Z", "+00:00"))
+            except Exception:
+                published = None
+        if published:
+            age_days = (datetime.now(timezone.utc) - published).days
+            if age_days <= 7:
+                confidence += 10
+            elif age_days <= 14:
+                confidence += 5
+            elif age_days > 30:
+                confidence -= 10
+
+    # Clamp to 0-100
+    return max(0, min(100, confidence))
+
+
+def passes_quality_gate(candidate: dict) -> bool:
+    """
+    Check if candidate passes quality gate thresholds.
+    """
+    score = candidate.get("trend_score", 0) or 0
+    confidence = candidate.get("trend_confidence", 0) or 0
+
+    return score >= TREND_MIN_SCORE and confidence >= TREND_MIN_CONFIDENCE
+
+
 async def analyze_with_llm(candidate: dict) -> dict:
     """
     Analyze a candidate with LLM for visual, simplicity, RU availability, and poliana fit scores.
@@ -172,12 +327,16 @@ async def analyze_with_llm(candidate: dict) -> dict:
     title = candidate.get("title", "")
     desc = candidate.get("description", "")[:300]
     platform = candidate.get("source_platform", "")
+    content_type = candidate.get("content_type", "unknown")
+    canonical_dish = candidate.get("canonical_dish_name", "")
 
     prompt = f"""Оцени этот рецепт для российской аудитории приложения "Поляна" (Telegram Mini App для рецептов).
 
 Рецепт: {title}
 Описание: {desc}
 Источник: {platform}
+Тип контента: {content_type}
+Каноническое название: {canonical_dish}
 
 Оцени по шкале 0-100 и верни ТОЛЬКО JSON:
 {{

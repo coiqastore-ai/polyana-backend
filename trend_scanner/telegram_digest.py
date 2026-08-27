@@ -1,5 +1,7 @@
 """
-Telegram admin digest for Trend Scanner results.
+Telegram admin digest for Trend Scanner v0.1.1.
+
+Sends summary + individual candidate cards with action buttons.
 """
 
 import logging
@@ -26,12 +28,17 @@ async def send_trend_digest(
         return
 
     # Build summary message
+    total_raw = sum(s.get("count", 0) for s in source_health.values())
+    specific_recipes = sum(1 for c in candidates if c.get("content_type") == "specific_recipe")
+    compilations = sum(1 for c in candidates if c.get("content_type") == "recipe_compilation")
+
     lines = [
         "🔥 ПОЛЯНА — TREND SCAN",
         "",
-        f"Найдено: {sum(s.get('count', 0) for s in source_health.values())}",
-        f"Уникальных: {len(candidates)}",
-        f"Лучших: {len(candidates)}",
+        f"Проверено: {total_raw}",
+        f"Конкретных рецептов: {specific_recipes}",
+        f"Compilation/discovery: {compilations}",
+        f"Прошли quality gate: {len(candidates)}",
         "",
     ]
 
@@ -42,23 +49,6 @@ async def send_trend_digest(
         count = info.get("count", 0)
         lines.append(f"  {status} {source}: {count}")
     lines.append("")
-
-    # Top candidates
-    for i, c in enumerate(candidates[:10], 1):
-        title = c.get("title", "?")[:60]
-        score = c.get("trend_score", 0)
-        sources = c.get("all_sources", [c.get("source_platform", "?")])
-        freshness = c.get("freshness_score", 0)
-        ru_fit = c.get("ru_availability_score", 0)
-        reason = c.get("reason", "")
-
-        lines.append(f"{i}. {title}")
-        lines.append(f"   Trend Score: {score:.0f}")
-        lines.append(f"   Источники: {', '.join(sources)}")
-        lines.append(f"   Свежесть: {freshness:.0f} | RU Fit: {ru_fit:.0f}")
-        if reason:
-            lines.append(f"   {reason}")
-        lines.append("")
 
     summary_text = "\n".join(lines)
 
@@ -75,36 +65,62 @@ async def send_trend_digest(
 def _build_candidate_card(candidate: dict, index: int) -> str:
     """Build a detailed card for a single candidate."""
     title = candidate.get("title", "?")
+    canonical_dish = candidate.get("canonical_dish_name", "")
     platform = candidate.get("source_platform", "?")
     url = candidate.get("source_url", "")
     author = candidate.get("source_author", "")
     score = candidate.get("trend_score", 0)
+    confidence = candidate.get("trend_confidence", 0)
     reason = candidate.get("reason", "")
     recipe_type = candidate.get("recipe_type", "")
     keywords = candidate.get("keywords", [])
     sources = candidate.get("all_sources", [platform])
     freshness = candidate.get("freshness_score", 0)
     engagement = candidate.get("engagement_score", 0)
+    cross_source = candidate.get("cross_source_score", 0)
+    visual = candidate.get("visual_score", 0)
+    simplicity = candidate.get("simplicity_score", 0)
     ru_fit = candidate.get("ru_availability_score", 0)
     poliana_fit = candidate.get("poliana_fit_score", 0)
+    content_type = candidate.get("content_type", "unknown")
+    velocity = candidate.get("engagement_velocity", 0)
 
+    # Build card
     lines = [
-        f"📋 КАНДИДАТ #{index}",
+        f"🔥 TREND CANDIDATE #{index}",
         "",
-        f"<b>{_esc(title)}</b>",
-        f"Платформа: {platform}",
+        f"<b>{_esc(canonical_dish or title)}</b>",
     ]
+
+    if canonical_dish and canonical_dish.lower() != title.lower():
+        lines.append(f"Исходное: {_esc(title)}")
+
+    lines.append(f"Тип: {content_type}")
     if author:
         lines.append(f"Автор: {_esc(author)}")
     if len(sources) > 1:
         lines.append(f"Источники: {', '.join(sources)}")
     lines.append("")
+
+    # Scores
     lines.append(f"📊 Оценки:")
-    lines.append(f"  Trend: {score:.0f} | Свежесть: {freshness:.0f}")
-    lines.append(f"  Engagement: {engagement:.0f} | RU: {ru_fit:.0f}")
+    lines.append(f"  Trend Score: {score:.0f}")
+    lines.append(f"  Confidence: {confidence:.0f}")
     lines.append(f"  Poliana Fit: {poliana_fit:.0f}")
+    lines.append("")
+    lines.append(f"📈 Детали:")
+    lines.append(f"  Свежесть: {freshness:.0f}")
+    lines.append(f"  Engagement: {engagement:.0f}")
+    lines.append(f"  Cross-source: {cross_source:.0f}")
+    lines.append(f"  Visual: {visual:.0f}")
+    lines.append(f"  Simplicity: {simplicity:.0f}")
+    lines.append(f"  RU доступность: {ru_fit:.0f}")
+    if velocity > 0:
+        lines.append(f"  Velocity: {velocity:.0f}/hr")
+    lines.append("")
+
     if reason:
-        lines.append(f"\n💡 {_esc(reason)}")
+        lines.append(f"💡 {_esc(reason)}")
     if keywords:
         lines.append(f"🏷 {', '.join(keywords)}")
     if url:
@@ -121,7 +137,7 @@ def _build_candidate_buttons(candidate: dict) -> list:
     buttons = []
 
     if url:
-        buttons.append({"text": "👁 Посмотреть", "url": url})
+        buttons.append({"text": "🔗 Источник", "url": url})
 
     buttons.append({"text": "✅ В работу", "callback_data": f"ts:approve:{candidate_id}"})
     buttons.append({"text": "❌ Пропустить", "callback_data": f"ts:reject:{candidate_id}"})

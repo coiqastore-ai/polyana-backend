@@ -1,27 +1,264 @@
 {
-  "ru": [
-    "вирусный рецепт",
-    "популярный рецепт",
-    "быстрый ужин",
-    "простой десерт",
-    "белковый рецепт",
-    "рецепт из 5 ингредиентов",
-    "ужин за 20 минут",
-    "летний рецепт",
-    "рецепт с творогом",
-    "рецепт с курицей"
-  ],
-  "en": [
-    "viral recipe",
-    "trending recipe",
-    "easy dinner",
-    "quick dinner",
-    "high protein recipe",
-    "5 ingredient recipe",
-    "viral dessert",
-    "cottage cheese recipe",
-    "chicken recipe trend",
-    "summer recipe trend",
-    "food trend"
-  ]
+  "core": {
+    "en": [
+      "viral recipe this week",
+      "trending recipe this week",
+      "viral dinner",
+      "viral dessert",
+      "high protein viral recipe"
+    ],
+    "ru": [
+      "вирусный рецепт этой недели",
+      "популярный рецепт этой недели",
+      "вирусный ужин",
+      "вирусный десерт",
+      "белковый рецепт тренд"
+    ]
+  },
+  "monday": {
+    "en": [
+      "quick dinner trend",
+      "family dinner trend",
+      "high protein meal trend",
+      "meal prep trend"
+    ],
+    "ru": [
+      "быстрый ужин тренд",
+      "семейный ужин тренд",
+      "белковый обед тренд",
+      "meal prep тренд"
+    ]
+  },
+  "wednesday": {
+    "en": [
+      "breakfast trend",
+      "viral dessert",
+      "snack trend",
+      "easy baking trend"
+    ],
+    "ru": [
+      "завтрак тренд",
+      "вирусный десерт",
+      "перекус тренд",
+      "простая выпечка тренд"
+    ]
+  },
+  "friday": {
+    "en": [
+      "weekend dinner trend",
+      "party food trend",
+      "date night recipe",
+      "viral baking"
+    ],
+    "ru": [
+      "ужин на выходные тренд",
+      "еда для вечеринки тренд",
+      "романтический ужин рецепт",
+      "вирусная выпечка"
+    ]
+  },
+  "seasonal": {
+    "august": {
+      "en": [
+        "viral recipe August 2026",
+        "trending recipe August 2026",
+        "viral dinner August 2026",
+        "viral dessert August 2026",
+        "high protein viral recipe August 2026",
+        "TikTok viral recipe August 2026",
+        "Instagram viral recipe August 2026",
+        "trending food this week"
+      ],
+      "ru": [
+        "вирусный рецепт август 2026",
+        "популярный рецепт август 2026",
+        "трендовый ужин август 2026",
+        "вирусный десерт август 2026",
+        "белковый рецепт тренд август 2026"
+      ]
+    },
+    "september": {
+      "en": [
+        "viral recipe September 2026",
+        "trending recipe September 2026",
+        "fall recipe trend",
+        "autumn recipe trend",
+        "pumpkin recipe trend",
+        "apple recipe trend",
+        "comfort food trend"
+      ],
+      "ru": [
+        "вирусный рецепт сентябрь 2026",
+        "популярный рецепт сентябрь 2026",
+        "осенний рецепт тренд",
+        "рецепт с тыквой тренд",
+        "рецепт с яблоками тренд"
+      ]
+    },
+    "october": {
+      "en": [
+        "viral recipe October 2026",
+        "Halloween recipe trend",
+        "pumpkin recipe trend",
+        "comfort food trend",
+        "soup recipe trend"
+      ],
+      "ru": [
+        "вирусный рецепт октябрь 2026",
+        "рецепт с тыквой тренд",
+        "суп рецепт тренд",
+        "горячий обед тренд"
+      ]
+    },
+    "november": {
+      "en": [
+        "viral recipe November 2026",
+        "Thanksgiving recipe trend",
+        "holiday recipe trend",
+        "comfort food trend",
+        "baking trend"
+      ],
+      "ru": [
+        "вирусный рецепт ноябрь 2026",
+        "праздничный рецепт тренд",
+        "выпечка тренд",
+        "горячий десерт тренд"
+      ]
+    },
+    "december": {
+      "en": [
+        "viral recipe December 2026",
+        "Christmas recipe trend",
+        "holiday recipe trend",
+        "New Year recipe trend",
+        "festive recipe trend"
+      ],
+      "ru": [
+        "вирусный рецепт декабрь 2026",
+        "новогодний рецепт тренд",
+        "праздничный рецепт тренд",
+        "выпечка на Новый год тренд"
+      ]
+    },
+    "january": {
+      "en": [
+        "viral recipe January 2027",
+        "healthy recipe trend",
+        "detox recipe trend",
+        "low calorie recipe trend",
+        "meal prep trend"
+      ],
+      "ru": [
+        "вирусный рецепт январь 2027",
+        "полезный рецепт тренд",
+        "диетический рецепт тренд",
+        "низкокалорийный рецепт тренд"
+      ]
+    },
+    "february": {
+      "en": [
+        "viral recipe February 2027",
+        "Valentine recipe trend",
+        "chocolate recipe trend",
+        "romantic dinner trend"
+      ],
+      "ru": [
+        "вирусный рецепт февраль 2027",
+        "рецепт на 14 февраля тренд",
+        "шоколадный рецепт тренд",
+        "романтический ужин тренд"
+      ]
+    },
+    "march": {
+      "en": [
+        "viral recipe March 2027",
+        "spring recipe trend",
+        "light recipe trend",
+        "Easter recipe trend"
+      ],
+      "ru": [
+        "вирусный рецепт март 2027",
+        "весенний рецепт тренд",
+        "легкий рецепт тренд",
+        "пасхальный рецепт тренд"
+      ]
+    },
+    "april": {
+      "en": [
+        "viral recipe April 2027",
+        "spring recipe trend",
+        "Easter recipe trend",
+        "fresh recipe trend"
+      ],
+      "ru": [
+        "вирусный рецепт апрель 2027",
+        "весенний рецепт тренд",
+        "пасхальный рецепт тренд",
+        "свежий рецепт тренд"
+      ]
+    },
+    "may": {
+      "en": [
+        "viral recipe May 2027",
+        "BBQ trend",
+        "grilling trend",
+        "outdoor cooking trend",
+        "summer recipe trend"
+      ],
+      "ru": [
+        "вирусный рецепт май 2027",
+        "шашлык тренд",
+        "гриль тренд",
+        "летний рецепт тренд"
+      ]
+    },
+    "june": {
+      "en": [
+        "viral recipe June 2027",
+        "summer recipe trend",
+        "ice cream trend",
+        "smoothie trend",
+        "salad trend"
+      ],
+      "ru": [
+        "вирусный рецепт июнь 2027",
+        "летний рецепт тренд",
+        "мороженое тренд",
+        "смузи тренд",
+        "салат тренд"
+      ]
+    },
+    "july": {
+      "en": [
+        "viral recipe July 2027",
+        "summer recipe trend",
+        "BBQ trend",
+        "no-bake recipe trend",
+        "frozen dessert trend"
+      ],
+      "ru": [
+        "вирусный рецепт июль 2027",
+        "летний рецепт тренд",
+        "шашлык тренд",
+        "десерт без выпечки тренд",
+        "замороженный десерт тренд"
+      ]
+    }
+  },
+  "evergreen": {
+    "en": [
+      "cottage cheese recipe",
+      "chicken recipe trend",
+      "5 ingredient recipe",
+      "easy dinner recipe",
+      "quick breakfast recipe"
+    ],
+    "ru": [
+      "рецепт с творогом",
+      "рецепт с курицей",
+      "рецепт из 5 ингредиентов",
+      "быстрый ужин рецепт",
+      "быстрый завтрак рецепт"
+    ]
+  }
 }
