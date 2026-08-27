@@ -1,0 +1,1 @@
+# Trend Scanner for Polyana
