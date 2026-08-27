@@ -5,6 +5,7 @@ Includes: content classification, freshness, engagement velocity,
 trend confidence, quality gates, and LLM analysis.
 """
 
+import json
 import logging
 import os
 import re
