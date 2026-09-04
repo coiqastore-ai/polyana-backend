@@ -6,6 +6,12 @@ import telegram_publisher
 import editorial_approval
 import admin_digest
 import ai_provider_balance
+from share_utils import (
+    build_mini_app_deep_link,
+    build_recipe_share_text,
+    prepared_expiration_value,
+    recipe_share_title,
+)
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 import asyncpg
@@ -50,8 +56,10 @@ if not SPLIT_AVAILABLE:
 
 ENV = os.environ.get
 BOT_TOKEN = ENV("BOT_TOKEN", "")
+BOT_USERNAME = ENV("BOT_USERNAME", "reciptesbot").strip().lstrip("@") or "reciptesbot"
 DATABASE_URL = ENV("DATABASE_URL", "")
 FRONTEND_URL = ENV("FRONTEND_URL", "")
+MINI_APP_SHORT_NAME = ENV("MINI_APP_SHORT_NAME", "polyana").strip() or "polyana"
 INTERNAL_API_KEY = ENV("INTERNAL_API_KEY", "")
 PORT = int(ENV("PORT", "8000"))
 OPENROUTER_KEY = ENV("OPENROUTER_API_KEY", "")
@@ -4377,33 +4385,7 @@ async def prepare_recipe_share(
         "steps": [{"step_number": s["step_number"], "text": s["text"]} for s in steps],
     }
 
-    # Build share text
-    lines = [f"{snapshot['emoji']} <b>{snapshot['name']}</b>"]
-    meta = []
-    if snapshot.get("category"):
-        meta.append(snapshot["category"])
-    if snapshot.get("servings"):
-        meta.append(f"🍽 {snapshot['servings']} порц.")
-    if snapshot.get("cook_time_minutes"):
-        meta.append(f"⏱ {snapshot['cook_time_minutes']} мин.")
-    if meta:
-        lines.append(" · ".join(meta))
-    if ings:
-        lines.append(f"\n🥄 Ингредиенты ({len(ings)}):")
-        for i in ings:
-            q = i.get("qty")
-            if q and q != 0:
-                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
-                qty = f"{q_str} {i.get('unit') or ''}".strip()
-            else:
-                qty = ""
-            lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
-    if steps:
-        lines.append(f"\n📋 Приготовление:")
-        for s in steps:
-            lines.append(f"  {s['step_number']}. {s['text']}")
-    lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
-    message_text = "\n".join(lines)
+    message_text = build_recipe_share_text(snapshot)
 
     # Create share record with token
     token = secrets.token_urlsafe(16)
@@ -4417,8 +4399,7 @@ async def prepare_recipe_share(
     if len(callback_data.encode("utf-8")) > 64:
         raise HTTPException(500, "Share token too long")
 
-    bot_username = await _get_bot_username()
-    mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+    mini_app_url = await _get_mini_app_url(f"shared_{token}")
 
     from aiogram.types import (
         InlineQueryResultArticle, InputTextMessageContent,
@@ -4427,7 +4408,7 @@ async def prepare_recipe_share(
 
     result = InlineQueryResultArticle(
         id=str(share["id"]),
-        title=snapshot["name"],
+        title=recipe_share_title(snapshot),
         description="Рецепт из ПОЛЯНЫ",
         input_message_content=InputTextMessageContent(
             message_text=message_text, parse_mode="HTML"
@@ -4449,14 +4430,20 @@ async def prepare_recipe_share(
         )
         return {
             "prepared_message_id": prepared.id,
+            "expiration_date": prepared_expiration_value(prepared),
             "share_id": str(share["id"]),
+            "token": token,
+            "mini_app_url": mini_app_url,
         }
     except Exception as e:
         log.warning("save_prepared_inline_message failed: %s", e)
         # Fallback: return the inline result for manual use
         return {
             "prepared_message_id": None,
+            "expiration_date": None,
             "share_id": str(share["id"]),
+            "token": token,
+            "mini_app_url": mini_app_url,
             "fallback": True,
         }
 
@@ -4747,32 +4734,9 @@ async def prepare_share_message(
     if isinstance(snap, str):
         snap = json.loads(snap)
 
-    # Build message text
-    lines = [f"{snap.get('emoji', '🍽')} <b>{snap['name']}</b>"]
-    meta = []
-    if snap.get("category"):
-        meta.append(snap["category"])
-    if snap.get("servings"):
-        meta.append(f"🍽 {snap['servings']} порц.")
-    if snap.get("cook_time_minutes"):
-        meta.append(f"⏱ {snap['cook_time_minutes']} мин.")
-    if meta:
-        lines.append(" · ".join(meta))
-    for i in snap.get("ingredients", [])[:10]:
-        q = i.get("qty")
-        if q and q != 0:
-            q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
-            qty = f"{q_str} {i.get('unit') or ''}".strip()
-        else:
-            qty = ""
-        lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
-    if len(snap.get("ingredients", [])) > 10:
-        lines.append(f"  … и ещё {len(snap['ingredients']) - 10}")
-    lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
-    message_text = "\n".join(lines)
+    message_text = build_recipe_share_text(snap, ingredient_limit=10, step_limit=4)
 
-    bot_username = await _get_bot_username()
-    mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+    mini_app_url = await _get_mini_app_url(f"shared_{token}")
 
     from aiogram.types import (
         InlineQueryResultArticle, InputTextMessageContent,
@@ -4781,7 +4745,7 @@ async def prepare_share_message(
 
     result = InlineQueryResultArticle(
         id=str(share["id"]),
-        title=snap["name"],
+        title=recipe_share_title(snap),
         description="Рецепт из ПОЛЯНЫ",
         input_message_content=InputTextMessageContent(
             message_text=message_text, parse_mode="HTML"
@@ -4801,10 +4765,23 @@ async def prepare_share_message(
             allow_bot_chats=False,
             allow_channel_chats=False,
         )
-        return {"prepared_message_id": prepared.id}
+        return {
+            "prepared_message_id": prepared.id,
+            "expiration_date": prepared_expiration_value(prepared),
+            "share_id": str(share["id"]),
+            "token": token,
+            "mini_app_url": mini_app_url,
+        }
     except Exception as e:
         log.warning("save_prepared_inline_message failed: %s", e)
-        raise HTTPException(502, f"Telegram API error: {e}")
+        return {
+            "prepared_message_id": None,
+            "expiration_date": None,
+            "share_id": str(share["id"]),
+            "token": token,
+            "mini_app_url": mini_app_url,
+            "fallback": True,
+        }
 
 
 @app.get("/api/events/{event_id}/share-link")
@@ -5331,10 +5308,17 @@ async def _get_bot_username() -> str:
     if _bot_username is None:
         try:
             me = await bot.get_me()
-            _bot_username = me.username or ""
+            _bot_username = me.username or BOT_USERNAME
         except Exception:
-            _bot_username = ""
+            _bot_username = BOT_USERNAME
     return _bot_username
+
+
+async def _get_mini_app_url(start_parameter: str) -> str:
+    """Return a deep link for the BotFather-registered Direct Mini App."""
+    return build_mini_app_deep_link(
+        await _get_bot_username(), MINI_APP_SHORT_NAME, start_parameter
+    )
 
 
 @app.get("/api/referrals/me")
@@ -6892,8 +6876,7 @@ async def handle_share_recipe(callback: CallbackQuery):
             token, recipe_id, callback.from_user.id, json.dumps(snapshot)
         )
 
-    bot_username = await _get_bot_username()
-    share_screen_url = f"https://t.me/{bot_username}?startapp=share_{token}"
+    share_screen_url = await _get_mini_app_url(f"share_{token}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -7010,40 +6993,18 @@ async def handle_inline_query(inline_query: InlineQuery):
         snap = share["snapshot"]
         if isinstance(snap, str):
             snap = json.loads(snap)
-        lines = [f"{snap.get('emoji', '🍽')} <b>{snap['name']}</b>"]
-        meta = []
-        if snap.get("category"):
-            meta.append(snap["category"])
-        if snap.get("servings"):
-            meta.append(f"🍽 {snap['servings']} порц.")
-        if snap.get("cook_time_minutes"):
-            meta.append(f"⏱ {snap['cook_time_minutes']} мин.")
-        if meta:
-            lines.append(" · ".join(meta))
-        for i in snap.get("ingredients", []):
-            q = i.get("qty")
-            if q and q != 0:
-                q_str = str(int(q)) if q == int(q) else str(round(q, 2)).rstrip("0").rstrip(".")
-                qty = f"{q_str} {i.get('unit') or ''}".strip()
-            else:
-                qty = ""
-            lines.append(f"  • {i['name']}" + (f" — {qty}" if qty else ""))
-        for s in snap.get("steps", []):
-            lines.append(f"  {s['step_number']}. {s['text']}")
-        lines.append("\n🌿 Рецепт из ПОЛЯНЫ")
-        text = "\n".join(lines)
+        text = build_recipe_share_text(snap)
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💾 Сохранить себе", callback_data=f"rs:{token}")],
         ])
 
-        bot_username = await _get_bot_username()
-        mini_app_url = f"https://t.me/{bot_username}?startapp=shared_{token}"
+        mini_app_url = await _get_mini_app_url(f"shared_{token}")
 
         await inline_query.answer([
             InlineQueryResultArticle(
                 id=str(share["id"]),
-                title=f"{snap['name']} — нажмите, чтобы отправить",
+                title=f"{recipe_share_title(snap)} — нажмите, чтобы отправить"[:64],
                 description="Рецепт из ПОЛЯНЫ · нажмите на карточку",
                 input_message_content=InputTextMessageContent(message_text=text, parse_mode="HTML"),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
